@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# --- Системные зависимости ---
+# System dependencies
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
@@ -13,28 +13,19 @@ RUN apt-get update && apt-get install -y \
     ffmpeg gcc g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# --- Обновление pip ---
 RUN python3 -m pip install --upgrade pip
 
-# --- Рабочая директория ---
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi
-RUN pip install --no-cache-dir uvicorn[standard]
-RUN pip install --no-cache-dir python-multipart
-RUN pip install --no-cache-dir pydantic
-RUN pip install --no-cache-dir pydantic-settings
-RUN pip install --no-cache-dir fastapi
-RUN pip install --no-cache-dir pytest
-RUN pip install --no-cache-dir pytest-asyncio
+COPY requirements.txt .
 
-RUN pip install --no-cache-dir --no-deps ultralytics
-RUN pip install --no-cache-dir --no-deps opencv-python-headless
+# Install deps except ultralytics/opencv (they need --no-deps to preserve ROCm PyTorch)
+RUN pip install --no-cache-dir $(grep -vE '^(ultralytics|opencv|#|$)' requirements.txt)
+# Install with pinned versions from requirements.txt but without deps to preserve ROCm PyTorch
+RUN pip install --no-cache-dir --no-deps $(grep '^ultralytics' requirements.txt) $(grep '^opencv' requirements.txt)
 
-# --- Копируем приложение ---
-COPY app/*.py .
+COPY app/ .
 
-# --- Папка для моделей ---
 RUN mkdir -p /models
 
 EXPOSE 8000

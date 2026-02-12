@@ -20,7 +20,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install deps except ultralytics/opencv (they need --no-deps to preserve ROCm PyTorch)
-RUN pip install --no-cache-dir $(grep -vE '^(ultralytics|opencv)' requirements.txt)
+RUN pip install --no-cache-dir $(grep -vE '^(ultralytics|opencv|#|$)' requirements.txt)
 # Install with pinned versions from requirements.txt but without deps to preserve ROCm PyTorch
 RUN pip install --no-cache-dir --no-deps $(grep '^ultralytics' requirements.txt) $(grep '^opencv' requirements.txt)
 

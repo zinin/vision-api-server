@@ -4,6 +4,9 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: read
+
 env:
   IMAGE_NAME: avzinin/vision-api-server
 
@@ -60,11 +63,12 @@ jobs:
 
   build-amd:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
       - name: Free disk space for large ROCm base image
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
           android: true
           dotnet: true

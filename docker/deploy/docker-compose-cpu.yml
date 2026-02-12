@@ -1,0 +1,21 @@
+services:
+  vision-api:
+    image: avzinin/vision-api-server:cpu-${IMAGE_TAG:-latest}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      YOLO_MODELS: ${YOLO_MODELS:-{"yolo11s.pt":"cpu","yolo11x.pt":"cpu"}}
+      YOLO_MODEL_TTL: ${YOLO_MODEL_TTL:-900}
+      YOLO_DEVICE: cpu
+    volumes:
+      - models:/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  models:

@@ -33,8 +33,6 @@ jobs:
           file: docker/cpu/Dockerfile
           push: true
           tags: ${{ env.IMAGE_NAME }}:cpu-${{ steps.version.outputs.version }}
-          cache-from: type=gha,scope=cpu
-          cache-to: type=gha,mode=min,scope=cpu
 
   build-nvidia:
     runs-on: ubuntu-latest
@@ -58,8 +56,6 @@ jobs:
           file: docker/nvidia/Dockerfile
           push: true
           tags: ${{ env.IMAGE_NAME }}:nvidia-${{ steps.version.outputs.version }}
-          cache-from: type=gha,scope=nvidia
-          cache-to: type=gha,mode=min,scope=nvidia
 
   build-amd:
     runs-on: ubuntu-latest
@@ -93,8 +89,6 @@ jobs:
           file: docker/amd/Dockerfile
           push: true
           tags: ${{ env.IMAGE_NAME }}:amd-${{ steps.version.outputs.version }}
-          cache-from: type=gha,scope=amd
-          cache-to: type=gha,mode=min,scope=amd
 
   promote-latest:
     needs: [build-cpu, build-nvidia, build-amd]

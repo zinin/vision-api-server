@@ -26,6 +26,8 @@ After loading all context below, you MUST:
 - Design: `docs/plans/2026-02-14-video-annotation-design.md`
 - Plan: `docs/plans/2026-02-14-video-annotation.md`
 - Review iteration 1: `docs/plans/2026-02-14-video-annotation-review-iter-1.md`
+- Review iteration 2: `docs/plans/2026-02-14-video-annotation-review-iter-2.md`
+- Review iteration 3: `docs/plans/2026-02-14-video-annotation-review-iter-3.md`
 
 Read all documents to understand the full picture.
 
@@ -36,12 +38,18 @@ Read all documents to understand the full picture.
 - [x] Implementation plan written (8 tasks)
 - [x] Design review iteration 1 completed (3 agents: Codex, Gemini, CCS)
 - [x] All 24 review findings processed, decisions made
-- [x] Design and plan documents updated with review fixes
+- [x] Design and plan documents updated with review fixes (iter 1)
+- [x] Design review iteration 2 completed (3 agents: Codex, Gemini, CCS)
+- [x] All 27 review findings processed (19 new, 3 repeats, 5 false positives)
+- [x] Design and plan documents updated with review fixes (iter 2)
+- [x] Design review iteration 3 completed (3 agents: Codex, Gemini, CCS)
+- [x] All 27 review findings processed (11 new, 8 repeats, 7 false positives)
+- [x] Design and plan documents updated with review fixes (iter 3)
+- [x] Task 1: Update requirements (opencv-contrib, aiofiles, httpx) and set up test infrastructure — `af74edb`
+- [x] Task 2: Add configuration settings to config.py — `eb3958a`
+- [x] Task 3: Add Pydantic response models to models.py — `529388e`
 
-**Remaining (all 8 implementation tasks):**
-- [ ] Task 1: Update requirements (opencv-contrib) and set up test infrastructure
-- [ ] Task 2: Add configuration settings to config.py
-- [ ] Task 3: Add Pydantic response models to models.py
+**Remaining (5 implementation tasks):**
 - [ ] Task 4: Create JobManager (job_manager.py)
 - [ ] Task 5: Create VideoAnnotator (video_annotator.py) + make visualization.py methods public
 - [ ] Task 6: Add API endpoints and worker loop to main.py
@@ -60,15 +68,19 @@ Key decisions from brainstorming and review sessions:
 
 4. **cv2.VideoWriter writes to disk**: Frame-by-frame, no memory accumulation. Intermediate file `video_only.mp4` is deleted after FFmpeg audio merge.
 
-5. **No existing tests**: The project has zero tests. Task 1 sets up test infrastructure from scratch. pytest and pytest-asyncio are already in requirements.txt.
+5. **No existing tests**: The project had zero tests before this work. Task 1 set up test infrastructure from scratch. pytest and pytest-asyncio are already in requirements.txt.
 
 6. **opencv-contrib is a drop-in replacement**: Changing `opencv-python-headless` to `opencv-contrib-python-headless` adds the `cv2.legacy` tracking module without breaking anything.
 
-7. **Branch**: Work is on `feature/VAS-2`. Current commits include the design doc and plan.
+7. **Branch**: Work is on `feature/VAS-2`. Current HEAD: `529388e`.
 
 8. **CLAUDE.md Jira note**: CLAUDE.md says `project_key: "FV"` but the actual project key is `VAS`. Use `VAS` for Jira operations.
 
 9. **YOLO.track investigated and rejected**: YOLO.track runs detection on EVERY frame (no native `detect_every`). CSRT is kept because `detect_every` is a core performance feature — YOLO runs only every Nth frame, CSRT tracks between.
+
+10. **Python venv**: pytest и зависимости установлены в `.venv`. Для запуска тестов использовать: `.venv/bin/python -m pytest tests/ -v`. Системный `python3` / `python3.13` НЕ имеет pytest.
+
+11. **Текущие тесты**: 4 теста проходят (1 config + 3 models).
 
 ### Review Fixes Applied to Plan (Iteration 1)
 
@@ -88,11 +100,42 @@ These changes are already in the plan documents. Implementers should follow the 
 - **Q1-Q2**: Jobs don't survive restart (by design). Audio is best effort (no audio = not an error).
 - **S1 (Tests TODO)**: VideoAnnotator unit tests deferred, TODO noted in Task 5.
 
+### Review Fixes Applied to Plan (Iteration 2)
+
+These changes are ALSO already in the plan documents:
+
+- **C-NEW-1 (writer try/finally)**: `writer` initialized as `None`, release called in `finally` block. After successful release in happy path `writer = None` to avoid double release.
+- **C-NEW-2 (input cleanup isolation)**: `unlink(input.mp4)` moved out of the main try block in worker. Separate try/except with `logger.warning`. Failed unlink doesn't overwrite job status to failed.
+- **C-NEW-3 (tmp file cleanup)**: Endpoint upload wrapped in try/except/finally for tmp file cleanup. `startup_sweep` extended to also delete `.tmp` files. Test updated (`assert removed == 3`).
+- **I-NEW-2 (queue pre-check)**: New `check_queue_capacity()` method in JobManager. Called in endpoint BEFORE upload starts. `create_job()` also calls it (double-check after upload).
+- **I-NEW-3 (ffprobe validation)**: After parsing ffprobe output, validates `width>0, height>0, fps>0`. Falls back to cv2 if invalid.
+- **I-NEW-4 (aiofiles)**: Sync `f.write()` replaced with `aiofiles.open()` + `await f.write()`. `aiofiles` added to requirements.txt in Task 1.
+- **I-NEW-6 (UTC timezone)**: `datetime.now()` → `datetime.now(tz=timezone.utc)` everywhere. `from datetime import datetime, timezone` import.
+- **I-NEW-7 (cv2 fallback try/finally)**: cv2 fallback in `_get_video_metadata()` wrapped in try/finally with `cap.release()`.
+- **I-NEW-8 (tracker bbox validation)**: Added `if w <= 0 or h <= 0: continue` in `_update_trackers()`.
+- **I-NEW-9 (service executor)**: `run_in_executor(None, ...)` → `run_in_executor(executor, ...)` where `executor = get_executor(settings.max_executor_workers).executor`.
+- **I-NEW-10 (mark_processing warning)**: Added `logger.warning` if job status != QUEUED when mark_processing is called.
+- **S-LOGGING**: Added `logger.info` at start of `annotate()` with key parameters.
+- **S-FFMPEG-CHECK**: Added `shutil.which("ffmpeg")` / `shutil.which("ffprobe")` check in lifespan with `logger.warning`.
+- **S-SLOTS**: `@dataclass(slots=True)` for Job, AnnotationParams, AnnotationStats.
+- **REPEAT-I2**: Removed `MAX_CONCURRENT_JOBS` from Task 7 docs configuration.
+- **S-TRACKER-COLOR**: Confirmed solved — `(tracker, det)` tuple preserves class_id, so `draw_detection` uses correct color by class.
+
+### Review Fixes Applied to Plan (Iteration 3)
+
+These changes are ALSO already in the plan documents:
+
+- **C-3-1 (executor bug)**: `model_manager._executor` → `get_executor(settings.max_executor_workers).executor`. Added `from inference_utils import get_executor` to imports. ModelManager has no `_executor` attribute; the executor lives in `inference_utils.py` as `InferenceExecutor` singleton.
+- **C-3-2 (per-job finally)**: Worker restructured with inner try/finally. `finally` always cleans up `input_path`, even on model load failure. Fixes input file leak when `continue` after model error.
+- **I-3-1 (move inside try)**: `shutil.move()` moved inside the try block, right after `create_job()`. On failure, tmp file is cleaned in except handlers.
+- **I-3-2 (config validation)**: `default_detect_every: int = Field(default=5, ge=1)` with `from pydantic import field_validator, Field` import. Prevents ZeroDivisionError from `frame_num % 0`.
+
 ### Accepted Risks (No Changes)
 
 - **C1**: mp4v codec kept — file is for download, not browser playback.
 - **I5**: ModelManager eviction risk accepted — worker holds reference, GC won't delete. Preloaded models are never evicted.
 - **I8**: No graceful shutdown cleanup — startup sweep handles orphans on next start.
+- **startup_sweep safety**: VIDEO_JOBS_DIR=/tmp/vision_jobs is specific enough, risk minimal.
 
 ### Deferred (Out of MVP Scope)
 
@@ -102,6 +145,17 @@ These changes are already in the plan documents. Implementers should follow the 
 - GPU encoding
 - 410 Gone for expired jobs
 - Classes validation against model.names
+- Smoke test for CV2/FFmpeg integration
+- Cancel endpoint (DELETE /jobs/{job_id})
+- Disk space pre-check
+- detect_every > total_frames validation
+- NamedTemporaryFile for upload
+- Monitoring metrics
+- In-flight uploads counting toward queue limit
+- VFR/rotated video metadata cross-check
+- Content-based input validation (beyond extension)
+- FFmpeg stderr last 500 chars instead of first 500
+- Model pre-validation before upload
 
 ## PLAN QUALITY WARNING
 

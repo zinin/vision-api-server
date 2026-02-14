@@ -91,13 +91,18 @@ Expected: FAIL with `AttributeError` — fields don't exist yet
 
 **Step 3: Add settings to config.py**
 
-In `app/config.py`, after line 22 (`max_executor_workers: int = 4`), add:
+In `app/config.py`, add `Field` to pydantic import (line 4):
+```python
+from pydantic import field_validator, Field
+```
+
+After line 22 (`max_executor_workers: int = 4`), add:
 ```python
     # Video annotation job settings
     video_job_ttl: int = 3600  # 1 hour TTL for completed jobs
     video_jobs_dir: str = "/tmp/vision_jobs"
     max_queued_jobs: int = 10
-    default_detect_every: int = 5
+    default_detect_every: int = Field(default=5, ge=1)
 ```
 
 **Step 4: Run test to verify it passes**
@@ -990,6 +995,7 @@ After line 28 (`from visualization import encode_image_to_bytes`), add:
 ```python
 from job_manager import JobManager, JobStatus
 from video_annotator import VideoAnnotator, AnnotationParams, AnnotationStats
+from inference_utils import get_executor
 ```
 
 Add to the models import (line 20-27), add `JobCreatedResponse, JobStatusResponse, JobStats`:
@@ -1076,77 +1082,79 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
 
             job_manager.mark_processing(job_id)
 
-            # Get model
-            model_name = job.params.get("model")
             try:
-                model_entry = await model_manager.get_model(model_name)
-            except (RuntimeError, ValueError) as e:
-                job_manager.mark_failed(job_id, f"Model error: {e}")
-                continue
+                # Get model
+                model_name = job.params.get("model")
+                try:
+                    model_entry = await model_manager.get_model(model_name)
+                except (RuntimeError, ValueError) as e:
+                    job_manager.mark_failed(job_id, f"Model error: {e}")
+                    continue
 
-            annotator = VideoAnnotator(
-                model=model_entry.model,
-                visualizer=model_entry.visualizer,
-                class_names=model_entry.model.names,
-            )
+                annotator = VideoAnnotator(
+                    model=model_entry.model,
+                    visualizer=model_entry.visualizer,
+                    class_names=model_entry.model.names,
+                )
 
-            params = AnnotationParams(
-                conf=job.params.get("conf", 0.5),
-                imgsz=job.params.get("imgsz", 640),
-                max_det=job.params.get("max_det", 100),
-                detect_every=job.params.get(
-                    "detect_every", settings.default_detect_every
-                ),
-                classes=job.params.get("classes"),
-                line_width=job.params.get("line_width", 2),
-                show_labels=job.params.get("show_labels", True),
-                show_conf=job.params.get("show_conf", True),
-            )
-
-            output_path = job.input_path.parent / "output.mp4"
-
-            def progress_cb(progress: int) -> None:
-                job_manager.update_progress(job_id, progress)
-
-            # Run in executor (blocking I/O + YOLO inference)
-            loop = asyncio.get_running_loop()
-            executor = model_manager._executor  # Use service's controlled executor
-            try:
-                stats = await loop.run_in_executor(
-                    executor,
-                    lambda: annotator.annotate(
-                        input_path=job.input_path,
-                        output_path=output_path,
-                        params=params,
-                        progress_callback=progress_cb,
+                params = AnnotationParams(
+                    conf=job.params.get("conf", 0.5),
+                    imgsz=job.params.get("imgsz", 640),
+                    max_det=job.params.get("max_det", 100),
+                    detect_every=job.params.get(
+                        "detect_every", settings.default_detect_every
                     ),
+                    classes=job.params.get("classes"),
+                    line_width=job.params.get("line_width", 2),
+                    show_labels=job.params.get("show_labels", True),
+                    show_conf=job.params.get("show_conf", True),
                 )
 
-                job_manager.mark_completed(
-                    job_id,
-                    output_path=output_path,
-                    stats={
-                        "total_frames": stats.total_frames,
-                        "detected_frames": stats.detected_frames,
-                        "tracked_frames": stats.tracked_frames,
-                        "total_detections": stats.total_detections,
-                        "processing_time_ms": stats.processing_time_ms,
-                    },
-                )
+                output_path = job.input_path.parent / "output.mp4"
 
-            except Exception as e:
-                logger.error(
-                    f"Annotation failed for job {job_id}: {e}",
-                    exc_info=True,
-                )
-                job_manager.mark_failed(job_id, str(e))
+                def progress_cb(progress: int) -> None:
+                    job_manager.update_progress(job_id, progress)
 
-            # Clean up input file (separate from try to avoid failed on unlink error)
-            try:
-                if job.input_path and job.input_path.exists():
-                    job.input_path.unlink()
-            except OSError as e:
-                logger.warning(f"Failed to clean up input file for {job_id}: {e}")
+                # Run in executor (blocking I/O + YOLO inference)
+                loop = asyncio.get_running_loop()
+                executor = get_executor(settings.max_executor_workers).executor
+                try:
+                    stats = await loop.run_in_executor(
+                        executor,
+                        lambda: annotator.annotate(
+                            input_path=job.input_path,
+                            output_path=output_path,
+                            params=params,
+                            progress_callback=progress_cb,
+                        ),
+                    )
+
+                    job_manager.mark_completed(
+                        job_id,
+                        output_path=output_path,
+                        stats={
+                            "total_frames": stats.total_frames,
+                            "detected_frames": stats.detected_frames,
+                            "tracked_frames": stats.tracked_frames,
+                            "total_detections": stats.total_detections,
+                            "processing_time_ms": stats.processing_time_ms,
+                        },
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        f"Annotation failed for job {job_id}: {e}",
+                        exc_info=True,
+                    )
+                    job_manager.mark_failed(job_id, str(e))
+
+            finally:
+                # Always clean up input file (per-job finally)
+                try:
+                    if job.input_path and job.input_path.exists():
+                        job.input_path.unlink()
+                except OSError as e:
+                    logger.warning(f"Failed to clean up input file for {job_id}: {e}")
 
         except asyncio.CancelledError:
             logger.info("Annotation worker cancelled")
@@ -1266,6 +1274,9 @@ async def annotate_video(
                 "model": model,
             }
         )
+
+        # Move uploaded file to job directory (inside try for cleanup)
+        _shutil.move(str(tmp_file), str(job.input_path))
     except HTTPException:
         tmp_file.unlink(missing_ok=True)
         raise
@@ -1275,9 +1286,6 @@ async def annotate_video(
     except Exception:
         tmp_file.unlink(missing_ok=True)
         raise
-
-    # Move uploaded file to job directory
-    _shutil.move(str(tmp_file), str(job.input_path))
 
     logger.info(
         f"Video annotation job created: {job.job_id}, "

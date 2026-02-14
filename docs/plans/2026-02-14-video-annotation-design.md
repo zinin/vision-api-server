@@ -1,0 +1,145 @@
+# Video Annotation Design (VAS-2)
+
+Video endpoint that takes input video and returns the same video with detected objects highlighted with bounding boxes.
+
+## Approach
+
+YOLO detection every Nth frame + OpenCV CSRT tracker for intermediate frames. Async job API.
+
+## API
+
+### POST /detect/video/visualize
+
+Creates annotation job. Returns 202 with `job_id`.
+
+Parameters:
+- `file` (file, required) — video file
+- `conf` (float, 0.5) — confidence threshold, 0.0-1.0
+- `imgsz` (int, 640) — YOLO inference size, 32-2016
+- `max_det` (int, 100) — max detections per frame, 1-1000
+- `model` (str, null) — YOLO model name
+- `detect_every` (int, 5) — run YOLO every N frames, 1-300
+- `classes` (str, null) — comma-separated class filter (e.g. `person,car`)
+- `line_width` (int, 2) — bbox line width, 1-10
+- `show_labels` (bool, true) — show class names
+- `show_conf` (bool, true) — show confidence scores
+
+Response (202):
+```json
+{
+  "job_id": "uuid",
+  "status": "queued",
+  "message": "Video annotation job created"
+}
+```
+
+### GET /jobs/{job_id}
+
+Job status and result info.
+
+Response (processing):
+```json
+{
+  "job_id": "uuid",
+  "status": "processing",
+  "progress": 45,
+  "created_at": "2026-02-14T12:00:00"
+}
+```
+
+Response (completed):
+```json
+{
+  "job_id": "uuid",
+  "status": "completed",
+  "progress": 100,
+  "download_url": "/jobs/{job_id}/download",
+  "stats": {
+    "total_frames": 900,
+    "detected_frames": 180,
+    "tracked_frames": 720,
+    "total_detections": 1250,
+    "processing_time_ms": 45000
+  }
+}
+```
+
+### GET /jobs/{job_id}/download
+
+Returns MP4 file as StreamingResponse.
+
+## Processing Pipeline
+
+1. Save uploaded video to `/tmp/vision_jobs/{job_id}/input.mp4`
+2. Get metadata (fps, resolution, duration) via ffprobe
+3. Open video with `cv2.VideoCapture` (streaming decoder, ~50 MB RAM)
+4. Create `cv2.VideoWriter` for output video (writes to disk frame-by-frame)
+5. Frame loop:
+   - If `frame_num % detect_every == 0`: run YOLO, reinitialize CSRT trackers
+   - Else: update CSRT trackers to get box positions
+   - Draw bboxes using existing `DetectionVisualizer`
+   - Write frame to VideoWriter
+6. Close VideoWriter
+7. FFmpeg: merge annotated video stream with audio from original
+8. Update job status to completed
+9. Clean up intermediate files (input.mp4, video_only.mp4)
+
+Tracker: `cv2.TrackerCSRT` — best accuracy/speed balance for short tracking intervals.
+
+Reinit strategy: on every YOLO frame, trackers are fully recreated from fresh detections. Prevents drift accumulation.
+
+## Job Management
+
+In-memory `JobManager` with:
+- `dict[str, Job]` state storage (lost on restart, acceptable)
+- FIFO queue with `asyncio.Queue`
+- Single worker (one video at a time, GPU bottleneck)
+- Background cleanup task (every 60s, removes expired jobs)
+
+Job states: `queued` → `processing` → `completed` | `failed`
+
+Limits:
+- `MAX_QUEUED_JOBS=10` — 429 when exceeded
+- `MAX_VIDEO_SIZE=500MB` — existing limit
+
+## Storage
+
+```
+/tmp/vision_jobs/{job_id}/
+├── input.mp4          # uploaded video (deleted after processing)
+├── video_only.mp4     # VideoWriter output, no audio (deleted after merge)
+└── output.mp4         # final result with audio (deleted by TTL)
+```
+
+Disk: ~2-3x input size temporarily, ~1x after cleanup.
+RAM: ~50-100 MB per job regardless of video length.
+
+## Configuration
+
+New env variables in `config.py`:
+- `VIDEO_JOB_TTL=3600` — completed job TTL (seconds)
+- `VIDEO_JOBS_DIR=/tmp/vision_jobs` — job files directory
+- `MAX_CONCURRENT_JOBS=1` — parallel video processing
+- `MAX_QUEUED_JOBS=10` — queue limit
+- `DEFAULT_DETECT_EVERY=5` — default YOLO interval
+
+## New Files
+
+| File | Purpose |
+|------|---------|
+| `app/job_manager.py` | JobManager, Job dataclass, queue, TTL cleanup |
+| `app/video_annotator.py` | Pipeline: decode → YOLO + CSRT tracker → encode → FFmpeg audio merge |
+
+## Changes to Existing Files
+
+| File | Changes |
+|------|---------|
+| `app/main.py` | +3 endpoints, JobManager init in lifespan |
+| `app/config.py` | +5 env variables |
+| `app/models.py` | +3 Pydantic response models |
+
+## Reused Without Changes
+
+- `app/visualization.py` — `DetectionVisualizer` used as-is
+- `app/inference_utils.py` — `run_inference()` used as-is
+- `app/video_utils.py` — not used (different pipeline: per-frame, not keyframe)

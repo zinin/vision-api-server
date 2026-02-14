@@ -14,6 +14,12 @@ from visualization import DetectionVisualizer, DetectionBox
 
 logger = logging.getLogger(__name__)
 
+CODEC_MAP = {
+    "h264": "libx264",
+    "h265": "libx265",
+    "av1": "libsvtav1",
+}
+
 
 def _create_csrt_tracker() -> cv2.Tracker:
     """Create CSRT tracker, handling different OpenCV versions."""
@@ -55,10 +61,14 @@ class VideoAnnotator:
         model: Any,
         visualizer: DetectionVisualizer,
         class_names: dict[int, str],
+        codec: str = "h264",
+        crf: int = 18,
     ):
         self.model = model
         self.visualizer = visualizer
         self.class_names = class_names
+        self.codec = codec
+        self.crf = crf
 
     def annotate(
         self,
@@ -337,13 +347,15 @@ class VideoAnnotator:
     def _merge_audio(
         self, original: Path, video_only: Path, output: Path
     ) -> None:
-        """Merge annotated video with audio from original using FFmpeg."""
+        """Re-encode video with target codec and merge audio from original using FFmpeg."""
+        encoder = CODEC_MAP.get(self.codec, "libx264")
         cmd = [
             "ffmpeg",
             "-y",
             "-i", str(video_only),
             "-i", str(original),
-            "-c:v", "copy",
+            "-c:v", encoder,
+            "-crf", str(self.crf),
             "-c:a", "aac",
             "-map", "0:v:0",
             "-map", "1:a:0?",

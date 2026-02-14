@@ -8,3 +8,5 @@ def test_video_job_settings_defaults():
     assert s.max_queued_jobs == 10
     assert s.default_detect_every == 5
     assert s.log_level == "INFO"
+    assert s.video_codec == "h264"
+    assert s.video_crf == 18

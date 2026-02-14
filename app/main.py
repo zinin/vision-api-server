@@ -198,6 +198,8 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     model=model_entry.model,
                     visualizer=model_entry.visualizer,
                     class_names=model_entry.model.names,
+                    codec=settings.video_codec,
+                    crf=settings.video_crf,
                 )
 
                 params = AnnotationParams(

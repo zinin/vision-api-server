@@ -61,6 +61,8 @@ VIDEO_JOB_TTL=3600                      # Completed job TTL seconds
 VIDEO_JOBS_DIR=/tmp/vision_jobs         # Job files directory
 MAX_QUEUED_JOBS=10                      # Queue limit
 DEFAULT_DETECT_EVERY=5                  # YOLO every N frames
+VIDEO_CODEC=h264                        # Output codec: h264, h265, av1
+VIDEO_CRF=18                            # Quality: 0=lossless, 18=near-lossless, 23=default
 ```
 
 ## Testing

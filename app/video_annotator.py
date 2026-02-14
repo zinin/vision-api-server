@@ -1,3 +1,4 @@
+import json
 import logging
 import subprocess
 import shutil
@@ -105,6 +106,7 @@ class VideoAnnotator:
             stats = AnnotationStats(total_frames=total_frames)
             trackers: list[tuple[cv2.Tracker, DetectionBox]] = []
             current_detections: list[DetectionBox] = []
+            font_scale = self.visualizer.calculate_adaptive_font_scale(height)
             frame_num = 0
             start_time = time.perf_counter()
 
@@ -134,14 +136,12 @@ class VideoAnnotator:
                     stats.tracked_frames += 1
                     stats.total_detections += len(current_detections)
 
-                self._draw_detections(frame, current_detections, params)
+                self._draw_detections(frame, current_detections, params, font_scale)
                 writer.write(frame)
                 frame_num += 1
 
-                if progress_callback and frame_num % 10 == 0:
-                    progress = int(
-                        (frame_num / max(total_frames, 1)) * 100
-                    )
+                if progress_callback and total_frames > 0 and frame_num % 10 == 0:
+                    progress = int((frame_num / total_frames) * 100)
                     progress_callback(min(progress, 99))
 
             writer.release()
@@ -153,8 +153,11 @@ class VideoAnnotator:
 
             self._merge_audio(input_path, video_only_path, output_path)
 
-            if video_only_path.exists():
-                video_only_path.unlink()
+            try:
+                if video_only_path.exists():
+                    video_only_path.unlink()
+            except OSError as e:
+                logger.warning(f"Failed to clean up intermediate file: {e}")
 
             return stats
 
@@ -168,7 +171,6 @@ class VideoAnnotator:
         video_path: Path,
     ) -> tuple[float, int, int, int]:
         """Get video metadata via ffprobe. Returns (fps, width, height, total_frames)."""
-        import json as _json
 
         cmd = [
             "ffprobe",
@@ -183,7 +185,7 @@ class VideoAnnotator:
                 cmd, capture_output=True, text=True, timeout=30
             )
             if result.returncode == 0:
-                data = _json.loads(result.stdout)
+                data = json.loads(result.stdout)
                 stream = data["streams"][0]
                 # Parse fps from r_frame_rate (e.g. "30/1")
                 r_rate = stream.get("r_frame_rate", "30/1")
@@ -202,7 +204,7 @@ class VideoAnnotator:
                 logger.warning(
                     f"ffprobe returned invalid metadata: {width}x{height} @ {fps}fps"
                 )
-        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        except Exception as e:
             logger.warning(f"ffprobe failed: {e}, falling back to cv2")
 
         # Fallback to cv2
@@ -290,6 +292,7 @@ class VideoAnnotator:
         frame: np.ndarray,
         detections: list[DetectionBox],
         params: AnnotationParams,
+        font_scale: float,
     ) -> None:
         for det in detections:
             self.visualizer.draw_detection(
@@ -298,9 +301,7 @@ class VideoAnnotator:
                 line_width=params.line_width,
                 show_labels=params.show_labels,
                 show_conf=params.show_conf,
-                font_scale=self.visualizer.calculate_adaptive_font_scale(
-                    frame.shape[0]
-                ),
+                font_scale=font_scale,
                 text_thickness=1,
             )
 

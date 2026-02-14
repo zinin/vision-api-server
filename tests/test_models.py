@@ -1,4 +1,4 @@
-from app.models import JobCreatedResponse, JobStatusResponse, JobStats
+from models import JobCreatedResponse, JobStatusResponse, JobStats
 
 
 def test_job_created_response():

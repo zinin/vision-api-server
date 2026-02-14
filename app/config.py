@@ -22,10 +22,10 @@ class Settings(BaseSettings):
     max_executor_workers: int = 4
 
     # Video annotation job settings
-    video_job_ttl: int = 3600  # 1 hour TTL for completed jobs
+    video_job_ttl: int = Field(default=3600, ge=60)  # 1 hour TTL for completed jobs
     video_jobs_dir: str = "/tmp/vision_jobs"
     max_queued_jobs: int = 10
-    default_detect_every: int = Field(default=5, ge=1)
+    default_detect_every: int = Field(default=5, ge=1, le=300)
 
     @property
     def preload_model_map(self) -> dict[str, str]:

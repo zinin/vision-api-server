@@ -1,3 +1,4 @@
+import shutil
 import time
 import logging
 import base64
@@ -5,6 +6,7 @@ from typing import Annotated
 from io import BytesIO
 from collections import Counter
 
+import aiofiles
 import cv2
 import torch
 
@@ -34,7 +36,7 @@ from models import (
 )
 from visualization import encode_image_to_bytes
 from job_manager import JobManager, JobStatus
-from video_annotator import VideoAnnotator, AnnotationParams, AnnotationStats
+from video_annotator import VideoAnnotator, AnnotationParams
 from inference_utils import get_executor
 from video_utils import extract_frames_from_video, VideoFrameExtractor
 
@@ -101,8 +103,7 @@ async def lifespan(app: FastAPI):
         app.state.model_manager = model_manager
 
         # Verify ffmpeg/ffprobe are available for video annotation
-        import shutil as _shutil_check
-        if not _shutil_check.which("ffmpeg") or not _shutil_check.which("ffprobe"):
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             logger.warning(
                 "ffmpeg/ffprobe not found — video annotation will have limited functionality"
             )
@@ -261,7 +262,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
 app = FastAPI(
     title="YOLO Detection API",
     description="REST API for image and video analysis using Ultralytics YOLO",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -868,8 +869,6 @@ async def annotate_video(
         raise HTTPException(status_code=429, detail=str(e))
 
     # Stream upload to temp file using aiofiles, then validate size
-    import aiofiles
-    import shutil as _shutil
     tmp_dir = Path(settings.video_jobs_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_file = tmp_dir / f"upload_{uuid.uuid4().hex[:8]}.tmp"
@@ -902,7 +901,7 @@ async def annotate_video(
         )
 
         # Move uploaded file to job directory (inside try for cleanup)
-        _shutil.move(str(tmp_file), str(job.input_path))
+        shutil.move(str(tmp_file), str(job.input_path))
     except HTTPException:
         tmp_file.unlink(missing_ok=True)
         raise

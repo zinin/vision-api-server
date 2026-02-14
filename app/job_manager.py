@@ -146,6 +146,12 @@ class JobManager:
         """Delete all job directories and orphan tmp files on startup."""
         if not self.jobs_dir.exists():
             return 0
+        # Safety: refuse to sweep well-known system directories
+        resolved = self.jobs_dir.resolve()
+        _dangerous = {Path(p) for p in ("/", "/tmp", "/var", "/home", "/root", "/etc", "/usr")}
+        if resolved in _dangerous:
+            logger.warning(f"Refusing to sweep dangerous path: {resolved}")
+            return 0
         count = 0
         for entry in self.jobs_dir.iterdir():
             if entry.is_dir():

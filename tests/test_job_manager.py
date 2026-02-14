@@ -109,6 +109,13 @@ def test_cleanup_expired(manager, tmp_jobs_dir):
     assert not (Path(tmp_jobs_dir) / job_id).exists()
 
 
+def test_startup_sweep_refuses_dangerous_path():
+    """Verify startup_sweep refuses to sweep dangerous system directories."""
+    for dangerous in ("/tmp", "/", "/var", "/home"):
+        mgr = JobManager(jobs_dir=dangerous, ttl_seconds=10, max_queued=3)
+        assert mgr.startup_sweep() == 0
+
+
 def test_startup_sweep(tmp_jobs_dir):
     jobs_dir = Path(tmp_jobs_dir)
     jobs_dir.mkdir(parents=True, exist_ok=True)

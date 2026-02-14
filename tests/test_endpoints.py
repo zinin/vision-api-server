@@ -7,8 +7,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from config import Settings
-from job_manager import JobManager, JobStatus
+from config import Settings, get_settings
+from dependencies import get_job_manager, get_model_manager
+from job_manager import JobManager
 from main import app
 
 
@@ -42,15 +43,9 @@ def mock_model_manager():
 @pytest.fixture
 def client(test_settings, job_manager_for_tests, mock_model_manager):
     app.router.lifespan_context = _noop_lifespan
-    app.dependency_overrides[__import__("dependencies", fromlist=["get_job_manager"]).get_job_manager] = (
-        lambda: job_manager_for_tests
-    )
-    app.dependency_overrides[__import__("dependencies", fromlist=["get_model_manager"]).get_model_manager] = (
-        lambda: mock_model_manager
-    )
-    app.dependency_overrides[__import__("config", fromlist=["get_settings"]).get_settings] = (
-        lambda: test_settings
-    )
+    app.dependency_overrides[get_job_manager] = lambda: job_manager_for_tests
+    app.dependency_overrides[get_model_manager] = lambda: mock_model_manager
+    app.dependency_overrides[get_settings] = lambda: test_settings
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
@@ -84,13 +79,16 @@ class TestAnnotateVideo:
         resp = client.post("/detect/video/visualize", files=[_make_video_file()])
         assert resp.status_code == 429
 
-    def test_too_large(self, client):
+    def test_too_large(self, client, test_settings):
         with patch("main.MAX_VIDEO_SIZE", 10):
             resp = client.post(
                 "/detect/video/visualize",
                 files=[_make_video_file(content=b"x" * 100)],
             )
         assert resp.status_code == 413
+        # Verify temp file is cleaned up
+        tmp_files = list(Path(test_settings.video_jobs_dir).glob("*.tmp"))
+        assert tmp_files == [], f"Temp files not cleaned up: {tmp_files}"
 
     def test_invalid_model(self, client, mock_model_manager):
         mock_model_manager.get_model = AsyncMock(side_effect=RuntimeError("not found"))

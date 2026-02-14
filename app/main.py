@@ -918,6 +918,9 @@ async def annotate_video(
         raise HTTPException(status_code=429, detail=str(e))
     except Exception:
         tmp_file.unlink(missing_ok=True)
+        # Mark job as failed if it was already created (e.g. shutil.move failed)
+        if "job" in locals():
+            job_manager.mark_failed(job.job_id, error="Failed to save uploaded file")
         raise
 
     logger.info(

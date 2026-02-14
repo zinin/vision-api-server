@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 import pytest
 import numpy as np
 
@@ -57,6 +59,44 @@ class TestDrawDetection:
         det = DetectionBox(x1=10, y1=10, x2=100, y2=100, class_id=0, class_name="person", confidence=0.9)
         visualizer.draw_detection(image, det, line_width=2, show_labels=True, show_conf=True, font_scale=0.5, text_thickness=1)
         assert image.sum() > original_sum
+
+
+class TestDrawYoloResults:
+    def test_draws_detections_on_copy(self):
+        visualizer = DetectionVisualizer(class_names={0: "person", 1: "car"})
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        xyxy = np.array([[10, 20, 100, 200], [50, 60, 150, 250]], dtype=np.float32)
+        cls = np.array([0, 1], dtype=np.float32)
+        conf = np.array([0.9, 0.8], dtype=np.float32)
+
+        boxes = MagicMock()
+        boxes.xyxy.cpu.return_value.numpy.return_value = xyxy
+        boxes.cls.cpu.return_value.numpy.return_value = cls
+        boxes.conf.cpu.return_value.numpy.return_value = conf
+        boxes.__len__ = lambda self: 2
+
+        result = MagicMock()
+        result.boxes = boxes
+
+        annotated = visualizer.draw_yolo_results(image, [result])
+
+        # Original image is not modified
+        assert image.sum() == 0
+        # Annotated copy has drawings
+        assert annotated.sum() > 0
+
+    def test_empty_results(self):
+        visualizer = DetectionVisualizer(class_names={0: "person"})
+        image = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        result = MagicMock()
+        result.boxes = None
+
+        annotated = visualizer.draw_yolo_results(image, [result])
+        # Returns a copy even with no detections
+        assert annotated is not image
+        assert annotated.sum() == 0
 
 
 class TestEncodeImageToBytes:

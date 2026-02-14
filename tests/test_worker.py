@@ -1,5 +1,4 @@
 import asyncio
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -88,13 +87,7 @@ class TestAnnotationWorker:
         with (
             patch("main.VideoAnnotator", mock_annotator_cls),
             patch("main.get_executor", return_value=mock_executor),
-            patch("main.asyncio.get_running_loop") as mock_loop,
         ):
-            # Make run_in_executor call the function directly
-            async def fake_run_in_executor(executor, func):
-                return func()
-            mock_loop.return_value.run_in_executor = fake_run_in_executor
-
             await _run_worker_until_job_done(worker_app, worker_settings, worker_job_manager)
 
         completed = worker_job_manager.get_job(job.job_id)
@@ -132,12 +125,7 @@ class TestAnnotationWorker:
         with (
             patch("main.VideoAnnotator", mock_annotator_cls),
             patch("main.get_executor", return_value=mock_executor),
-            patch("main.asyncio.get_running_loop") as mock_loop,
         ):
-            async def fake_run_in_executor(executor, func):
-                return func()
-            mock_loop.return_value.run_in_executor = fake_run_in_executor
-
             await _run_worker_until_job_done(worker_app, worker_settings, worker_job_manager)
 
         failed = worker_job_manager.get_job(job.job_id)
@@ -161,12 +149,7 @@ class TestAnnotationWorker:
         with (
             patch("main.VideoAnnotator", mock_annotator_cls),
             patch("main.get_executor", return_value=mock_executor),
-            patch("main.asyncio.get_running_loop") as mock_loop,
         ):
-            async def fake_run_in_executor(executor, func):
-                return func()
-            mock_loop.return_value.run_in_executor = fake_run_in_executor
-
             await _run_worker_until_job_done(worker_app, worker_settings, worker_job_manager)
 
         assert not job.input_path.exists()
@@ -237,12 +220,7 @@ class TestAnnotationWorker:
         with (
             patch("main.VideoAnnotator", mock_annotator_cls),
             patch("main.get_executor", return_value=mock_executor),
-            patch("main.asyncio.get_running_loop") as mock_loop,
         ):
-            async def fake_run_in_executor(executor, func):
-                return func()
-            mock_loop.return_value.run_in_executor = fake_run_in_executor
-
             await _run_worker_until_job_done(worker_app, worker_settings, worker_job_manager)
 
         assert worker_job_manager.get_job(job1.job_id).status == JobStatus.FAILED

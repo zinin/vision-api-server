@@ -1,8 +1,9 @@
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
+import cv2
 import numpy as np
 import pytest
 
@@ -154,11 +155,10 @@ class TestGetVideoMetadata:
         }
         mock_cap = MagicMock()
         mock_cap.get.side_effect = lambda prop: {
-            0: 30.0,  # CAP_PROP_POS_MSEC (not used but safe)
-            3: 1280.0,  # CAP_PROP_FRAME_WIDTH
-            4: 720.0,  # CAP_PROP_FRAME_HEIGHT
-            5: 25.0,  # CAP_PROP_FPS
-            7: 500.0,  # CAP_PROP_FRAME_COUNT
+            cv2.CAP_PROP_FRAME_WIDTH: 1280.0,
+            cv2.CAP_PROP_FRAME_HEIGHT: 720.0,
+            cv2.CAP_PROP_FPS: 25.0,
+            cv2.CAP_PROP_FRAME_COUNT: 500.0,
         }.get(prop, 0)
 
         with (
@@ -175,10 +175,10 @@ class TestGetVideoMetadata:
     def test_ffprobe_error_falls_back_to_cv2(self):
         mock_cap = MagicMock()
         mock_cap.get.side_effect = lambda prop: {
-            3: 640.0,
-            4: 480.0,
-            5: 30.0,
-            7: 300.0,
+            cv2.CAP_PROP_FRAME_WIDTH: 640.0,
+            cv2.CAP_PROP_FRAME_HEIGHT: 480.0,
+            cv2.CAP_PROP_FPS: 30.0,
+            cv2.CAP_PROP_FRAME_COUNT: 300.0,
         }.get(prop, 0)
 
         with (
@@ -393,11 +393,16 @@ class TestAnnotatePipeline:
 
         annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
 
+        def subprocess_side_effect(cmd, **kwargs):
+            if cmd[0] == "ffprobe":
+                return ffprobe_result
+            return merge_result
+
         with (
             patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
             patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
             patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
-            patch("video_annotator.subprocess.run", side_effect=[ffprobe_result, merge_result]),
+            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
             patch("video_annotator._create_csrt_tracker", return_value=mock_tracker),
         ):
             stats = annotator.annotate(input_path, output_path, AnnotationParams(detect_every=detect_every))

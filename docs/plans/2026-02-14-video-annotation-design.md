@@ -66,23 +66,24 @@ Response (completed):
 
 ### GET /jobs/{job_id}/download
 
-Returns MP4 file as StreamingResponse.
+Returns MP4 file as FileResponse.
 
 ## Processing Pipeline
 
-1. Save uploaded video to `/tmp/vision_jobs/{job_id}/input.mp4`
-2. Get metadata (fps, resolution, duration) via ffprobe
-3. Open video with `cv2.VideoCapture` (streaming decoder, ~50 MB RAM)
-4. Create `cv2.VideoWriter` for output video (writes to disk frame-by-frame)
-5. Frame loop:
+1. Stream uploaded video to `/tmp/vision_jobs/{job_id}/input.mp4` (chunked write, not full read into RAM)
+2. Validate file size after write, create job only after successful save
+3. Get metadata (fps, resolution, duration) via ffprobe (more reliable than cv2.CAP_PROP for VFR video)
+4. Open video with `cv2.VideoCapture` (streaming decoder, ~50 MB RAM)
+5. Create `cv2.VideoWriter` for output video (writes to disk frame-by-frame)
+6. Frame loop:
    - If `frame_num % detect_every == 0`: run YOLO, reinitialize CSRT trackers
    - Else: update CSRT trackers to get box positions
-   - Draw bboxes using existing `DetectionVisualizer`
+   - Draw bboxes using `DetectionVisualizer.draw_detection()` (public method)
    - Write frame to VideoWriter
-6. Close VideoWriter
-7. FFmpeg: merge annotated video stream with audio from original
-8. Update job status to completed
-9. Clean up intermediate files (input.mp4, video_only.mp4)
+7. Close VideoWriter
+8. FFmpeg: merge annotated video stream with audio from original (best effort — no audio is not an error)
+9. Update job status to completed
+10. Clean up intermediate files (input.mp4, video_only.mp4)
 
 Tracker: `cv2.TrackerCSRT` — best accuracy/speed balance for short tracking intervals.
 
@@ -91,16 +92,21 @@ Reinit strategy: on every YOLO frame, trackers are fully recreated from fresh de
 ## Job Management
 
 In-memory `JobManager` with:
-- `dict[str, Job]` state storage (lost on restart, acceptable)
+- `dict[str, Job]` state storage (lost on restart, acceptable — by design)
 - FIFO queue with `asyncio.Queue`
 - Single worker (one video at a time, GPU bottleneck)
 - Background cleanup task (every 60s, removes expired jobs)
+- Startup sweep: delete all directories in `VIDEO_JOBS_DIR` on startup (orphan cleanup after restart)
 
 Job states: `queued` → `processing` → `completed` | `failed`
 
 Limits:
 - `MAX_QUEUED_JOBS=10` — 429 when exceeded
 - `MAX_VIDEO_SIZE=500MB` — existing limit
+
+**Deployment constraint:** Requires `workers=1` (single process). In-memory state is not shared across processes. Multi-worker deployment (gunicorn, multiple pods) is not supported.
+
+**Audio:** Best effort. If source video has no audio or FFmpeg merge fails, output will be video-only without error.
 
 ## Storage
 
@@ -119,7 +125,6 @@ RAM: ~50-100 MB per job regardless of video length.
 New env variables in `config.py`:
 - `VIDEO_JOB_TTL=3600` — completed job TTL (seconds)
 - `VIDEO_JOBS_DIR=/tmp/vision_jobs` — job files directory
-- `MAX_CONCURRENT_JOBS=1` — parallel video processing
 - `MAX_QUEUED_JOBS=10` — queue limit
 - `DEFAULT_DETECT_EVERY=5` — default YOLO interval
 
@@ -135,11 +140,12 @@ New env variables in `config.py`:
 | File | Changes |
 |------|---------|
 | `app/main.py` | +3 endpoints, JobManager init in lifespan |
-| `app/config.py` | +5 env variables |
+| `app/config.py` | +4 env variables |
+| `app/visualization.py` | Rename `_draw_detection` → `draw_detection`, `_calculate_adaptive_font_scale` → `calculate_adaptive_font_scale` (make public) |
 | `app/models.py` | +3 Pydantic response models |
 
 ## Reused Without Changes
 
-- `app/visualization.py` — `DetectionVisualizer` used as-is
+- `app/visualization.py` — `DetectionVisualizer` (methods renamed to public, API unchanged)
 - `app/inference_utils.py` — `run_inference()` used as-is
 - `app/video_utils.py` — not used (different pipeline: per-frame, not keyframe)

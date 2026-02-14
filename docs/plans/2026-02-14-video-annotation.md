@@ -79,7 +79,6 @@ def test_video_job_settings_defaults():
     s = Settings(yolo_models="{}")
     assert s.video_job_ttl == 3600
     assert s.video_jobs_dir == "/tmp/vision_jobs"
-    assert s.max_concurrent_jobs == 1
     assert s.max_queued_jobs == 10
     assert s.default_detect_every == 5
 ```
@@ -96,7 +95,6 @@ In `app/config.py`, after line 22 (`max_executor_workers: int = 4`), add:
     # Video annotation job settings
     video_job_ttl: int = 3600  # 1 hour TTL for completed jobs
     video_jobs_dir: str = "/tmp/vision_jobs"
-    max_concurrent_jobs: int = 1
     max_queued_jobs: int = 10
     default_detect_every: int = 5
 ```
@@ -340,6 +338,21 @@ def test_cleanup_expired(manager, tmp_jobs_dir):
     assert manager.cleanup_expired() == 1
     assert manager.get_job(job_id) is None
     assert not (Path(tmp_jobs_dir) / job_id).exists()
+
+
+def test_startup_sweep(tmp_jobs_dir):
+    jobs_dir = Path(tmp_jobs_dir)
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    # Create orphan directories
+    (jobs_dir / "orphan1").mkdir()
+    (jobs_dir / "orphan2").mkdir()
+    (jobs_dir / "orphan2" / "output.mp4").touch()
+
+    mgr = JobManager(jobs_dir=tmp_jobs_dir, ttl_seconds=10, max_queued=3)
+    removed = mgr.startup_sweep()
+    assert removed == 2
+    assert not (jobs_dir / "orphan1").exists()
+    assert not (jobs_dir / "orphan2").exists()
 ```
 
 **Step 2: Run tests to verify they fail**
@@ -490,6 +503,19 @@ class JobManager:
                 if evicted:
                     logger.info(f"Job cleanup: removed {evicted} expired job(s)")
 
+    def startup_sweep(self) -> int:
+        """Delete all job directories on startup (orphan cleanup after restart)."""
+        if not self.jobs_dir.exists():
+            return 0
+        count = 0
+        for entry in self.jobs_dir.iterdir():
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+                count += 1
+        if count:
+            logger.info(f"Startup sweep: removed {count} orphan job dir(s)")
+        return count
+
     def start_cleanup_task(self, interval: int = 60) -> None:
         if self._cleanup_task is None or self._cleanup_task.done():
             self._shutdown_event.clear()
@@ -511,7 +537,7 @@ class JobManager:
 **Step 4: Run tests to verify they pass**
 
 Run: `cd /opt/github/zinin/vision-api-server && python -m pytest tests/test_job_manager.py -v`
-Expected: All 9 tests PASS
+Expected: All 10 tests PASS
 
 **Step 5: Commit**
 
@@ -526,8 +552,17 @@ git commit -m "feat: add JobManager with async queue and TTL cleanup"
 
 **Files:**
 - Create: `app/video_annotator.py`
+- Modify: `app/visualization.py` (rename private methods to public)
 
-No unit tests for this task — VideoAnnotator requires YOLO model, video files, and FFmpeg. It will be tested via integration in Task 7.
+No unit tests for this task — VideoAnnotator requires YOLO model, video files, and FFmpeg. It will be tested via integration in Task 7. TODO: add unit tests with mocked cv2/subprocess later.
+
+**Step 0: Make visualization methods public**
+
+In `app/visualization.py`, rename:
+- `_draw_detection` → `draw_detection` (line 157)
+- `_calculate_adaptive_font_scale` → `calculate_adaptive_font_scale` (line 86)
+
+Update all internal callers in `draw_yolo_results` accordingly.
 
 **Step 1: Create video_annotator.py**
 
@@ -612,15 +647,14 @@ class VideoAnnotator:
             params: Annotation parameters
             progress_callback: Called with progress 0-99 during processing
         """
+        # Get metadata via ffprobe (more reliable than cv2.CAP_PROP for VFR video)
+        fps, width, height, total_frames = self._get_video_metadata(input_path)
+
         cap = cv2.VideoCapture(str(input_path))
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {input_path}")
 
         try:
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
             video_only_path = output_path.parent / "video_only.mp4"
 
@@ -688,6 +722,52 @@ class VideoAnnotator:
 
         finally:
             cap.release()
+
+    @staticmethod
+    def _get_video_metadata(
+        video_path: Path,
+    ) -> tuple[float, int, int, int]:
+        """Get video metadata via ffprobe. Returns (fps, width, height, total_frames)."""
+        import json as _json
+
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-select_streams", "v:0",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                data = _json.loads(result.stdout)
+                stream = data["streams"][0]
+                # Parse fps from r_frame_rate (e.g. "30/1")
+                r_rate = stream.get("r_frame_rate", "30/1")
+                num, den = map(int, r_rate.split("/"))
+                fps = num / den if den else 30.0
+                width = int(stream.get("width", 0))
+                height = int(stream.get("height", 0))
+                total_frames = int(stream.get("nb_frames", 0))
+                if total_frames == 0:
+                    # Estimate from duration
+                    duration = float(stream.get("duration", 0))
+                    total_frames = int(duration * fps)
+                return fps, width, height, total_frames
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logger.warning(f"ffprobe failed: {e}, falling back to cv2")
+
+        # Fallback to cv2
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return fps, width, height, total_frames
 
     def _extract_detections(
         self, results: list, class_filter: list[str] | None
@@ -763,13 +843,13 @@ class VideoAnnotator:
         params: AnnotationParams,
     ) -> None:
         for det in detections:
-            self.visualizer._draw_detection(
+            self.visualizer.draw_detection(
                 image=frame,
                 det=det,
                 line_width=params.line_width,
                 show_labels=params.show_labels,
                 show_conf=params.show_conf,
-                font_scale=self.visualizer._calculate_adaptive_font_scale(
+                font_scale=self.visualizer.calculate_adaptive_font_scale(
                     frame.shape[0]
                 ),
                 text_thickness=1,
@@ -802,8 +882,8 @@ class VideoAnnotator:
                 )
                 # Fallback: use video without audio
                 shutil.copy2(str(video_only), str(output))
-        except subprocess.TimeoutExpired:
-            logger.warning("FFmpeg audio merge timed out, using video only")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.warning(f"FFmpeg audio merge failed ({type(e).__name__}), using video only")
             shutil.copy2(str(video_only), str(output))
 ```
 
@@ -853,7 +933,13 @@ In `app/main.py`, add to the imports section.
 After line 12 (`from contextlib import asynccontextmanager`), add:
 ```python
 import asyncio
+import uuid
 from pathlib import Path
+```
+
+Add `FileResponse` to the FastAPI imports:
+```python
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 ```
 
 After line 16 (`from dependencies import get_model_manager`), change to:
@@ -863,7 +949,7 @@ from dependencies import get_model_manager, get_job_manager
 
 After line 28 (`from visualization import encode_image_to_bytes`), add:
 ```python
-from job_manager import JobManager
+from job_manager import JobManager, JobStatus
 from video_annotator import VideoAnnotator, AnnotationParams, AnnotationStats
 ```
 
@@ -894,11 +980,12 @@ In the lifespan function (`app/main.py`), after line 92 (`app.state.model_manage
             ttl_seconds=settings.video_job_ttl,
             max_queued=settings.max_queued_jobs,
         )
+        job_manager.startup_sweep()
         job_manager.start_cleanup_task(interval=60)
         app.state.job_manager = job_manager
 
         # Start annotation worker
-        worker_task = asyncio.create_task(
+        app.state.worker_task = asyncio.create_task(
             _annotation_worker(app, settings)
         )
 ```
@@ -914,10 +1001,10 @@ Also cancel the worker task. Change the yield section. After `yield` (line 107),
 ```python
 
     # Cancel worker
-    if 'worker_task' in dir():
-        worker_task.cancel()
+    if hasattr(app.state, "worker_task"):
+        app.state.worker_task.cancel()
         try:
-            await worker_task
+            await app.state.worker_task
         except asyncio.CancelledError:
             pass
 ```
@@ -1028,8 +1115,8 @@ Append before `@app.get("/models", ...)` (line 660), add:
 # --- Video Annotation Endpoints ---
 
 DetectEveryQuery = Annotated[
-    int,
-    Query(ge=1, le=300, description="Run YOLO detection every N frames"),
+    int | None,
+    Query(ge=1, le=300, description="Run YOLO detection every N frames (default from config)"),
 ]
 ClassesQuery = Annotated[
     str | None,
@@ -1048,7 +1135,7 @@ async def annotate_video(
     conf: ConfidenceQuery = 0.5,
     imgsz: ImageSizeQuery = 640,
     max_det: MaxDetQuery = 100,
-    detect_every: DetectEveryQuery = 5,
+    detect_every: DetectEveryQuery = None,
     classes: ClassesQuery = None,
     line_width: Annotated[
         int, Query(ge=1, le=10, description="Bounding box line width")
@@ -1081,12 +1168,38 @@ async def annotate_video(
                 f"{', '.join(ALLOWED_VIDEO_EXTENSIONS)}",
             )
 
+    # Resolve detect_every default from settings
+    if detect_every is None:
+        detect_every = settings.default_detect_every
+
     # Parse classes filter
     classes_list = None
     if classes:
         classes_list = [c.strip() for c in classes.split(",") if c.strip()]
 
-    # Create job
+    # Stream upload to temp file, then validate size
+    import tempfile
+    import shutil as _shutil
+    tmp_dir = Path(settings.video_jobs_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_file = tmp_dir / f"upload_{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        total_size = 0
+        with open(tmp_file, "wb") as f:
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                total_size += len(chunk)
+                if total_size > MAX_VIDEO_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Video too large. Maximum: "
+                        f"{MAX_VIDEO_SIZE // (1024 * 1024)} MB",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        tmp_file.unlink(missing_ok=True)
+        raise
+
+    # Create job only after successful upload
     try:
         job = job_manager.create_job(
             params={
@@ -1102,22 +1215,15 @@ async def annotate_video(
             }
         )
     except RuntimeError as e:
+        tmp_file.unlink(missing_ok=True)
         raise HTTPException(status_code=429, detail=str(e))
 
-    # Save uploaded video
-    video_data = await file.read()
-    if len(video_data) > MAX_VIDEO_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Video too large. Maximum: "
-            f"{MAX_VIDEO_SIZE // (1024 * 1024)} MB",
-        )
-
-    job.input_path.write_bytes(video_data)
+    # Move uploaded file to job directory
+    _shutil.move(str(tmp_file), str(job.input_path))
 
     logger.info(
         f"Video annotation job created: {job.job_id}, "
-        f"size={len(video_data) // 1024}KB, detect_every={detect_every}"
+        f"size={total_size // 1024}KB, detect_every={detect_every}"
     )
 
     return JobCreatedResponse(
@@ -1142,7 +1248,7 @@ async def get_job_status(
         stats = JobStats(**job.stats)
 
     download_url = None
-    if job.status == "completed":
+    if job.status == JobStatus.COMPLETED:
         download_url = f"/jobs/{job_id}/download"
 
     return JobStatusResponse(
@@ -1169,7 +1275,7 @@ async def download_job_result(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.status != "completed":
+    if job.status != JobStatus.COMPLETED:
         raise HTTPException(
             status_code=400,
             detail=f"Job not ready. Status: {job.status.value}",
@@ -1180,12 +1286,10 @@ async def download_job_result(
             status_code=404, detail="Output file not found"
         )
 
-    return StreamingResponse(
-        open(job.output_path, "rb"),
+    return FileResponse(
+        path=str(job.output_path),
         media_type="video/mp4",
-        headers={
-            "Content-Disposition": f'attachment; filename="annotated_{job_id}.mp4"',
-        },
+        filename=f"annotated_{job_id}.mp4",
     )
 ```
 

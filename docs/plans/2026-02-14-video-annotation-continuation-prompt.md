@@ -48,10 +48,10 @@ Read all documents to understand the full picture.
 - [x] Task 1: Update requirements (opencv-contrib, aiofiles, httpx) and set up test infrastructure — `af74edb`
 - [x] Task 2: Add configuration settings to config.py — `eb3958a`
 - [x] Task 3: Add Pydantic response models to models.py — `529388e`
+- [x] Task 4: Create JobManager (job_manager.py) — `b3cb025` + test fix `0e048f9`
+- [x] Task 5: Create VideoAnnotator (video_annotator.py) + make visualization.py methods public — `a9ac08f`
 
-**Remaining (5 implementation tasks):**
-- [ ] Task 4: Create JobManager (job_manager.py)
-- [ ] Task 5: Create VideoAnnotator (video_annotator.py) + make visualization.py methods public
+**Remaining (3 implementation tasks):**
 - [ ] Task 6: Add API endpoints and worker loop to main.py
 - [ ] Task 7: Update CLAUDE.md documentation
 - [ ] Task 8: Manual integration test
@@ -72,7 +72,7 @@ Key decisions from brainstorming and review sessions:
 
 6. **opencv-contrib is a drop-in replacement**: Changing `opencv-python-headless` to `opencv-contrib-python-headless` adds the `cv2.legacy` tracking module without breaking anything.
 
-7. **Branch**: Work is on `feature/VAS-2`. Current HEAD: `529388e`.
+7. **Branch**: Work is on `feature/VAS-2`. Current HEAD: `a9ac08f`.
 
 8. **CLAUDE.md Jira note**: CLAUDE.md says `project_key: "FV"` but the actual project key is `VAS`. Use `VAS` for Jira operations.
 
@@ -80,7 +80,11 @@ Key decisions from brainstorming and review sessions:
 
 10. **Python venv**: pytest и зависимости установлены в `.venv`. Для запуска тестов использовать: `.venv/bin/python -m pytest tests/ -v`. Системный `python3` / `python3.13` НЕ имеет pytest.
 
-11. **Текущие тесты**: 4 теста проходят (1 config + 3 models).
+11. **Текущие тесты**: 15 тестов проходят (1 config + 3 models + 11 job_manager).
+
+12. **Code quality review на Task 4 нашёл**: naive datetime в тесте test_cleanup_expired — исправлено в отдельном коммите `0e048f9` (datetime.now() → datetime.now(tz=timezone.utc)).
+
+13. **Task 5 без тестов**: VideoAnnotator не имеет unit-тестов — требует YOLO модель, видеофайлы и FFmpeg. Тестируется интеграционно в Task 8.
 
 ### Review Fixes Applied to Plan (Iteration 1)
 

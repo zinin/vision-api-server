@@ -49,6 +49,7 @@ In `app/config.py`, add to `Settings` class after `video_crf`:
 
 ```python
 video_hw_accel: str = "auto"  # auto | nvidia | amd | cpu
+vaapi_device: str = "/dev/dri/renderD128"  # VAAPI render device path
 
 @field_validator("video_hw_accel")
 @classmethod
@@ -58,6 +59,8 @@ def validate_video_hw_accel(cls, v: str) -> str:
         raise ValueError(f"video_hw_accel must be one of: {allowed}")
     return v
 ```
+
+Also add `vaapi_device` test to `TestVideoHwAccel`.
 
 **Step 4: Run test to verify it passes**
 
@@ -248,13 +251,14 @@ _ENCODER_MAP: dict[HWAccelType, dict[str, str]] = {
 @dataclass(frozen=True)
 class HWAccelConfig:
     accel_type: HWAccelType
+    vaapi_device: str = "/dev/dri/renderD128"
 
     @property
     def decode_args(self) -> list[str]:
         if self.accel_type == HWAccelType.NVIDIA:
             return ["-hwaccel", "cuda"]
         if self.accel_type == HWAccelType.AMD:
-            return ["-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128"]
+            return ["-hwaccel", "vaapi", "-hwaccel_device", self.vaapi_device]
         return []
 
     def get_encode_args(self, codec: str, crf: int) -> list[str]:
@@ -270,9 +274,9 @@ class HWAccelConfig:
             return ["-c:v", encoder, "-preset", "p4", "-rc", "vbr", "-cq", str(crf)]
         if self.accel_type == HWAccelType.AMD:
             return [
-                "-vaapi_device", "/dev/dri/renderD128",
+                "-vaapi_device", self.vaapi_device,
                 "-vf", "format=nv12,hwupload",
-                "-c:v", encoder,
+                "-c:v", encoder, "-qp", str(crf),
             ]
         return self._cpu_encode_args(encoder, crf)
 
@@ -303,11 +307,13 @@ def _has_encoder(name: str) -> bool:
     return name in output
 
 
-def detect_hw_accel(mode: str = "auto") -> HWAccelConfig:
+def detect_hw_accel(mode: str = "auto", codec: str = "h264", vaapi_device: str = "/dev/dri/renderD128") -> HWAccelConfig:
     """Detect available hardware acceleration.
 
     Args:
         mode: "auto", "nvidia", "amd", or "cpu"
+        codec: configured video codec ("h264", "h265", "av1") — used to check encoder availability
+        vaapi_device: VAAPI render device path
 
     Returns:
         HWAccelConfig with detected acceleration type.
@@ -316,23 +322,25 @@ def detect_hw_accel(mode: str = "auto") -> HWAccelConfig:
         logger.info("Hardware acceleration: forced CPU")
         return HWAccelConfig(accel_type=HWAccelType.CPU)
 
-    # Check NVIDIA
+    # Check NVIDIA — verify encoder for configured codec exists
     if mode in ("auto", "nvidia"):
         try:
-            if _has_hwaccel("cuda") and _has_encoder("h264_nvenc"):
+            nvidia_encoder = _ENCODER_MAP[HWAccelType.NVIDIA].get(codec)
+            if _has_hwaccel("cuda") and nvidia_encoder and _has_encoder(nvidia_encoder):
                 logger.info("Hardware acceleration: NVIDIA (NVDEC/NVENC)")
-                return HWAccelConfig(accel_type=HWAccelType.NVIDIA)
+                return HWAccelConfig(accel_type=HWAccelType.NVIDIA, vaapi_device=vaapi_device)
         except Exception as e:
             logger.warning(f"NVIDIA detection failed: {e}")
         if mode == "nvidia":
             logger.warning("NVIDIA requested but not available, falling back to CPU")
 
-    # Check AMD
+    # Check AMD — verify encoder for configured codec exists (av1 has no VAAPI encoder)
     if mode in ("auto", "amd"):
         try:
-            if _has_hwaccel("vaapi") and _has_encoder("h264_vaapi"):
+            amd_encoder = _ENCODER_MAP.get(HWAccelType.AMD, {}).get(codec)
+            if _has_hwaccel("vaapi") and amd_encoder and _has_encoder(amd_encoder):
                 logger.info("Hardware acceleration: AMD (VAAPI)")
-                return HWAccelConfig(accel_type=HWAccelType.AMD)
+                return HWAccelConfig(accel_type=HWAccelType.AMD, vaapi_device=vaapi_device)
         except Exception as e:
             logger.warning(f"AMD/VAAPI detection failed: {e}")
         if mode == "amd":
@@ -461,6 +469,7 @@ Create `app/ffmpeg_pipe.py`:
 ```python
 import logging
 import subprocess
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -468,6 +477,15 @@ import numpy as np
 from hw_accel import HWAccelConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _drain_stderr(process: subprocess.Popen, collected: list[str]) -> None:
+    """Daemon thread target: read stderr line-by-line to prevent pipe buffer deadlock."""
+    try:
+        for line in process.stderr:
+            collected.append(line)
+    except (ValueError, OSError):
+        pass  # pipe closed
 
 
 class FFmpegDecoder:
@@ -486,9 +504,11 @@ class FFmpegDecoder:
         height: int,
         hw_config: HWAccelConfig,
     ):
+        self._input_path = str(input_path)
         self._width = width
         self._height = height
         self._frame_size = width * height * 3  # BGR24
+        self._stderr_lines: list[str] = []
 
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
         cmd += hw_config.decode_args
@@ -496,24 +516,38 @@ class FFmpegDecoder:
 
         logger.debug(f"FFmpegDecoder command: {' '.join(cmd)}")
         self._process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False
         )
+        # Start daemon thread to drain stderr and prevent deadlock
+        self._stderr_thread = threading.Thread(
+            target=_drain_stderr, args=(self._process, self._stderr_lines), daemon=True
+        )
+        self._stderr_thread.start()
 
     def read_frame(self) -> np.ndarray | None:
-        """Read one BGR24 frame. Returns None on EOF."""
+        """Read one BGR24 frame (writable copy). Returns None on EOF."""
         raw = self._process.stdout.read(self._frame_size)
         if not raw or len(raw) < self._frame_size:
+            # Check if process crashed (vs normal EOF)
+            if self._process.poll() is not None and self._process.returncode != 0:
+                stderr_text = "".join(str(l) for l in self._stderr_lines[-10:])
+                raise RuntimeError(
+                    f"FFmpeg decoder crashed (rc={self._process.returncode}): {stderr_text[:500]}"
+                )
             return None
         return np.frombuffer(raw, dtype=np.uint8).reshape(
             (self._height, self._width, 3)
-        )
+        ).copy()  # .copy() makes array writable for OpenCV drawing
 
     def close(self) -> None:
         if self._process.stdout:
             self._process.stdout.close()
-        if self._process.stderr:
-            self._process.stderr.close()
-        self._process.wait(timeout=10)
+        self._stderr_thread.join(timeout=5)
+        try:
+            self._process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait(timeout=5)
         if self._process.returncode and self._process.returncode != 0:
             logger.warning(f"FFmpeg decoder exited with code {self._process.returncode}")
 
@@ -691,6 +725,8 @@ class FFmpegEncoder:
         codec: str,
         crf: int,
     ):
+        self._stderr_lines: list[str] = []
+
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -698,31 +734,47 @@ class FFmpegEncoder:
             "-i", "pipe:0",
             "-i", str(original_path),
             "-map", "0:v:0", "-map", "1:a:0?",
+            "-map_metadata", "0",
         ]
         cmd += hw_config.get_encode_args(codec, crf)
         cmd += ["-c:a", "aac", "-shortest", str(output_path)]
 
         logger.debug(f"FFmpegEncoder command: {' '.join(cmd)}")
         self._process = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False
         )
+        # Start daemon thread to drain stderr and prevent deadlock
+        self._stderr_thread = threading.Thread(
+            target=_drain_stderr, args=(self._process, self._stderr_lines), daemon=True
+        )
+        self._stderr_thread.start()
 
     def write_frame(self, frame: np.ndarray) -> None:
-        """Write one BGR24 frame."""
+        """Write one BGR24 frame. Checks process health before writing."""
+        if self._process.poll() is not None:
+            stderr_text = "".join(str(l) for l in self._stderr_lines[-10:])
+            raise RuntimeError(
+                f"FFmpeg encoder crashed (rc={self._process.returncode}): {stderr_text[:500]}"
+            )
         self._process.stdin.write(frame.tobytes())
 
     def close(self) -> None:
-        if self._process.stdin:
-            self._process.stdin.close()
-        stderr_output = ""
-        if self._process.stderr:
-            stderr_output = self._process.stderr.read()
-            self._process.stderr.close()
-        self._process.wait(timeout=300)
+        try:
+            if self._process.stdin:
+                self._process.stdin.close()
+        except OSError:
+            pass
+        self._stderr_thread.join(timeout=10)
+        try:
+            self._process.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait(timeout=5)
         if self._process.returncode != 0:
+            stderr_text = "".join(str(l) for l in self._stderr_lines[-20:])
             raise RuntimeError(
                 f"FFmpeg encoder failed (rc={self._process.returncode}): "
-                f"{stderr_output[:500] if stderr_output else 'no stderr'}"
+                f"{stderr_text[:500] if stderr_text else 'no stderr'}"
             )
 
     def __enter__(self):
@@ -985,13 +1037,24 @@ Check existing test_worker.py first — if it uses mock VideoAnnotator, verify t
 
 **Step 2: Update lifespan**
 
-In `app/main.py` lifespan, after job_manager setup, detect hw acceleration:
+In `app/main.py` lifespan, after job_manager setup:
 
+1. **Verify FFmpeg is installed** (mandatory after this change):
+```python
+import shutil
+if not shutil.which("ffmpeg"):
+    raise RuntimeError("FFmpeg is required but not found in PATH")
+```
+
+2. **Detect hardware acceleration** passing configured codec and vaapi device:
 ```python
 from hw_accel import detect_hw_accel
 
-# In lifespan, after job_manager setup:
-hw_config = detect_hw_accel(settings.video_hw_accel)
+hw_config = detect_hw_accel(
+    mode=settings.video_hw_accel,
+    codec=settings.video_codec,
+    vaapi_device=settings.vaapi_device,
+)
 app.state.hw_config = hw_config
 logger.info(f"Video hardware acceleration: {hw_config.accel_type.value}")
 ```
@@ -1031,7 +1094,8 @@ git commit -m "feat: wire hw_config into lifespan and annotation worker (VAS-2)"
 
 **Files:**
 - Modify: `docker/amd/Dockerfile` (add VAAPI packages)
-- `docker/nvidia/Dockerfile` — likely no changes needed (nvidia-container-toolkit provides libs)
+- Modify: `docker/docker-compose-nvidia.yml` (add `video` capability)
+- `docker/nvidia/Dockerfile` — no changes needed (nvidia-container-toolkit provides libs at runtime)
 
 **Step 1: Update AMD Dockerfile**
 
@@ -1044,19 +1108,29 @@ RUN apt-get update && apt-get install -y \
     curl \
     python3-pip \
     ffmpeg gcc g++ \
-    libva-dev mesa-va-drivers \
+    libva-dev mesa-va-drivers vainfo \
     && rm -rf /var/lib/apt/lists/*
 ```
 
-**Step 2: Verify NVIDIA Dockerfile**
+**Step 2: Update NVIDIA docker-compose**
+
+In `docker/docker-compose-nvidia.yml`, add `video` to `NVIDIA_DRIVER_CAPABILITIES` (required for NVENC/NVDEC access):
+
+```yaml
+environment:
+  - NVIDIA_VISIBLE_DEVICES=all
+  - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+```
+
+**Step 3: Verify NVIDIA Dockerfile**
 
 Check that the nvidia/cuda base image + nvidia-container-toolkit will provide `libnvidia-encode.so`. No Dockerfile changes expected — the NVENC/NVDEC libs are mounted at runtime by nvidia-container-toolkit.
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
-git add docker/amd/Dockerfile
-git commit -m "build: add VAAPI packages to AMD Docker image (VAS-2)"
+git add docker/amd/Dockerfile docker/docker-compose-nvidia.yml
+git commit -m "build: add VAAPI packages and NVIDIA video capability for hw accel (VAS-2)"
 ```
 
 ---

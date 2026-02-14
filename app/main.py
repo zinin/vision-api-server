@@ -9,11 +9,14 @@ import cv2
 import torch
 
 from fastapi import FastAPI, File, UploadFile, Query, Request, Depends, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from contextlib import asynccontextmanager
+import asyncio
+import uuid
+from pathlib import Path
 
 from config import Settings, get_settings
-from dependencies import get_model_manager
+from dependencies import get_model_manager, get_job_manager
 from model_manager import ModelManager
 from image_utils import validate_and_decode_image
 from inference_utils import run_inference, build_detection_response, shutdown_executor
@@ -24,9 +27,15 @@ from models import (
     Detection,
     BoundingBox,
     FrameExtractionResponse,
-    ExtractedFrameData
+    ExtractedFrameData,
+    JobCreatedResponse,
+    JobStatusResponse,
+    JobStats,
 )
 from visualization import encode_image_to_bytes
+from job_manager import JobManager, JobStatus
+from video_annotator import VideoAnnotator, AnnotationParams, AnnotationStats
+from inference_utils import get_executor
 from video_utils import extract_frames_from_video, VideoFrameExtractor
 
 logging.basicConfig(
@@ -91,12 +100,34 @@ async def lifespan(app: FastAPI):
 
         app.state.model_manager = model_manager
 
+        # Verify ffmpeg/ffprobe are available for video annotation
+        import shutil as _shutil_check
+        if not _shutil_check.which("ffmpeg") or not _shutil_check.which("ffprobe"):
+            logger.warning(
+                "ffmpeg/ffprobe not found — video annotation will have limited functionality"
+            )
+
         # Verify ffmpeg is available
         try:
             VideoFrameExtractor()
             logger.info("FFmpeg verified and ready for video processing")
         except RuntimeError as e:
             logger.warning(f"Video processing unavailable: {e}")
+
+        # Initialize JobManager
+        job_manager = JobManager(
+            jobs_dir=settings.video_jobs_dir,
+            ttl_seconds=settings.video_job_ttl,
+            max_queued=settings.max_queued_jobs,
+        )
+        job_manager.startup_sweep()
+        job_manager.start_cleanup_task(interval=60)
+        app.state.job_manager = job_manager
+
+        # Start annotation worker
+        app.state.worker_task = asyncio.create_task(
+            _annotation_worker(app, settings)
+        )
 
         logger.info("Application startup complete")
 
@@ -106,6 +137,14 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Cancel worker
+    if hasattr(app.state, "worker_task"):
+        app.state.worker_task.cancel()
+        try:
+            await app.state.worker_task
+        except asyncio.CancelledError:
+            pass
+
     # Cleanup
     logger.info("Shutting down gracefully...")
     try:
@@ -114,9 +153,109 @@ async def lifespan(app: FastAPI):
         if hasattr(app.state, "model_manager"):
             await app.state.model_manager.shutdown()
 
+        if hasattr(app.state, "job_manager"):
+            await app.state.job_manager.shutdown()
+
         logger.info("Resources released successfully")
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
+
+
+async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
+    """Background worker that processes video annotation jobs."""
+    logger.info("Annotation worker started")
+    job_manager: JobManager = app.state.job_manager
+    model_manager: ModelManager = app.state.model_manager
+
+    while True:
+        try:
+            job_id = await job_manager.get_next_job_id()
+            job = job_manager.get_job(job_id)
+            if job is None:
+                continue
+
+            job_manager.mark_processing(job_id)
+
+            try:
+                # Get model
+                model_name = job.params.get("model")
+                try:
+                    model_entry = await model_manager.get_model(model_name)
+                except (RuntimeError, ValueError) as e:
+                    job_manager.mark_failed(job_id, f"Model error: {e}")
+                    continue
+
+                annotator = VideoAnnotator(
+                    model=model_entry.model,
+                    visualizer=model_entry.visualizer,
+                    class_names=model_entry.model.names,
+                )
+
+                params = AnnotationParams(
+                    conf=job.params.get("conf", 0.5),
+                    imgsz=job.params.get("imgsz", 640),
+                    max_det=job.params.get("max_det", 100),
+                    detect_every=job.params.get(
+                        "detect_every", settings.default_detect_every
+                    ),
+                    classes=job.params.get("classes"),
+                    line_width=job.params.get("line_width", 2),
+                    show_labels=job.params.get("show_labels", True),
+                    show_conf=job.params.get("show_conf", True),
+                )
+
+                output_path = job.input_path.parent / "output.mp4"
+
+                def progress_cb(progress: int) -> None:
+                    job_manager.update_progress(job_id, progress)
+
+                # Run in executor (blocking I/O + YOLO inference)
+                loop = asyncio.get_running_loop()
+                executor = get_executor(settings.max_executor_workers).executor
+                try:
+                    stats = await loop.run_in_executor(
+                        executor,
+                        lambda: annotator.annotate(
+                            input_path=job.input_path,
+                            output_path=output_path,
+                            params=params,
+                            progress_callback=progress_cb,
+                        ),
+                    )
+
+                    job_manager.mark_completed(
+                        job_id,
+                        output_path=output_path,
+                        stats={
+                            "total_frames": stats.total_frames,
+                            "detected_frames": stats.detected_frames,
+                            "tracked_frames": stats.tracked_frames,
+                            "total_detections": stats.total_detections,
+                            "processing_time_ms": stats.processing_time_ms,
+                        },
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        f"Annotation failed for job {job_id}: {e}",
+                        exc_info=True,
+                    )
+                    job_manager.mark_failed(job_id, str(e))
+
+            finally:
+                # Always clean up input file (per-job finally)
+                try:
+                    if job.input_path and job.input_path.exists():
+                        job.input_path.unlink()
+                except OSError as e:
+                    logger.warning(f"Failed to clean up input file for {job_id}: {e}")
+
+        except asyncio.CancelledError:
+            logger.info("Annotation worker cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Worker error: {e}", exc_info=True)
+            await asyncio.sleep(1)
 
 
 app = FastAPI(
@@ -179,7 +318,7 @@ async def root(
         "status": "ready",
         "max_file_size_mb": round(settings.max_file_size / (1024 * 1024), 1),
         "max_video_size_mb": round(MAX_VIDEO_SIZE / (1024 * 1024), 1),
-        "features": ["image_detection", "video_detection", "visualization", "frame_extraction", "multi_model"]
+        "features": ["image_detection", "video_detection", "visualization", "frame_extraction", "multi_model", "video_annotation"]
     }
 
 
@@ -654,6 +793,195 @@ async def detect_and_visualize(
             "X-Detections-Count": str(num_detections),
             "Cache-Control": "no-cache"
         }
+    )
+
+
+# --- Video Annotation Endpoints ---
+
+DetectEveryQuery = Annotated[
+    int | None,
+    Query(ge=1, le=300, description="Run YOLO detection every N frames (default from config)"),
+]
+ClassesQuery = Annotated[
+    str | None,
+    Query(description="Comma-separated class filter (e.g. person,car)"),
+]
+
+
+@app.post(
+    "/detect/video/visualize",
+    response_model=JobCreatedResponse,
+    status_code=202,
+    tags=["Video Annotation"],
+)
+async def annotate_video(
+    file: UploadFile = File(..., description="Video file for annotation"),
+    conf: ConfidenceQuery = 0.5,
+    imgsz: ImageSizeQuery = 640,
+    max_det: MaxDetQuery = 100,
+    detect_every: DetectEveryQuery = None,
+    classes: ClassesQuery = None,
+    line_width: Annotated[
+        int, Query(ge=1, le=10, description="Bounding box line width")
+    ] = 2,
+    show_labels: Annotated[bool, Query(description="Show class labels")] = True,
+    show_conf: Annotated[
+        bool, Query(description="Show confidence scores")
+    ] = True,
+    model: ModelQuery = None,
+    job_manager: JobManager = Depends(get_job_manager),
+    settings: Settings = Depends(get_settings),
+):
+    """
+    Submit video for annotation with bounding boxes.
+
+    Returns a job ID. Poll GET /jobs/{job_id} for status.
+    Download result via GET /jobs/{job_id}/download when completed.
+    """
+    # Validate extension
+    if file.filename:
+        ext = (
+            "." + file.filename.rsplit(".", 1)[-1].lower()
+            if "." in file.filename
+            else ""
+        )
+        if ext not in ALLOWED_VIDEO_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid video format. Allowed: "
+                f"{', '.join(ALLOWED_VIDEO_EXTENSIONS)}",
+            )
+
+    # Resolve detect_every default from settings
+    if detect_every is None:
+        detect_every = settings.default_detect_every
+
+    # Parse classes filter
+    classes_list = None
+    if classes:
+        classes_list = [c.strip() for c in classes.split(",") if c.strip()]
+
+    # Early reject if queue is full (before expensive upload)
+    try:
+        job_manager.check_queue_capacity()
+    except RuntimeError as e:
+        raise HTTPException(status_code=429, detail=str(e))
+
+    # Stream upload to temp file using aiofiles, then validate size
+    import aiofiles
+    import shutil as _shutil
+    tmp_dir = Path(settings.video_jobs_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_file = tmp_dir / f"upload_{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        total_size = 0
+        async with aiofiles.open(tmp_file, "wb") as f:
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                total_size += len(chunk)
+                if total_size > MAX_VIDEO_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Video too large. Maximum: "
+                        f"{MAX_VIDEO_SIZE // (1024 * 1024)} MB",
+                    )
+                await f.write(chunk)
+
+        # Create job only after successful upload
+        job = job_manager.create_job(
+            params={
+                "conf": conf,
+                "imgsz": imgsz,
+                "max_det": max_det,
+                "detect_every": detect_every,
+                "classes": classes_list,
+                "line_width": line_width,
+                "show_labels": show_labels,
+                "show_conf": show_conf,
+                "model": model,
+            }
+        )
+
+        # Move uploaded file to job directory (inside try for cleanup)
+        _shutil.move(str(tmp_file), str(job.input_path))
+    except HTTPException:
+        tmp_file.unlink(missing_ok=True)
+        raise
+    except RuntimeError as e:
+        tmp_file.unlink(missing_ok=True)
+        raise HTTPException(status_code=429, detail=str(e))
+    except Exception:
+        tmp_file.unlink(missing_ok=True)
+        raise
+
+    logger.info(
+        f"Video annotation job created: {job.job_id}, "
+        f"size={total_size // 1024}KB, detect_every={detect_every}"
+    )
+
+    return JobCreatedResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        message="Video annotation job created",
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Jobs"])
+async def get_job_status(
+    job_id: str,
+    job_manager: JobManager = Depends(get_job_manager),
+):
+    """Get status of a video annotation job."""
+    job = job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    stats = None
+    if job.stats:
+        stats = JobStats(**job.stats)
+
+    download_url = None
+    if job.status == JobStatus.COMPLETED:
+        download_url = f"/jobs/{job_id}/download"
+
+    return JobStatusResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        progress=job.progress,
+        created_at=job.created_at.isoformat(),
+        completed_at=(
+            job.completed_at.isoformat() if job.completed_at else None
+        ),
+        download_url=download_url,
+        error=job.error,
+        stats=stats,
+    )
+
+
+@app.get("/jobs/{job_id}/download", tags=["Jobs"])
+async def download_job_result(
+    job_id: str,
+    job_manager: JobManager = Depends(get_job_manager),
+):
+    """Download annotated video result."""
+    job = job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job not ready. Status: {job.status.value}",
+        )
+
+    if job.output_path is None or not job.output_path.exists():
+        raise HTTPException(
+            status_code=404, detail="Output file not found"
+        )
+
+    return FileResponse(
+        path=str(job.output_path),
+        media_type="video/mp4",
+        filename=f"annotated_{job_id}.mp4",
     )
 
 

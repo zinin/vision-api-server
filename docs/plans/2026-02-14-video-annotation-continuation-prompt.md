@@ -50,9 +50,9 @@ Read all documents to understand the full picture.
 - [x] Task 3: Add Pydantic response models to models.py — `529388e`
 - [x] Task 4: Create JobManager (job_manager.py) — `b3cb025` + test fix `0e048f9`
 - [x] Task 5: Create VideoAnnotator (video_annotator.py) + make visualization.py methods public — `a9ac08f`
+- [x] Task 6: Add API endpoints and worker loop to main.py + get_job_manager dependency — `a0fea76`
 
-**Remaining (3 implementation tasks):**
-- [ ] Task 6: Add API endpoints and worker loop to main.py
+**Remaining (2 implementation tasks):**
 - [ ] Task 7: Update CLAUDE.md documentation
 - [ ] Task 8: Manual integration test
 
@@ -72,7 +72,7 @@ Key decisions from brainstorming and review sessions:
 
 6. **opencv-contrib is a drop-in replacement**: Changing `opencv-python-headless` to `opencv-contrib-python-headless` adds the `cv2.legacy` tracking module without breaking anything.
 
-7. **Branch**: Work is on `feature/VAS-2`. Current HEAD: `a9ac08f`.
+7. **Branch**: Work is on `feature/VAS-2`. Current HEAD: `a0fea76`.
 
 8. **CLAUDE.md Jira note**: CLAUDE.md says `project_key: "FV"` but the actual project key is `VAS`. Use `VAS` for Jira operations.
 
@@ -85,6 +85,8 @@ Key decisions from brainstorming and review sessions:
 12. **Code quality review на Task 4 нашёл**: naive datetime в тесте test_cleanup_expired — исправлено в отдельном коммите `0e048f9` (datetime.now() → datetime.now(tz=timezone.utc)).
 
 13. **Task 5 без тестов**: VideoAnnotator не имеет unit-тестов — требует YOLO модель, видеофайлы и FFmpeg. Тестируется интеграционно в Task 8.
+
+14. **Task 6 реализован субагентом**: Все 6 шагов выполнены точно по плану. Модуль загружается, 14 роутов зарегистрированы (включая 3 новых: `/detect/video/visualize`, `/jobs/{job_id}`, `/jobs/{job_id}/download`). 15 тестов проходят без регрессий.
 
 ### Review Fixes Applied to Plan (Iteration 1)
 

@@ -30,7 +30,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/models.py` | Request/response Pydantic models |
 | `app/dependencies.py` | FastAPI dependency injection |
 | `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
-| `app/video_annotator.py` | YOLO + CSRT tracker video annotation pipeline |
+| `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
 
 ## Endpoints
 
@@ -72,7 +72,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-Tests cover config, Pydantic models, and JobManager. VideoAnnotator has no unit tests (requires YOLO model + FFmpeg).
+Tests cover config, Pydantic models, JobManager, and VideoAnnotator (mocked YOLO/FFmpeg).
 
 ## Key Patterns
 
@@ -82,7 +82,7 @@ Tests cover config, Pydantic models, and JobManager. VideoAnnotator has no unit 
 
 **Smart Frames**: FFmpeg scene detection with fallback to interval-based extraction.
 
-**Video Annotation**: Async job API — YOLO every Nth frame + CSRT tracker for intermediate frames. Single worker, in-memory job state (requires `workers=1`).
+**Video Annotation**: Async job API — YOLO every Nth frame + hold mode (reuse detections) for intermediate frames. Single worker, in-memory job state (requires `workers=1`).
 
 ## Limits
 

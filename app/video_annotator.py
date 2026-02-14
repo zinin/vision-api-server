@@ -21,17 +21,6 @@ CODEC_MAP = {
 }
 
 
-def _create_csrt_tracker() -> cv2.Tracker:
-    """Create CSRT tracker, handling different OpenCV versions."""
-    if hasattr(cv2, "TrackerCSRT"):
-        return cv2.TrackerCSRT.create()
-    if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT"):
-        return cv2.legacy.TrackerCSRT.create()
-    raise RuntimeError(
-        "CSRT tracker not available. Install opencv-contrib-python-headless."
-    )
-
-
 @dataclass(slots=True)
 class AnnotationParams:
     conf: float = 0.5
@@ -46,6 +35,13 @@ class AnnotationParams:
 
 @dataclass(slots=True)
 class AnnotationStats:
+    """Video annotation processing statistics.
+
+    Attributes:
+        tracked_frames: Frames where detections were reused from last
+            YOLO detection (hold mode). Previously: CSRT-tracked frames.
+    """
+
     total_frames: int = 0
     detected_frames: int = 0
     tracked_frames: int = 0
@@ -54,7 +50,7 @@ class AnnotationStats:
 
 
 class VideoAnnotator:
-    """Annotate video with YOLO detections and CSRT tracking."""
+    """Annotate video with YOLO detections and hold mode."""
 
     def __init__(
         self,
@@ -119,7 +115,6 @@ class VideoAnnotator:
             logger.info(f"VideoWriter created: {video_only_path}, codec=mp4v, {width}x{height} @ {fps:.1f}fps")
 
             stats = AnnotationStats(total_frames=total_frames)
-            trackers: list[tuple[cv2.Tracker, DetectionBox]] = []
             current_detections: list[DetectionBox] = []
             font_scale = self.visualizer.calculate_adaptive_font_scale(height)
             frame_num = 0
@@ -141,25 +136,15 @@ class VideoAnnotator:
                     current_detections = self._extract_detections(
                         results, params.classes
                     )
-                    trackers = self._init_trackers(frame, current_detections)
                     stats.detected_frames += 1
                     stats.total_detections += len(current_detections)
                     logger.debug(
-                        f"Frame {frame_num}: YOLO detected {len(current_detections)} objects, "
-                        f"initialized {len(trackers)} trackers"
+                        f"Frame {frame_num}: YOLO detected "
+                        f"{len(current_detections)} objects"
                     )
                 else:
-                    prev_count = len(trackers)
-                    current_detections = self._update_trackers(
-                        frame, trackers
-                    )
                     stats.tracked_frames += 1
                     stats.total_detections += len(current_detections)
-                    if len(current_detections) < prev_count:
-                        logger.debug(
-                            f"Frame {frame_num}: tracking {len(current_detections)}/{prev_count} "
-                            f"(lost {prev_count - len(current_detections)})"
-                        )
 
                 self._draw_detections(frame, current_detections, params, font_scale)
                 writer.write(frame)
@@ -286,45 +271,6 @@ class VideoAnnotator:
                     )
                 )
         return detections
-
-    def _init_trackers(
-        self, frame: np.ndarray, detections: list[DetectionBox]
-    ) -> list[tuple[cv2.Tracker, DetectionBox]]:
-        trackers = []
-        for det in detections:
-            tracker = _create_csrt_tracker()
-            w = det.x2 - det.x1
-            h = det.y2 - det.y1
-            if w <= 0 or h <= 0:
-                continue
-            tracker.init(frame, (det.x1, det.y1, w, h))
-            trackers.append((tracker, det))
-        return trackers
-
-    def _update_trackers(
-        self,
-        frame: np.ndarray,
-        trackers: list[tuple[cv2.Tracker, DetectionBox]],
-    ) -> list[DetectionBox]:
-        updated = []
-        for tracker, orig_det in trackers:
-            success, bbox = tracker.update(frame)
-            if success:
-                x, y, w, h = [int(v) for v in bbox]
-                if w <= 0 or h <= 0:
-                    continue
-                updated.append(
-                    DetectionBox(
-                        x1=x,
-                        y1=y,
-                        x2=x + w,
-                        y2=y + h,
-                        class_id=orig_det.class_id,
-                        class_name=orig_det.class_name,
-                        confidence=orig_det.confidence,
-                    )
-                )
-        return updated
 
     def _draw_detections(
         self,

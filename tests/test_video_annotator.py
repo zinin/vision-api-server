@@ -10,7 +10,6 @@ import pytest
 from video_annotator import (
     VideoAnnotator,
     AnnotationParams,
-    _create_csrt_tracker,
 )
 from visualization import DetectionBox, DetectionVisualizer
 
@@ -69,34 +68,6 @@ def sample_frame():
 @pytest.fixture
 def default_params():
     return AnnotationParams()
-
-
-# --- _create_csrt_tracker ---
-
-class TestCreateCsrtTracker:
-    def test_modern_api(self):
-        mock_cv2 = MagicMock()
-        mock_cv2.TrackerCSRT.create.return_value = MagicMock()
-        with patch("video_annotator.cv2", mock_cv2):
-            tracker = _create_csrt_tracker()
-        mock_cv2.TrackerCSRT.create.assert_called_once()
-        assert tracker is not None
-
-    def test_legacy_api(self):
-        mock_cv2 = MagicMock(spec=[])
-        mock_cv2.legacy = MagicMock()
-        mock_cv2.legacy.TrackerCSRT.create.return_value = MagicMock()
-        with patch("video_annotator.cv2", mock_cv2):
-            tracker = _create_csrt_tracker()
-        mock_cv2.legacy.TrackerCSRT.create.assert_called_once()
-        assert tracker is not None
-
-    def test_unavailable(self):
-        mock_cv2 = MagicMock(spec=[])
-        del mock_cv2.legacy
-        with patch("video_annotator.cv2", mock_cv2):
-            with pytest.raises(RuntimeError, match="CSRT tracker not available"):
-                _create_csrt_tracker()
 
 
 # --- _get_video_metadata ---
@@ -230,57 +201,6 @@ class TestExtractDetections:
         assert dets[0].class_name == "class_99"
 
 
-# --- _init_trackers ---
-
-class TestInitTrackers:
-    def test_success(self, annotator, sample_frame):
-        mock_tracker = MagicMock()
-        det = DetectionBox(x1=10, y1=20, x2=110, y2=220, class_id=0, class_name="person", confidence=0.9)
-        with patch("video_annotator._create_csrt_tracker", return_value=mock_tracker):
-            trackers = annotator._init_trackers(sample_frame, [det])
-        assert len(trackers) == 1
-        mock_tracker.init.assert_called_once_with(sample_frame, (10, 20, 100, 200))
-
-    def test_skip_zero_size(self, annotator, sample_frame):
-        det = DetectionBox(x1=50, y1=50, x2=50, y2=100, class_id=0, class_name="person", confidence=0.9)
-        mock_tracker = MagicMock()
-        with patch("video_annotator._create_csrt_tracker", return_value=mock_tracker):
-            trackers = annotator._init_trackers(sample_frame, [det])
-        assert len(trackers) == 0
-        # Tracker is created but init() is NOT called due to zero width
-        mock_tracker.init.assert_not_called()
-
-
-# --- _update_trackers ---
-
-class TestUpdateTrackers:
-    def test_success(self, annotator, sample_frame):
-        tracker = MagicMock()
-        tracker.update.return_value = (True, (20, 30, 80, 150))
-        orig = DetectionBox(x1=10, y1=20, x2=90, y2=170, class_id=1, class_name="car", confidence=0.85)
-        updated = annotator._update_trackers(sample_frame, [(tracker, orig)])
-        assert len(updated) == 1
-        assert updated[0].x1 == 20
-        assert updated[0].y1 == 30
-        assert updated[0].x2 == 100  # x + w = 20 + 80
-        assert updated[0].y2 == 180  # y + h = 30 + 150
-        assert updated[0].class_name == "car"
-
-    def test_lost_tracker(self, annotator, sample_frame):
-        tracker = MagicMock()
-        tracker.update.return_value = (False, (0, 0, 0, 0))
-        orig = DetectionBox(x1=10, y1=20, x2=90, y2=170, class_id=0, class_name="person", confidence=0.9)
-        updated = annotator._update_trackers(sample_frame, [(tracker, orig)])
-        assert updated == []
-
-    def test_zero_size_dropped(self, annotator, sample_frame):
-        tracker = MagicMock()
-        tracker.update.return_value = (True, (50, 50, 0, 0))
-        orig = DetectionBox(x1=10, y1=20, x2=90, y2=170, class_id=0, class_name="person", confidence=0.9)
-        updated = annotator._update_trackers(sample_frame, [(tracker, orig)])
-        assert updated == []
-
-
 # --- _draw_detections ---
 
 class TestDrawDetections:
@@ -384,8 +304,53 @@ class TestAnnotatePipeline:
         merge_result = MagicMock()
         merge_result.returncode = 0
 
-        mock_tracker = MagicMock()
-        mock_tracker.update.return_value = (True, (10, 20, 90, 180))
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        output_path = tmp_path / "output.mp4"
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
+
+        def subprocess_side_effect(cmd, **kwargs):
+            if cmd[0] == "ffprobe":
+                return ffprobe_result
+            return merge_result
+
+        with (
+            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
+            patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
+            patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
+            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
+        ):
+            stats = annotator.annotate(input_path, output_path, AnnotationParams(detect_every=detect_every))
+
+        assert stats.total_frames == num_frames
+        # Frames 0, 3 are detection frames
+        assert stats.detected_frames == 2
+        # Frames 1, 2, 4, 5 are tracked frames
+        assert stats.tracked_frames == 4
+        assert mock_writer.write.call_count == num_frames
+
+    def test_detect_every_1(self, mock_model, mock_visualizer, tmp_path):
+        """When detect_every=1, every frame gets YOLO detection, no hold frames."""
+        num_frames = 4
+        mock_cap, mock_writer = self._setup_pipeline_mocks(num_frames)
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        ffprobe_stream = {
+            "r_frame_rate": "30/1",
+            "width": 640,
+            "height": 480,
+            "nb_frames": str(num_frames),
+        }
+        ffprobe_result = MagicMock()
+        ffprobe_result.returncode = 0
+        ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
+
+        merge_result = MagicMock()
+        merge_result.returncode = 0
 
         input_path = tmp_path / "input.mp4"
         input_path.touch()
@@ -403,16 +368,117 @@ class TestAnnotatePipeline:
             patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
             patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
             patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
-            patch("video_annotator._create_csrt_tracker", return_value=mock_tracker),
         ):
-            stats = annotator.annotate(input_path, output_path, AnnotationParams(detect_every=detect_every))
+            stats = annotator.annotate(
+                input_path, output_path, AnnotationParams(detect_every=1)
+            )
 
         assert stats.total_frames == num_frames
-        # Frames 0, 3 are detection frames
+        assert stats.detected_frames == num_frames
+        assert stats.tracked_frames == 0
+        assert mock_model.predict.call_count == num_frames
+
+    def test_hold_reuses_detections(self, mock_model, mock_visualizer, tmp_path):
+        """Intermediate frames reuse last YOLO detections (hold mode)."""
+        num_frames = 3
+        mock_cap, mock_writer = self._setup_pipeline_mocks(num_frames)
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        ffprobe_stream = {
+            "r_frame_rate": "30/1",
+            "width": 640,
+            "height": 480,
+            "nb_frames": str(num_frames),
+        }
+        ffprobe_result = MagicMock()
+        ffprobe_result.returncode = 0
+        ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
+
+        merge_result = MagicMock()
+        merge_result.returncode = 0
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        output_path = tmp_path / "output.mp4"
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
+
+        def subprocess_side_effect(cmd, **kwargs):
+            if cmd[0] == "ffprobe":
+                return ffprobe_result
+            return merge_result
+
+        with (
+            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
+            patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
+            patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
+            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
+        ):
+            stats = annotator.annotate(
+                input_path, output_path, AnnotationParams(detect_every=3)
+            )
+
+        assert stats.total_frames == num_frames
+        assert stats.detected_frames == 1
+        assert mock_model.predict.call_count == 1
+        assert stats.tracked_frames == 2
+        assert stats.total_detections == 3
+        assert mock_visualizer.draw_detection.call_count == 3
+
+    def test_hold_clears_on_empty_detection(self, mock_model, mock_visualizer, tmp_path):
+        """When detection frame returns no objects, hold frames also show nothing."""
+        num_frames = 4
+        mock_cap, mock_writer = self._setup_pipeline_mocks(num_frames)
+
+        # Frame 0: 1 detection. Frame 3: 0 detections.
+        mock_model.predict.side_effect = [
+            [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])],
+            [_make_yolo_result([])],
+        ]
+
+        ffprobe_stream = {
+            "r_frame_rate": "30/1",
+            "width": 640,
+            "height": 480,
+            "nb_frames": str(num_frames),
+        }
+        ffprobe_result = MagicMock()
+        ffprobe_result.returncode = 0
+        ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
+
+        merge_result = MagicMock()
+        merge_result.returncode = 0
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        output_path = tmp_path / "output.mp4"
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
+
+        def subprocess_side_effect(cmd, **kwargs):
+            if cmd[0] == "ffprobe":
+                return ffprobe_result
+            return merge_result
+
+        with (
+            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
+            patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
+            patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
+            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
+        ):
+            stats = annotator.annotate(
+                input_path, output_path, AnnotationParams(detect_every=3)
+            )
+
+        assert stats.total_frames == num_frames
         assert stats.detected_frames == 2
-        # Frames 1, 2, 4, 5 are tracked frames
-        assert stats.tracked_frames == 4
-        assert mock_writer.write.call_count == num_frames
+        assert stats.tracked_frames == 2
+        assert mock_model.predict.call_count == 2
+        assert stats.total_detections == 3
+        assert mock_visualizer.draw_detection.call_count == 3
 
     def test_cannot_open_video(self, mock_model, mock_visualizer, tmp_path):
         mock_cap = MagicMock()

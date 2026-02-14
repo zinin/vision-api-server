@@ -170,7 +170,7 @@ class JobStats(BaseModel):
     """Statistics for a completed annotation job."""
     total_frames: int = Field(description="Total frames in video")
     detected_frames: int = Field(description="Frames with YOLO detection")
-    tracked_frames: int = Field(description="Frames with tracker only")
+    tracked_frames: int = Field(description="Frames with held detections (reused from last YOLO run)")
     total_detections: int = Field(description="Total object detections")
     processing_time_ms: int = Field(description="Total processing time in ms")
 

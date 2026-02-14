@@ -63,6 +63,15 @@ MAX_QUEUED_JOBS=10                      # Queue limit
 DEFAULT_DETECT_EVERY=5                  # YOLO every N frames
 ```
 
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+```
+
+Tests cover config, Pydantic models, and JobManager. VideoAnnotator has no unit tests (requires YOLO model + FFmpeg).
+
 ## Key Patterns
 
 **Async Inference**: YOLO runs in ThreadPoolExecutor via `run_in_executor()`.

@@ -29,6 +29,8 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/config.py` | Pydantic settings, env vars |
 | `app/models.py` | Request/response Pydantic models |
 | `app/dependencies.py` | FastAPI dependency injection |
+| `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
+| `app/video_annotator.py` | YOLO + CSRT tracker video annotation pipeline |
 
 ## Endpoints
 
@@ -38,6 +40,9 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `/detect/video` | POST | Video detection with smart frames |
 | `/detect/visualize` | POST | Image with drawn bboxes |
 | `/extract/frames` | POST | Extract frames as base64 |
+| `/detect/video/visualize` | POST | Submit video for annotation (async, returns job_id) |
+| `/jobs/{job_id}` | GET | Job status and progress |
+| `/jobs/{job_id}/download` | GET | Download annotated video |
 | `/models` | GET | List loaded/cached models |
 | `/health` | GET | Health check |
 
@@ -52,6 +57,10 @@ MAX_FILE_SIZE=10485760                  # Max image size (default 10MB)
 MAX_EXECUTOR_WORKERS=4                  # ThreadPool workers
 INFERENCE_TIMEOUT=30.0                  # Timeout seconds
 DEBUG=false                             # Detailed errors
+VIDEO_JOB_TTL=3600                      # Completed job TTL seconds
+VIDEO_JOBS_DIR=/tmp/vision_jobs         # Job files directory
+MAX_QUEUED_JOBS=10                      # Queue limit
+DEFAULT_DETECT_EVERY=5                  # YOLO every N frames
 ```
 
 ## Key Patterns
@@ -61,6 +70,8 @@ DEBUG=false                             # Detailed errors
 **Two-Tier Caching**: Preloaded (never evicted) + cached (TTL-based eviction).
 
 **Smart Frames**: FFmpeg scene detection with fallback to interval-based extraction.
+
+**Video Annotation**: Async job API — YOLO every Nth frame + CSRT tracker for intermediate frames. Single worker, in-memory job state (requires `workers=1`).
 
 ## Limits
 

@@ -90,6 +90,7 @@ class VideoAnnotator:
         cap = cv2.VideoCapture(str(input_path))
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {input_path}")
+        logger.debug(f"VideoCapture opened: {input_path}")
 
         writer = None
         try:
@@ -102,6 +103,7 @@ class VideoAnnotator:
             )
             if not writer.isOpened():
                 raise RuntimeError("Cannot create video writer")
+            logger.info(f"VideoWriter created: {video_only_path}, codec=mp4v, {width}x{height} @ {fps:.1f}fps")
 
             stats = AnnotationStats(total_frames=total_frames)
             trackers: list[tuple[cv2.Tracker, DetectionBox]] = []
@@ -129,12 +131,22 @@ class VideoAnnotator:
                     trackers = self._init_trackers(frame, current_detections)
                     stats.detected_frames += 1
                     stats.total_detections += len(current_detections)
+                    logger.debug(
+                        f"Frame {frame_num}: YOLO detected {len(current_detections)} objects, "
+                        f"initialized {len(trackers)} trackers"
+                    )
                 else:
+                    prev_count = len(trackers)
                     current_detections = self._update_trackers(
                         frame, trackers
                     )
                     stats.tracked_frames += 1
                     stats.total_detections += len(current_detections)
+                    if len(current_detections) < prev_count:
+                        logger.debug(
+                            f"Frame {frame_num}: tracking {len(current_detections)}/{prev_count} "
+                            f"(lost {prev_count - len(current_detections)})"
+                        )
 
                 self._draw_detections(frame, current_detections, params, font_scale)
                 writer.write(frame)
@@ -149,6 +161,13 @@ class VideoAnnotator:
             stats.total_frames = frame_num
             stats.processing_time_ms = int(
                 (time.perf_counter() - start_time) * 1000
+            )
+
+            fps_actual = frame_num / max(stats.processing_time_ms / 1000, 0.001)
+            logger.info(
+                f"Frame processing complete: {frame_num} frames in {stats.processing_time_ms}ms "
+                f"({fps_actual:.1f} fps), detected={stats.detected_frames}, "
+                f"tracked={stats.tracked_frames}, total_detections={stats.total_detections}"
             )
 
             self._merge_audio(input_path, video_only_path, output_path)
@@ -180,6 +199,7 @@ class VideoAnnotator:
             "-select_streams", "v:0",
             str(video_path),
         ]
+        logger.debug(f"ffprobe command: {' '.join(cmd)}")
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=30
@@ -200,6 +220,10 @@ class VideoAnnotator:
                     total_frames = int(duration * fps)
                 # Validate metadata is usable
                 if width > 0 and height > 0 and fps > 0:
+                    logger.debug(
+                        f"ffprobe metadata: {width}x{height} @ {fps:.2f}fps, "
+                        f"~{total_frames} frames, codec={stream.get('codec_name', '?')}"
+                    )
                     return fps, width, height, total_frames
                 logger.warning(
                     f"ffprobe returned invalid metadata: {width}x{height} @ {fps}fps"
@@ -208,12 +232,14 @@ class VideoAnnotator:
             logger.warning(f"ffprobe failed: {e}, falling back to cv2")
 
         # Fallback to cv2
+        logger.info("Using cv2 fallback for video metadata")
         cap = cv2.VideoCapture(str(video_path))
         try:
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            logger.debug(f"cv2 metadata: {width}x{height} @ {fps:.2f}fps, ~{total_frames} frames")
             return fps, width, height, total_frames
         finally:
             cap.release()
@@ -321,11 +347,15 @@ class VideoAnnotator:
             "-shortest",
             str(output),
         ]
+        logger.info("Merging audio from original video")
+        logger.debug(f"FFmpeg command: {' '.join(cmd)}")
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=300
             )
-            if result.returncode != 0:
+            if result.returncode == 0:
+                logger.info(f"Audio merge complete: {output}")
+            else:
                 logger.warning(
                     f"FFmpeg audio merge failed (rc={result.returncode}): "
                     f"{result.stderr[:500]}"

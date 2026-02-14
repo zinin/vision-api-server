@@ -1,3 +1,4 @@
+import os
 import shutil
 import time
 import logging
@@ -40,10 +41,14 @@ from video_annotator import VideoAnnotator, AnnotationParams
 from inference_utils import get_executor
 from video_utils import extract_frames_from_video, VideoFrameExtractor
 
+_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, _log_level, logging.INFO),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+# Suppress noisy third-party debug logs
+for _lib in ("python_multipart", "multipart", "urllib3", "httpcore", "httpx", "ultralytics"):
+    logging.getLogger(_lib).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Video file settings
@@ -176,15 +181,18 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                 continue
 
             job_manager.mark_processing(job_id)
+            logger.info(f"Worker picked up job {job_id}, params: {job.params}")
 
             try:
                 # Get model
                 model_name = job.params.get("model")
+                logger.debug(f"Job {job_id}: loading model '{model_name or 'default'}'")
                 try:
                     model_entry = await model_manager.get_model(model_name)
                 except (RuntimeError, ValueError) as e:
                     job_manager.mark_failed(job_id, f"Model error: {e}")
                     continue
+                logger.debug(f"Job {job_id}: model loaded, device={model_entry.device}")
 
                 annotator = VideoAnnotator(
                     model=model_entry.model,
@@ -211,6 +219,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     job_manager.update_progress(job_id, progress)
 
                 # Run in executor (blocking I/O + YOLO inference)
+                logger.debug(f"Job {job_id}: submitting to executor")
                 loop = asyncio.get_running_loop()
                 executor = get_executor(settings.max_executor_workers).executor
                 try:
@@ -224,6 +233,10 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                         ),
                     )
 
+                    logger.info(
+                        f"Job {job_id} annotation finished: {stats.total_frames} frames, "
+                        f"{stats.processing_time_ms}ms"
+                    )
                     job_manager.mark_completed(
                         job_id,
                         output_path=output_path,
@@ -275,7 +288,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
     settings = get_settings()
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
 
-    detail = str(exc) if settings.debug else "An internal error occurred"
+    detail = str(exc) if settings.log_level.upper() == "DEBUG" else "An internal error occurred"
 
     return JSONResponse(
         status_code=500,

@@ -7,3 +7,4 @@ def test_video_job_settings_defaults():
     assert s.video_jobs_dir == "/tmp/vision_jobs"
     assert s.max_queued_jobs == 10
     assert s.default_detect_every == 5
+    assert s.log_level == "INFO"

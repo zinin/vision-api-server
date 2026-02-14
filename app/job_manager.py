@@ -43,6 +43,9 @@ class JobManager:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._cleanup_task: asyncio.Task | None = None
         self._shutdown_event = asyncio.Event()
+        logger.info(
+            f"JobManager initialized: jobs_dir={jobs_dir}, ttl={ttl_seconds}s, max_queued={max_queued}"
+        )
 
     def check_queue_capacity(self) -> None:
         """Raise RuntimeError if queue is full. Call before expensive upload."""
@@ -79,6 +82,7 @@ class JobManager:
         job = self._jobs.get(job_id)
         if job:
             job.progress = progress
+            logger.debug(f"Job {job_id}: progress {progress}%")
 
     def mark_processing(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
@@ -98,7 +102,7 @@ class JobManager:
             job.completed_at = datetime.now(tz=timezone.utc)
             job.output_path = output_path
             job.stats = stats
-            logger.info(f"Job completed: {job_id}")
+            logger.info(f"Job completed: {job_id}, output={output_path}, stats={stats}")
 
     def mark_failed(self, job_id: str, error: str) -> None:
         job = self._jobs.get(job_id)
@@ -126,6 +130,7 @@ class JobManager:
             job_dir = self.jobs_dir / job_id
             if job_dir.exists():
                 shutil.rmtree(job_dir, ignore_errors=True)
+                logger.debug(f"Removed directory: {job_dir}")
             logger.info(f"Cleaned up expired job: {job_id}")
 
         return len(expired)

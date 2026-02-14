@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     yolo_model_ttl: int = 900  # 15 minutes TTL for cached models
     max_file_size: int = 10 * 1024 * 1024
     allowed_extensions: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp"})
-    debug: bool = False
+    log_level: str = "INFO"
     inference_timeout: float = 30.0
     max_executor_workers: int = 4
 

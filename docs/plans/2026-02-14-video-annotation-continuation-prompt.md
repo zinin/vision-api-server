@@ -1,6 +1,6 @@
 ## TASK
 
-Run code review for Video Annotation feature (VAS-2). All implementation tasks are complete except Task 8 (manual integration test).
+Continue executing the implementation plan for Video Annotation feature (VAS-2). All implementation and code review are done — only manual integration test remains.
 
 ## CRITICAL: DO NOT START WORKING
 
@@ -36,6 +36,7 @@ Read both documents to understand the full picture.
 - [x] Task 5: Create VideoAnnotator (video_annotator.py) + make visualization.py methods public — `a9ac08f`
 - [x] Task 6: Add API endpoints and worker loop to main.py + get_job_manager dependency — `a0fea76`
 - [x] Task 7: Update CLAUDE.md documentation — `7ad108b`
+- [x] Code review (4 agents: Claude, Codex, CCS/GLM-4.7, Gemini) — 11 issues fixed — `4763068`
 
 **Remaining:**
 - [ ] Task 8: Manual integration test (requires running server with YOLO model + FFmpeg)
@@ -44,17 +45,30 @@ Read both documents to understand the full picture.
 
 Key facts about the implementation:
 
-1. **Branch**: `feature/VAS-2`. Current HEAD: `7ad108b`.
+1. **Branch**: `feature/VAS-2`. Current HEAD: `4763068`.
 2. **15 tests pass**: 1 config + 3 models + 11 job_manager. Run with `.venv/bin/python -m pytest tests/ -v`.
 3. **VideoAnnotator has no unit tests** — requires YOLO model, video files and FFmpeg. Tested only via manual integration (Task 8).
 4. **3 design review iterations were done BEFORE implementation** (78 findings total, all processed). The plan already incorporates all accepted fixes.
-5. **Endpoint naming**: `/detect/video/visualize` (matches existing `/detect/visualize` for images).
-6. **No tracker fallback**: Only CSRT, no KCF. `_create_csrt_tracker()` handles OpenCV version differences.
-7. **YOLO.track was investigated and rejected**: It runs detection on EVERY frame (no `detect_every`). CSRT kept for performance.
-8. **Python venv**: `.venv/bin/python -m pytest tests/ -v` — system python3 does NOT have pytest.
-9. **workers=1 is a hard requirement** — in-memory job state not shared across processes.
+5. **Code review done with 4 agents.** Results summary:
+   - 19 unique findings total
+   - 11 marked "Справедливо" — all fixed in `4763068`
+   - 3 marked "Спорно" (job orphan on shutil.move failure, thread-safety comment, multi-worker warning) — left as-is for v1
+   - 5 marked "Ложное срабатывание" (worker crash recovery, silent tracker failures, premature cleanup, mp4v codec, chunk size)
+6. **Key fixes in code review commit** (`4763068`):
+   - `startup_sweep()` safety guard against dangerous paths (`/tmp`, `/var`, etc.)
+   - `video_only.mp4` unlink wrapped in try/except OSError
+   - `video_job_ttl` minimum 60s, `default_detect_every` upper bound 300
+   - Version synced to 2.2.0
+   - `font_scale` calculated once per video instead of per detection
+   - Imports moved to top-level, unused import removed, redundant except simplified
+   - Progress skipped when `total_frames` unknown
+7. **Endpoint naming**: `/detect/video/visualize` (matches existing `/detect/visualize` for images).
+8. **No tracker fallback**: Only CSRT, no KCF. `_create_csrt_tracker()` handles OpenCV version differences.
+9. **YOLO.track was investigated and rejected**: It runs detection on EVERY frame (no `detect_every`). CSRT kept for performance.
+10. **Python venv**: `.venv/bin/python -m pytest tests/ -v` — system python3 does NOT have pytest.
+11. **workers=1 is a hard requirement** — in-memory job state not shared across processes.
 
-### Files changed in this feature (for code review scope)
+### Files changed in this feature (for reference)
 
 **New files:**
 - `app/job_manager.py` — JobManager, Job dataclass, queue, TTL cleanup
@@ -89,6 +103,14 @@ The plan was written for a large task and may contain:
 4. Ask the user how to proceed
 
 Do NOT silently work around plan issues or make significant deviations without user approval.
+
+## INSTRUCTIONS
+
+1. Read the documents listed above
+2. Understand current progress and session context
+3. Provide a brief summary of what you understood
+4. **STOP and WAIT** — do NOT proceed with any implementation
+5. Ask: "What would you like me to work on?"
 
 ## SPECIAL INSTRUCTIONS
 

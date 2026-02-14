@@ -831,6 +831,7 @@ async def annotate_video(
     ] = True,
     model: ModelQuery = None,
     job_manager: JobManager = Depends(get_job_manager),
+    model_manager: ModelManager = Depends(get_model_manager),
     settings: Settings = Depends(get_settings),
 ):
     """
@@ -861,6 +862,13 @@ async def annotate_video(
     classes_list = None
     if classes:
         classes_list = [c.strip() for c in classes.split(",") if c.strip()]
+
+    # Validate model exists before expensive upload
+    if model:
+        try:
+            await model_manager.get_model(model)
+        except (RuntimeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid model: {e}")
 
     # Early reject if queue is full (before expensive upload)
     try:

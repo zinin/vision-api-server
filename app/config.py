@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # Video annotation job settings
     video_job_ttl: int = Field(default=3600, ge=60)  # 1 hour TTL for completed jobs
     video_jobs_dir: str = "/tmp/vision_jobs"
-    max_queued_jobs: int = 10
+    max_queued_jobs: int = Field(default=10, ge=1)
     default_detect_every: int = Field(default=5, ge=1, le=300)
 
     @property

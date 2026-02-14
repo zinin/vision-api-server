@@ -77,3 +77,9 @@ Container: 8000 → Host: 3001
 See `.claude/rules/` for detailed documentation:
 - `api.md` — Endpoints, parameters, examples
 - `docker.md` — Docker deployment, scripts
+
+## Jira
+
+Project tracker: https://jira.zinin.ru/ (project key: **VAS**)
+Available via MCP `mcp-atlassian` — use `jira_search`, `jira_get_issue`, `jira_create_issue` etc. with `project_key: "FV"`.
+When creating issues, assign them to user **azinin**.

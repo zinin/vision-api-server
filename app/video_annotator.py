@@ -81,9 +81,12 @@ class VideoAnnotator:
         # Get metadata via ffprobe (more reliable than cv2.CAP_PROP for VFR video)
         fps, width, height, total_frames = self._get_video_metadata(input_path)
 
+        model_name = getattr(self.model, "model_name", None) or getattr(self.model, "ckpt_path", "unknown")
+        model_device = getattr(self.model, "device", "unknown")
         logger.info(
             f"Starting annotation: {input_path.name}, "
             f"{width}x{height} @ {fps:.1f}fps, ~{total_frames} frames, "
+            f"model={model_name}, device={model_device}, "
             f"detect_every={params.detect_every}, conf={params.conf}"
         )
 

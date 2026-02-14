@@ -1,7 +1,7 @@
 import json
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import field_validator
+from pydantic import field_validator, Field
 from functools import lru_cache
 
 
@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     debug: bool = False
     inference_timeout: float = 30.0
     max_executor_workers: int = 4
+
+    # Video annotation job settings
+    video_job_ttl: int = 3600  # 1 hour TTL for completed jobs
+    video_jobs_dir: str = "/tmp/vision_jobs"
+    max_queued_jobs: int = 10
+    default_detect_every: int = Field(default=5, ge=1)
 
     @property
     def preload_model_map(self) -> dict[str, str]:

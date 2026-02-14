@@ -125,3 +125,54 @@ def test_startup_sweep(tmp_jobs_dir):
     assert not (jobs_dir / "orphan1").exists()
     assert not (jobs_dir / "orphan2").exists()
     assert not (jobs_dir / "upload_abc123.tmp").exists()
+
+
+# --- Async lifecycle tests ---
+
+@pytest.mark.asyncio
+async def test_start_cleanup_task_creates_task(manager):
+    manager.start_cleanup_task(interval=60)
+    assert manager._cleanup_task is not None
+    assert not manager._cleanup_task.done()
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_start_cleanup_task_idempotent(manager):
+    manager.start_cleanup_task(interval=60)
+    first_task = manager._cleanup_task
+    manager.start_cleanup_task(interval=60)
+    assert manager._cleanup_task is first_task
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stops_cleanup_task(manager):
+    manager.start_cleanup_task(interval=60)
+    task = manager._cleanup_task
+    await manager.shutdown()
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_without_cleanup_task(manager):
+    # Should not raise
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_expired_removes_failed_jobs(manager, tmp_jobs_dir):
+    from datetime import datetime, timedelta, timezone
+
+    job = manager.create_job(params={})
+    job_id = job.job_id
+    manager.mark_failed(job_id, error="some error")
+
+    # Not expired yet
+    assert manager.cleanup_expired() == 0
+
+    # Backdate completed_at to make it expired
+    manager.get_job(job_id).completed_at = datetime.now(tz=timezone.utc) - timedelta(seconds=20)
+
+    assert manager.cleanup_expired() == 1
+    assert manager.get_job(job_id) is None

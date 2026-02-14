@@ -50,7 +50,11 @@ GPU economy by default. Users can set `detect_every=1` for maximum quality when 
 
 ### 4. Remove CSRT entirely
 
-No replacement tracker. `_create_csrt_tracker()`, `_init_trackers()`, `_update_trackers()` become dead code. `opencv-contrib-python-headless` stays in requirements — still needed for `cv2.VideoWriter`, `cv2.VideoCapture`, etc.
+No replacement tracker. `_create_csrt_tracker()`, `_init_trackers()`, `_update_trackers()` become dead code.
+
+### 5. Replace `opencv-contrib-python-headless` with `opencv-python-headless`
+
+After CSRT removal, no contrib-specific modules are used. All remaining cv2 usage (`VideoCapture`, `VideoWriter`, `imencode`, `rectangle`, `putText`, etc.) is in the standard `opencv-python-headless` package. Switching reduces Docker image size.
 
 ## Expected Performance
 
@@ -62,14 +66,15 @@ No replacement tracker. `_create_csrt_tracker()`, `_init_trackers()`, `_update_t
 
 ## API Impact
 
-None. `detect_every` parameter unchanged (range 1-300, default 5). Same endpoints, same response format. `AnnotationStats.tracked_frames` semantics shift from "CSRT-tracked" to "hold-reused", but field name stays the same.
+None. `detect_every` parameter unchanged (range 1-300, default 5). Same endpoints, same response format. `AnnotationStats.tracked_frames` semantics shift from "CSRT-tracked" to "hold-reused", but field name stays the same. Add docstring to `AnnotationStats` clarifying that `tracked_frames` now means "frames where detections were reused from last YOLO run (hold mode)" rather than "frames processed by CSRT tracker".
 
 ## Files to Modify
 
 | File | Change |
 |------|--------|
-| `app/video_annotator.py` | Remove CSRT functions/methods, simplify frame loop |
-| `tests/test_video_annotator.py` | Remove CSRT tests, add hold mode tests |
+| `app/video_annotator.py` | Remove CSRT functions/methods, simplify frame loop, update AnnotationStats docstring |
+| `tests/test_video_annotator.py` | Remove CSRT tests, add hold mode tests (incl. empty detections edge case) |
+| `requirements.txt` | Replace `opencv-contrib-python-headless` with `opencv-python-headless` |
 
 ## Files Unchanged
 

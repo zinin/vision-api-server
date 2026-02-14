@@ -158,15 +158,55 @@ class VideoAnnotator:
     """Annotate video with YOLO detections and hold mode."""
 ```
 
+**Step 6a: Update AnnotationStats docstring**
+
+```python
+# OLD:
+@dataclass(slots=True)
+class AnnotationStats:
+    total_frames: int = 0
+    detected_frames: int = 0
+    tracked_frames: int = 0
+    total_detections: int = 0
+    processing_time_ms: int = 0
+
+# NEW:
+@dataclass(slots=True)
+class AnnotationStats:
+    """Video annotation processing statistics.
+
+    Attributes:
+        tracked_frames: Frames where detections were reused from last
+            YOLO detection (hold mode). Previously: CSRT-tracked frames.
+    """
+    total_frames: int = 0
+    detected_frames: int = 0
+    tracked_frames: int = 0
+    total_detections: int = 0
+    processing_time_ms: int = 0
+```
+
 **Step 7: Run tests**
 
 Run: `python -m pytest tests/test_video_annotator.py -v`
 Expected: Some tests FAIL (TestCreateCsrtTracker, TestInitTrackers, TestUpdateTrackers — they import/reference removed code). TestAnnotatePipeline.test_full_pipeline may also fail due to tracker mock.
 
-**Step 8: Commit (WIP)**
+**Step 8: Replace `opencv-contrib-python-headless` with `opencv-python-headless` in requirements.txt**
+
+```
+# OLD:
+opencv-contrib-python-headless>=4.12.0.88,<5.0.0
+
+# NEW:
+opencv-python-headless>=4.12.0.88,<5.0.0
+```
+
+After CSRT removal, no contrib-specific modules are used. All remaining cv2 usage (VideoCapture, VideoWriter, imencode, rectangle, putText, etc.) is in the standard package.
+
+**Step 9: Commit (WIP)**
 
 ```bash
-git add app/video_annotator.py
+git add app/video_annotator.py requirements.txt
 git commit -m "refactor: remove CSRT tracker, implement hold mode (VAS-2)"
 ```
 
@@ -370,12 +410,72 @@ Add to `TestAnnotatePipeline` class:
         assert mock_visualizer.draw_detection.call_count == 3
 ```
 
-**Step 3: Run tests**
+**Step 3: Write test for empty detections clearing hold**
+
+Add to `TestAnnotatePipeline` class:
+
+```python
+    def test_hold_clears_on_empty_detection(self, mock_model, mock_visualizer, tmp_path):
+        """When detection frame returns no objects, hold frames also show nothing."""
+        num_frames = 4
+        mock_cap, mock_writer = self._setup_pipeline_mocks(num_frames)
+
+        # Frame 0: 1 detection. Frame 3: 0 detections.
+        mock_model.predict.side_effect = [
+            [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])],  # frame 0
+            [_make_yolo_result([])],  # frame 3
+        ]
+
+        ffprobe_stream = {
+            "r_frame_rate": "30/1",
+            "width": 640,
+            "height": 480,
+            "nb_frames": str(num_frames),
+        }
+        ffprobe_result = MagicMock()
+        ffprobe_result.returncode = 0
+        ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
+
+        merge_result = MagicMock()
+        merge_result.returncode = 0
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        output_path = tmp_path / "output.mp4"
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
+
+        def subprocess_side_effect(cmd, **kwargs):
+            if cmd[0] == "ffprobe":
+                return ffprobe_result
+            return merge_result
+
+        with (
+            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
+            patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
+            patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
+            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
+        ):
+            stats = annotator.annotate(
+                input_path, output_path, AnnotationParams(detect_every=3)
+            )
+
+        assert stats.total_frames == num_frames
+        assert stats.detected_frames == 2  # frames 0, 3
+        assert stats.tracked_frames == 2  # frames 1, 2
+        assert mock_model.predict.call_count == 2
+        # Frame 0: 1 det, frames 1-2: 1 det each (hold), frame 3: 0 det
+        assert stats.total_detections == 3
+        # Visualizer: 1 (frame 0) + 1 (frame 1) + 1 (frame 2) + 0 (frame 3) = 3
+        assert mock_visualizer.draw_detection.call_count == 3
+```
+
+**Step 4: Run tests**
 
 Run: `python -m pytest tests/test_video_annotator.py -v`
 Expected: All tests PASS.
 
-**Step 4: Commit**
+**Step 5: Commit**
 
 ```bash
 git add tests/test_video_annotator.py
@@ -398,7 +498,7 @@ Expected: No output (no matches).
 
 **Step 3: Check test count**
 
-Old: 77 tests. Removed 8 (3 + 2 + 3), added 2. Expected: **71 tests**.
+Old: 77 tests. Removed 8 (3 + 2 + 3), added 3. Expected: **72 tests**.
 
 **Step 4: Squash or keep commits as-is, push**
 

@@ -70,20 +70,21 @@ Returns MP4 file as FileResponse.
 
 ## Processing Pipeline
 
-1. Stream uploaded video to `/tmp/vision_jobs/{job_id}/input.mp4` (chunked write, not full read into RAM)
-2. Validate file size after write, create job only after successful save
-3. Get metadata (fps, resolution, duration) via ffprobe (more reliable than cv2.CAP_PROP for VFR video)
-4. Open video with `cv2.VideoCapture` (streaming decoder, ~50 MB RAM)
-5. Create `cv2.VideoWriter` for output video (writes to disk frame-by-frame)
-6. Frame loop:
+1. Early reject if queue is full (before expensive upload)
+2. Stream uploaded video to `/tmp/vision_jobs/{job_id}/input.mp4` (async chunked write via aiofiles, not full read into RAM)
+3. Validate file size after write, create job only after successful save
+4. Get metadata (fps, resolution, duration) via ffprobe with validation (width>0, height>0, fps>0; cv2 fallback)
+5. Open video with `cv2.VideoCapture` (streaming decoder, ~50 MB RAM)
+6. Create `cv2.VideoWriter` for output video (writes to disk frame-by-frame, released in finally)
+7. Frame loop:
    - If `frame_num % detect_every == 0`: run YOLO, reinitialize CSRT trackers
    - Else: update CSRT trackers to get box positions
    - Draw bboxes using `DetectionVisualizer.draw_detection()` (public method)
    - Write frame to VideoWriter
-7. Close VideoWriter
-8. FFmpeg: merge annotated video stream with audio from original (best effort — no audio is not an error)
-9. Update job status to completed
-10. Clean up intermediate files (input.mp4, video_only.mp4)
+8. Close VideoWriter
+9. FFmpeg: merge annotated video stream with audio from original (best effort — no audio is not an error)
+10. Update job status to completed
+11. Clean up intermediate files (input.mp4, video_only.mp4) — separate try/except to avoid overwriting completed status
 
 Tracker: `cv2.TrackerCSRT` — best accuracy/speed balance for short tracking intervals.
 
@@ -96,7 +97,8 @@ In-memory `JobManager` with:
 - FIFO queue with `asyncio.Queue`
 - Single worker (one video at a time, GPU bottleneck)
 - Background cleanup task (every 60s, removes expired jobs)
-- Startup sweep: delete all directories in `VIDEO_JOBS_DIR` on startup (orphan cleanup after restart)
+- Startup sweep: delete all directories and orphan .tmp files in `VIDEO_JOBS_DIR` on startup (orphan cleanup after restart)
+- Queue capacity pre-check (`check_queue_capacity()`) — early reject before upload
 
 Job states: `queued` → `processing` → `completed` | `failed`
 

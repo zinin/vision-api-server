@@ -30,9 +30,10 @@ with:
 opencv-contrib-python-headless>=4.12.0.88,<5.0.0
 ```
 
-This is a drop-in replacement that adds the `cv2.legacy` module with CSRT tracker. Also add `httpx` for FastAPI TestClient:
+This is a drop-in replacement that adds the `cv2.legacy` module with CSRT tracker. Also add `httpx` for FastAPI TestClient and `aiofiles` for async file I/O:
 ```
 httpx>=0.28.0,<1.0.0
+aiofiles>=24.1.0,<25.0.0
 ```
 
 **Step 2: Create test directory**
@@ -276,6 +277,13 @@ def test_get_job_not_found(manager):
     assert manager.get_job("nonexistent") is None
 
 
+def test_check_queue_capacity(manager):
+    for _ in range(3):
+        manager.create_job(params={})
+    with pytest.raises(RuntimeError, match="Too many queued jobs"):
+        manager.check_queue_capacity()
+
+
 def test_queue_overflow(manager):
     for _ in range(3):
         manager.create_job(params={})
@@ -347,12 +355,15 @@ def test_startup_sweep(tmp_jobs_dir):
     (jobs_dir / "orphan1").mkdir()
     (jobs_dir / "orphan2").mkdir()
     (jobs_dir / "orphan2" / "output.mp4").touch()
+    # Create orphan tmp files
+    (jobs_dir / "upload_abc123.tmp").touch()
 
     mgr = JobManager(jobs_dir=tmp_jobs_dir, ttl_seconds=10, max_queued=3)
     removed = mgr.startup_sweep()
-    assert removed == 2
+    assert removed == 3
     assert not (jobs_dir / "orphan1").exists()
     assert not (jobs_dir / "orphan2").exists()
+    assert not (jobs_dir / "upload_abc123.tmp").exists()
 ```
 
 **Step 2: Run tests to verify they fail**
@@ -370,7 +381,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -385,12 +396,12 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
-@dataclass
+@dataclass(slots=True)
 class Job:
     job_id: str
     status: JobStatus
     progress: int = 0
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     completed_at: datetime | None = None
     error: str | None = None
     input_path: Path | None = None
@@ -411,7 +422,8 @@ class JobManager:
         self._cleanup_task: asyncio.Task | None = None
         self._shutdown_event = asyncio.Event()
 
-    def create_job(self, params: dict) -> Job:
+    def check_queue_capacity(self) -> None:
+        """Raise RuntimeError if queue is full. Call before expensive upload."""
         queued_count = sum(
             1 for j in self._jobs.values() if j.status == JobStatus.QUEUED
         )
@@ -419,6 +431,9 @@ class JobManager:
             raise RuntimeError(
                 f"Too many queued jobs ({queued_count}/{self.max_queued})"
             )
+
+    def create_job(self, params: dict) -> Job:
+        self.check_queue_capacity()
 
         job_id = uuid.uuid4().hex[:12]
         job_dir = self.jobs_dir / job_id
@@ -446,6 +461,8 @@ class JobManager:
     def mark_processing(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
         if job:
+            if job.status != JobStatus.QUEUED:
+                logger.warning(f"Job {job_id} unexpected state for processing: {job.status}")
             job.status = JobStatus.PROCESSING
             logger.info(f"Job processing: {job_id}")
 
@@ -456,7 +473,7 @@ class JobManager:
         if job:
             job.status = JobStatus.COMPLETED
             job.progress = 100
-            job.completed_at = datetime.now()
+            job.completed_at = datetime.now(tz=timezone.utc)
             job.output_path = output_path
             job.stats = stats
             logger.info(f"Job completed: {job_id}")
@@ -465,7 +482,7 @@ class JobManager:
         job = self._jobs.get(job_id)
         if job:
             job.status = JobStatus.FAILED
-            job.completed_at = datetime.now()
+            job.completed_at = datetime.now(tz=timezone.utc)
             job.error = error
             logger.error(f"Job failed: {job_id}: {error}")
 
@@ -504,7 +521,7 @@ class JobManager:
                     logger.info(f"Job cleanup: removed {evicted} expired job(s)")
 
     def startup_sweep(self) -> int:
-        """Delete all job directories on startup (orphan cleanup after restart)."""
+        """Delete all job directories and orphan tmp files on startup."""
         if not self.jobs_dir.exists():
             return 0
         count = 0
@@ -512,8 +529,11 @@ class JobManager:
             if entry.is_dir():
                 shutil.rmtree(entry, ignore_errors=True)
                 count += 1
+            elif entry.is_file() and entry.suffix == ".tmp":
+                entry.unlink(missing_ok=True)
+                count += 1
         if count:
-            logger.info(f"Startup sweep: removed {count} orphan job dir(s)")
+            logger.info(f"Startup sweep: removed {count} orphan item(s)")
         return count
 
     def start_cleanup_task(self, interval: int = 60) -> None:
@@ -537,7 +557,7 @@ class JobManager:
 **Step 4: Run tests to verify they pass**
 
 Run: `cd /opt/github/zinin/vision-api-server && python -m pytest tests/test_job_manager.py -v`
-Expected: All 10 tests PASS
+Expected: All 11 tests PASS
 
 **Step 5: Commit**
 
@@ -595,7 +615,7 @@ def _create_csrt_tracker() -> cv2.Tracker:
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class AnnotationParams:
     conf: float = 0.5
     imgsz: int = 640
@@ -607,7 +627,7 @@ class AnnotationParams:
     show_conf: bool = True
 
 
-@dataclass
+@dataclass(slots=True)
 class AnnotationStats:
     total_frames: int = 0
     detected_frames: int = 0
@@ -650,10 +670,17 @@ class VideoAnnotator:
         # Get metadata via ffprobe (more reliable than cv2.CAP_PROP for VFR video)
         fps, width, height, total_frames = self._get_video_metadata(input_path)
 
+        logger.info(
+            f"Starting annotation: {input_path.name}, "
+            f"{width}x{height} @ {fps:.1f}fps, ~{total_frames} frames, "
+            f"detect_every={params.detect_every}, conf={params.conf}"
+        )
+
         cap = cv2.VideoCapture(str(input_path))
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {input_path}")
 
+        writer = None
         try:
 
             video_only_path = output_path.parent / "video_only.mp4"
@@ -708,6 +735,7 @@ class VideoAnnotator:
                     progress_callback(min(progress, 99))
 
             writer.release()
+            writer = None
             stats.total_frames = frame_num
             stats.processing_time_ms = int(
                 (time.perf_counter() - start_time) * 1000
@@ -721,6 +749,8 @@ class VideoAnnotator:
             return stats
 
         finally:
+            if writer is not None:
+                writer.release()
             cap.release()
 
     @staticmethod
@@ -756,18 +786,25 @@ class VideoAnnotator:
                     # Estimate from duration
                     duration = float(stream.get("duration", 0))
                     total_frames = int(duration * fps)
-                return fps, width, height, total_frames
+                # Validate metadata is usable
+                if width > 0 and height > 0 and fps > 0:
+                    return fps, width, height, total_frames
+                logger.warning(
+                    f"ffprobe returned invalid metadata: {width}x{height} @ {fps}fps"
+                )
         except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
             logger.warning(f"ffprobe failed: {e}, falling back to cv2")
 
         # Fallback to cv2
         cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        return fps, width, height, total_frames
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            return fps, width, height, total_frames
+        finally:
+            cap.release()
 
     def _extract_detections(
         self, results: list, class_filter: list[str] | None
@@ -823,6 +860,8 @@ class VideoAnnotator:
             success, bbox = tracker.update(frame)
             if success:
                 x, y, w, h = [int(v) for v in bbox]
+                if w <= 0 or h <= 0:
+                    continue
                 updated.append(
                     DetectionBox(
                         x1=x,
@@ -974,6 +1013,13 @@ from models import (
 In the lifespan function (`app/main.py`), after line 92 (`app.state.model_manager = model_manager`), add:
 ```python
 
+        # Verify ffmpeg/ffprobe are available for video annotation
+        import shutil as _shutil_check
+        if not _shutil_check.which("ffmpeg") or not _shutil_check.which("ffprobe"):
+            logger.warning(
+                "ffmpeg/ffprobe not found — video annotation will have limited functionality"
+            )
+
         # Initialize JobManager
         job_manager = JobManager(
             jobs_dir=settings.video_jobs_dir,
@@ -1064,9 +1110,10 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
 
             # Run in executor (blocking I/O + YOLO inference)
             loop = asyncio.get_running_loop()
+            executor = model_manager._executor  # Use service's controlled executor
             try:
                 stats = await loop.run_in_executor(
-                    None,
+                    executor,
                     lambda: annotator.annotate(
                         input_path=job.input_path,
                         output_path=output_path,
@@ -1087,16 +1134,19 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     },
                 )
 
-                # Clean up input file
-                if job.input_path.exists():
-                    job.input_path.unlink()
-
             except Exception as e:
                 logger.error(
                     f"Annotation failed for job {job_id}: {e}",
                     exc_info=True,
                 )
                 job_manager.mark_failed(job_id, str(e))
+
+            # Clean up input file (separate from try to avoid failed on unlink error)
+            try:
+                if job.input_path and job.input_path.exists():
+                    job.input_path.unlink()
+            except OSError as e:
+                logger.warning(f"Failed to clean up input file for {job_id}: {e}")
 
         except asyncio.CancelledError:
             logger.info("Annotation worker cancelled")
@@ -1177,15 +1227,21 @@ async def annotate_video(
     if classes:
         classes_list = [c.strip() for c in classes.split(",") if c.strip()]
 
-    # Stream upload to temp file, then validate size
-    import tempfile
+    # Early reject if queue is full (before expensive upload)
+    try:
+        job_manager.check_queue_capacity()
+    except RuntimeError as e:
+        raise HTTPException(status_code=429, detail=str(e))
+
+    # Stream upload to temp file using aiofiles, then validate size
+    import aiofiles
     import shutil as _shutil
     tmp_dir = Path(settings.video_jobs_dir)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_file = tmp_dir / f"upload_{uuid.uuid4().hex[:8]}.tmp"
     try:
         total_size = 0
-        with open(tmp_file, "wb") as f:
+        async with aiofiles.open(tmp_file, "wb") as f:
             while chunk := await file.read(1024 * 1024):  # 1MB chunks
                 total_size += len(chunk)
                 if total_size > MAX_VIDEO_SIZE:
@@ -1194,13 +1250,9 @@ async def annotate_video(
                         detail=f"Video too large. Maximum: "
                         f"{MAX_VIDEO_SIZE // (1024 * 1024)} MB",
                     )
-                f.write(chunk)
-    except HTTPException:
-        tmp_file.unlink(missing_ok=True)
-        raise
+                await f.write(chunk)
 
-    # Create job only after successful upload
-    try:
+        # Create job only after successful upload
         job = job_manager.create_job(
             params={
                 "conf": conf,
@@ -1214,9 +1266,15 @@ async def annotate_video(
                 "model": model,
             }
         )
+    except HTTPException:
+        tmp_file.unlink(missing_ok=True)
+        raise
     except RuntimeError as e:
         tmp_file.unlink(missing_ok=True)
         raise HTTPException(status_code=429, detail=str(e))
+    except Exception:
+        tmp_file.unlink(missing_ok=True)
+        raise
 
     # Move uploaded file to job directory
     _shutil.move(str(tmp_file), str(job.input_path))
@@ -1326,7 +1384,6 @@ Add to Configuration section:
 ```
 VIDEO_JOB_TTL=3600              # Completed job TTL seconds
 VIDEO_JOBS_DIR=/tmp/vision_jobs  # Job files directory
-MAX_CONCURRENT_JOBS=1            # Parallel video processing
 MAX_QUEUED_JOBS=10               # Queue limit
 DEFAULT_DETECT_EVERY=5           # YOLO every N frames
 ```

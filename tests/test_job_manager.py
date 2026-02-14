@@ -91,8 +91,6 @@ async def test_get_next_job_id(manager):
 
 
 def test_cleanup_expired(manager, tmp_jobs_dir):
-    import time
-
     job = manager.create_job(params={})
     job_id = job.job_id
     output = Path(tmp_jobs_dir) / job_id / "output.mp4"
@@ -103,8 +101,8 @@ def test_cleanup_expired(manager, tmp_jobs_dir):
     assert manager.cleanup_expired() == 0
 
     # Fake expiry by backdating completed_at
-    from datetime import datetime, timedelta
-    manager.get_job(job_id).completed_at = datetime.now() - timedelta(seconds=20)
+    from datetime import datetime, timedelta, timezone
+    manager.get_job(job_id).completed_at = datetime.now(tz=timezone.utc) - timedelta(seconds=20)
 
     assert manager.cleanup_expired() == 1
     assert manager.get_job(job_id) is None

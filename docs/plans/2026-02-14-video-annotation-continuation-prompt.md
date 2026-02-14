@@ -1,6 +1,6 @@
 ## TASK
 
-Continue executing the implementation plan for Video Annotation feature (VAS-2). All implementation and code review are done — only manual integration test remains.
+Continue executing the implementation plan for Video Annotation feature (VAS-2). All implementation, two rounds of code review, and documentation are done — only manual integration test remains.
 
 ## CRITICAL: DO NOT START WORKING
 
@@ -36,7 +36,9 @@ Read both documents to understand the full picture.
 - [x] Task 5: Create VideoAnnotator (video_annotator.py) + make visualization.py methods public — `a9ac08f`
 - [x] Task 6: Add API endpoints and worker loop to main.py + get_job_manager dependency — `a0fea76`
 - [x] Task 7: Update CLAUDE.md documentation — `7ad108b`
-- [x] Code review (4 agents: Claude, Codex, CCS/GLM-4.7, Gemini) — 11 issues fixed — `4763068`
+- [x] Code review round 1 (4 agents: Claude, Codex, CCS/GLM-4.7, Gemini) — 11 issues fixed — `4763068`
+- [x] Code review round 2 (4 agents: same) — 3 issues fixed — `7869f78`
+- [x] Added Testing section to CLAUDE.md — `0856b67`
 
 **Remaining:**
 - [ ] Task 8: Manual integration test (requires running server with YOLO model + FFmpeg)
@@ -45,28 +47,44 @@ Read both documents to understand the full picture.
 
 Key facts about the implementation:
 
-1. **Branch**: `feature/VAS-2`. Current HEAD: `4763068`.
-2. **15 tests pass**: 1 config + 3 models + 11 job_manager. Run with `.venv/bin/python -m pytest tests/ -v`.
+1. **Branch**: `feature/VAS-2`. Current HEAD: `0856b67`.
+2. **15 tests pass**: 1 config + 3 models + 11 job_manager. Run with `pip install -r requirements-dev.txt && python -m pytest tests/ -v`.
 3. **VideoAnnotator has no unit tests** — requires YOLO model, video files and FFmpeg. Tested only via manual integration (Task 8).
 4. **3 design review iterations were done BEFORE implementation** (78 findings total, all processed). The plan already incorporates all accepted fixes.
-5. **Code review done with 4 agents.** Results summary:
+5. **Code review round 1 (4 agents).** Results:
    - 19 unique findings total
    - 11 marked "Справедливо" — all fixed in `4763068`
    - 3 marked "Спорно" (job orphan on shutil.move failure, thread-safety comment, multi-worker warning) — left as-is for v1
-   - 5 marked "Ложное срабатывание" (worker crash recovery, silent tracker failures, premature cleanup, mp4v codec, chunk size)
-6. **Key fixes in code review commit** (`4763068`):
+   - 5 marked "Ложное срабатывание"
+6. **Code review round 2 (4 agents).** Results:
+   - 19 unique findings total
+   - 3 marked "Справедливо" — all fixed in `7869f78`:
+     - `max_queued_jobs` now has `Field(default=10, ge=1)` validation
+     - Model validated at submission time before upload (immediate 400 instead of delayed failure)
+     - pytest/pytest-asyncio moved to `requirements-dev.txt`
+   - 6 marked "Спорно" — left as-is for v1:
+     - Queue not atomic with upload (TOCTOU, low impact for internal API)
+     - Thread-safety progress_callback (repeat from round 1, CPython GIL safe)
+     - Failed trackers kept active (minor CPU waste, max 4 frames)
+     - create_job before shutil.move (repeat from round 1, worker handles failure)
+     - No tests for VideoAnnotator (known, by design)
+     - Duplicate ffmpeg checks in lifespan (cosmetic)
+   - 10 marked "Ложное срабатывание"
+7. **Key fixes across both review rounds** (`4763068` + `7869f78`):
    - `startup_sweep()` safety guard against dangerous paths (`/tmp`, `/var`, etc.)
    - `video_only.mp4` unlink wrapped in try/except OSError
-   - `video_job_ttl` minimum 60s, `default_detect_every` upper bound 300
+   - `video_job_ttl` minimum 60s, `default_detect_every` upper bound 300, `max_queued_jobs` minimum 1
    - Version synced to 2.2.0
    - `font_scale` calculated once per video instead of per detection
    - Imports moved to top-level, unused import removed, redundant except simplified
    - Progress skipped when `total_frames` unknown
-7. **Endpoint naming**: `/detect/video/visualize` (matches existing `/detect/visualize` for images).
-8. **No tracker fallback**: Only CSRT, no KCF. `_create_csrt_tracker()` handles OpenCV version differences.
-9. **YOLO.track was investigated and rejected**: It runs detection on EVERY frame (no `detect_every`). CSRT kept for performance.
-10. **Python venv**: `.venv/bin/python -m pytest tests/ -v` — system python3 does NOT have pytest.
-11. **workers=1 is a hard requirement** — in-memory job state not shared across processes.
+   - Model validated at submission time in `annotate_video` endpoint
+   - Dev dependencies separated to `requirements-dev.txt`
+8. **Endpoint naming**: `/detect/video/visualize` (matches existing `/detect/visualize` for images).
+9. **No tracker fallback**: Only CSRT, no KCF. `_create_csrt_tracker()` handles OpenCV version differences.
+10. **YOLO.track was investigated and rejected**: It runs detection on EVERY frame (no `detect_every`). CSRT kept for performance.
+11. **Python venv**: `.venv/bin/python -m pytest tests/ -v` — system python3 does NOT have pytest.
+12. **workers=1 is a hard requirement** — in-memory job state not shared across processes.
 
 ### Files changed in this feature (for reference)
 
@@ -78,15 +96,16 @@ Key facts about the implementation:
 - `tests/test_job_manager.py` — JobManager tests
 - `tests/__init__.py` — empty
 - `tests/conftest.py` — sys.path setup
+- `requirements-dev.txt` — dev dependencies (includes -r requirements.txt)
 
 **Modified files:**
-- `app/main.py` — +3 endpoints, worker loop, JobManager init in lifespan
-- `app/config.py` — +4 env variables
+- `app/main.py` — +3 endpoints, worker loop, JobManager init in lifespan, model validation at submission
+- `app/config.py` — +4 env variables with Field validation
 - `app/models.py` — +3 Pydantic response models
 - `app/visualization.py` — renamed _draw_detection → draw_detection, _calculate_adaptive_font_scale → calculate_adaptive_font_scale
 - `app/dependencies.py` — +get_job_manager
-- `requirements.txt` — opencv-contrib, aiofiles, httpx
-- `CLAUDE.md` — updated docs
+- `requirements.txt` — opencv-contrib, aiofiles, httpx (pytest moved to dev)
+- `CLAUDE.md` — updated docs + testing section
 
 ## PLAN QUALITY WARNING
 

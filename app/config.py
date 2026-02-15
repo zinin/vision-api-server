@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     video_jobs_dir: str = "/tmp/vision_jobs"
     max_queued_jobs: int = Field(default=10, ge=1)
     default_detect_every: int = Field(default=5, ge=1, le=300)
-    video_codec: str = "h264"  # h264, h265, av1
+    video_codec: str = "auto"  # auto | h264 | h265 | av1
     video_crf: int = Field(default=18, ge=0, le=63)
     video_hw_accel: str = "auto"  # auto | nvidia | amd | cpu
     vaapi_device: str = "/dev/dri/renderD128"  # VAAPI render device path
@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     @field_validator("video_codec")
     @classmethod
     def validate_video_codec(cls, v: str) -> str:
-        allowed = ("h264", "h265", "av1")
+        allowed = ("auto", "h264", "h265", "av1")
         if v not in allowed:
             raise ValueError(f"video_codec must be one of: {allowed}")
         return v

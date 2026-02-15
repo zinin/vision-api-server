@@ -95,3 +95,89 @@ class FFmpegDecoder:
 
     def __exit__(self, *exc):
         self.close()
+
+
+class FFmpegEncoder:
+    """Encode raw BGR24 frames via FFmpeg subprocess pipe with audio merge.
+
+    Usage:
+        with FFmpegEncoder(original, output, w, h, fps, config, codec, crf) as enc:
+            for frame in frames:
+                enc.write_frame(frame)
+    """
+
+    def __init__(
+        self,
+        original_path: str | Path,
+        output_path: str | Path,
+        width: int,
+        height: int,
+        fps: float,
+        hw_config: HWAccelConfig,
+        codec: str,
+        crf: int,
+    ):
+        self._stderr_lines: deque[bytes] = deque(maxlen=100)
+
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+        cmd += hw_config.global_encode_args  # e.g. [-vaapi_device, ...] — MUST be before -i
+        cmd += [
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "pipe:0",
+            "-i", str(original_path),
+            "-map", "0:v:0", "-map", "1:a:0?",
+            "-map_metadata", "0",
+        ]
+        cmd += hw_config.get_encode_args(codec, crf)  # codec-specific args (after inputs)
+        cmd += ["-c:a", "aac", "-shortest", str(output_path)]
+
+        logger.debug(f"FFmpegEncoder command: {' '.join(cmd)}")
+        self._process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False
+        )
+        # Start daemon thread to drain stderr and prevent deadlock
+        self._stderr_thread = threading.Thread(
+            target=_drain_stderr, args=(self._process, self._stderr_lines), daemon=True
+        )
+        self._stderr_thread.start()
+
+    def write_frame(self, frame: np.ndarray) -> None:
+        """Write one BGR24 frame to the encoder. Raises RuntimeError if process crashed."""
+        rc = self._process.poll()
+        if rc is not None:
+            raise RuntimeError(
+                f"FFmpeg encoder crashed (rc={rc}): "
+                f"{_format_stderr(self._stderr_lines)}"
+            )
+        self._process.stdin.write(frame.tobytes())
+
+    def close(self) -> None:
+        """Close stdin, wait for FFmpeg to finish, check return code."""
+        if self._process.stdin:
+            self._process.stdin.close()
+        self._stderr_thread.join(timeout=10)
+        try:
+            self._process.wait(timeout=300)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait(timeout=10)
+        if self._process.returncode and self._process.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg encoder failed (rc={self._process.returncode}): "
+                f"{_format_stderr(self._stderr_lines)}"
+            )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            # An exception is already propagating (e.g. from write_frame crash).
+            # Still clean up, but don't raise another error from close().
+            try:
+                self.close()
+            except RuntimeError:
+                pass  # suppress close error; the original exception takes priority
+        else:
+            self.close()

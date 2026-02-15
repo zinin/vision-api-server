@@ -63,6 +63,43 @@ _CODEC_NAME_MAP: dict[str, str] = {
 
 _MIN_BITRATE = 100_000
 _MAX_BITRATE = 200_000_000
+_MAX_REASONABLE_FPS = 240.0
+
+
+def _parse_frame_rate(raw: str | None) -> float | None:
+    """Parse ffprobe frame rate string like '30/1' or '25740000/2052571'."""
+    if not raw:
+        return None
+    try:
+        num, den = map(int, raw.split("/"))
+        if den == 0 or num <= 0:
+            return None
+        return num / den
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _parse_fps(avg_frame_rate: str | None, r_frame_rate: str | None) -> float:
+    """Pick best fps from ffprobe fields.
+
+    Prefers avg_frame_rate (accurate for VFR and HEVC).
+    Falls back to r_frame_rate, then 30.0.
+    r_frame_rate can report timebase values (e.g. 90000/1) for HEVC streams.
+    """
+    avg = _parse_frame_rate(avg_frame_rate)
+    r = _parse_frame_rate(r_frame_rate)
+
+    # Prefer avg_frame_rate — it's computed from actual stream data
+    if avg is not None and 0 < avg <= _MAX_REASONABLE_FPS:
+        return avg
+    # Fall back to r_frame_rate if reasonable
+    if r is not None and 0 < r <= _MAX_REASONABLE_FPS:
+        return r
+    # Both unreasonable — last resort
+    if avg is not None and avg > 0:
+        logger.warning(f"Unusually high avg_frame_rate ({avg:.1f}), using it anyway")
+        return avg
+    return 30.0
 
 
 class VideoAnnotator:
@@ -230,12 +267,7 @@ class VideoAnnotator:
             raise RuntimeError(f"ffprobe returned no video streams for {video_path}")
         stream = streams[0]
 
-        r_rate = stream.get("r_frame_rate", "30/1")
-        try:
-            num, den = map(int, r_rate.split("/"))
-            fps = num / den if den else 30.0
-        except (ValueError, ZeroDivisionError):
-            fps = 30.0
+        fps = _parse_fps(stream.get("avg_frame_rate"), stream.get("r_frame_rate"))
 
         width = int(stream.get("width", 0))
         height = int(stream.get("height", 0))

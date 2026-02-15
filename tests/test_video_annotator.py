@@ -10,6 +10,7 @@ from video_annotator import (
     VideoAnnotator,
     VideoMetadata,
     AnnotationParams,
+    _parse_fps,
 )
 from visualization import DetectionBox, DetectionVisualizer
 
@@ -247,6 +248,62 @@ class TestGetVideoMetadata:
         with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
             meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
         assert meta.fps == 30.0
+
+    def test_hevc_high_r_frame_rate_uses_avg(self):
+        """HEVC streams can report r_frame_rate as timebase (90000/1).
+        Should prefer avg_frame_rate."""
+        stream = {
+            "r_frame_rate": "90000/1",
+            "avg_frame_rate": "25740000/2052571",
+            "width": 2560,
+            "height": 1920,
+            "nb_frames": "286",
+            "codec_name": "hevc",
+            "bit_rate": "315539",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.fps == pytest.approx(12.54, abs=0.01)
+
+    def test_avg_frame_rate_preferred_over_r_frame_rate(self):
+        """When both are reasonable, avg_frame_rate wins."""
+        stream = {
+            "r_frame_rate": "30/1",
+            "avg_frame_rate": "24/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.fps == 24.0
+
+
+class TestParseFps:
+    def test_normal_avg(self):
+        assert _parse_fps("30/1", "30/1") == 30.0
+
+    def test_avg_preferred(self):
+        assert _parse_fps("24/1", "30/1") == 24.0
+
+    def test_hevc_timebase_r_frame_rate(self):
+        assert _parse_fps("25740000/2052571", "90000/1") == pytest.approx(12.54, abs=0.01)
+
+    def test_no_avg_falls_back_to_r(self):
+        assert _parse_fps(None, "25/1") == 25.0
+
+    def test_both_none_returns_30(self):
+        assert _parse_fps(None, None) == 30.0
+
+    def test_both_invalid_returns_30(self):
+        assert _parse_fps("invalid", "invalid") == 30.0
+
+    def test_zero_den_returns_fallback(self):
+        assert _parse_fps("0/0", "30/1") == 30.0
+
+    def test_high_avg_and_high_r_uses_avg(self):
+        """When both are above max, avg_frame_rate is still used (with warning)."""
+        assert _parse_fps("90000/1", "90000/1") == 90000.0
 
 
 # --- _extract_detections ---

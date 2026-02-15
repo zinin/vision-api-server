@@ -329,3 +329,47 @@ class TestFFmpegEncoder:
                     crf=18,
                 ) as encoder:
                     encoder.write_frame(frame)
+
+    def test_bitrate_mode_command(self):
+        """When bitrate is passed, command uses -b:v instead of -crf."""
+        mock_proc = self._make_mock_process()
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+                bitrate=8000000,
+            ):
+                pass
+
+        cmd = mock_popen.call_args[0][0]
+        assert "-b:v" in cmd
+        assert "8000000" in cmd
+        assert "-crf" not in cmd
+
+    def test_crf_mode_default(self):
+        """When neither crf nor bitrate passed, uses crf=18 default."""
+        mock_proc = self._make_mock_process()
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+            ):
+                pass
+
+        cmd = mock_popen.call_args[0][0]
+        assert "-crf" in cmd
+        assert "-b:v" not in cmd

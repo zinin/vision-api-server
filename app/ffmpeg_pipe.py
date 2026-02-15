@@ -120,7 +120,8 @@ class FFmpegEncoder:
         fps: float,
         hw_config: HWAccelConfig,
         codec: str,
-        crf: int,
+        crf: int | None = None,
+        bitrate: int | None = None,
     ):
         self._stderr_lines: deque[bytes] = deque(maxlen=100)
 
@@ -134,7 +135,7 @@ class FFmpegEncoder:
             "-map", "0:v:0", "-map", "1:a:0?",
             "-map_metadata", "1",
         ]
-        cmd += hw_config.get_encode_args(codec, crf)  # codec-specific args (after inputs)
+        cmd += hw_config.get_encode_args(codec, crf=crf, bitrate=bitrate)
         cmd += ["-c:a", "aac", "-shortest", str(output_path)]
 
         logger.debug(f"FFmpegEncoder command: {' '.join(cmd)}")

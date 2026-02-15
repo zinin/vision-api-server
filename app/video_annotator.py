@@ -43,6 +43,28 @@ class AnnotationStats:
     processing_time_ms: int = 0
 
 
+@dataclass(slots=True)
+class VideoMetadata:
+    """Video metadata from ffprobe."""
+    fps: float
+    width: int
+    height: int
+    total_frames: int
+    codec_name: str | None = None
+    bit_rate: int | None = None
+
+
+# ffprobe codec_name → internal codec name
+_CODEC_NAME_MAP: dict[str, str] = {
+    "h264": "h264",
+    "hevc": "h265",
+    "av1": "av1",
+}
+
+_MIN_BITRATE = 100_000
+_MAX_BITRATE = 200_000_000
+
+
 class VideoAnnotator:
     """Annotate video with YOLO detections and hold mode."""
 
@@ -80,26 +102,51 @@ class VideoAnnotator:
             params: Annotation parameters
             progress_callback: Called with progress 0-99 during processing
         """
-        fps, width, height, total_frames = self._get_video_metadata(input_path)
+        metadata = self._get_video_metadata(input_path)
+
+        # Resolve effective codec and quality from source when auto
+        if self.codec == "auto":
+            resolved_codec = _CODEC_NAME_MAP.get(metadata.codec_name, None)
+            if resolved_codec is not None and metadata.bit_rate is not None:
+                effective_codec = resolved_codec
+                effective_crf = None
+                effective_bitrate = metadata.bit_rate
+            elif resolved_codec is not None:
+                effective_codec = resolved_codec
+                effective_crf = 18
+                effective_bitrate = None
+            else:
+                effective_codec = "h264"
+                effective_crf = 18
+                effective_bitrate = None
+            logger.info(
+                f"Auto codec: source={metadata.codec_name}, resolved={effective_codec}, "
+                f"bitrate={effective_bitrate}, crf={effective_crf}"
+            )
+        else:
+            effective_codec = self.codec
+            effective_crf = self.crf
+            effective_bitrate = None
 
         model_name = getattr(self.model, "model_name", None) or getattr(self.model, "ckpt_path", "unknown")
         model_device = getattr(self.model, "device", "unknown")
         logger.info(
             f"Starting annotation: {input_path.name}, "
-            f"{width}x{height} @ {fps:.1f}fps, ~{total_frames} frames, "
+            f"{metadata.width}x{metadata.height} @ {metadata.fps:.1f}fps, ~{metadata.total_frames} frames, "
             f"model={model_name}, device={model_device}, "
             f"detect_every={params.detect_every}, conf={params.conf}"
         )
 
-        stats = AnnotationStats(total_frames=total_frames)
+        stats = AnnotationStats(total_frames=metadata.total_frames)
         current_detections: list[DetectionBox] = []
-        font_scale = self.visualizer.calculate_adaptive_font_scale(height)
+        font_scale = self.visualizer.calculate_adaptive_font_scale(metadata.height)
         frame_num = 0
         start_time = time.perf_counter()
 
-        with FFmpegDecoder(input_path, width, height, self.hw_config) as decoder, \
-             FFmpegEncoder(input_path, output_path, width, height, fps,
-                           self.hw_config, self.codec, self.crf) as encoder:
+        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder, \
+             FFmpegEncoder(input_path, output_path, metadata.width, metadata.height, metadata.fps,
+                           self.hw_config, effective_codec,
+                           crf=effective_crf, bitrate=effective_bitrate) as encoder:
 
             while True:
                 frame = decoder.read_frame()
@@ -131,8 +178,8 @@ class VideoAnnotator:
                 encoder.write_frame(frame)
                 frame_num += 1
 
-                if progress_callback and total_frames > 0 and frame_num % 10 == 0:
-                    progress = int((frame_num / total_frames) * 100)
+                if progress_callback and metadata.total_frames > 0 and frame_num % 10 == 0:
+                    progress = int((frame_num / metadata.total_frames) * 100)
                     progress_callback(min(progress, 99))
 
         stats.total_frames = frame_num
@@ -150,14 +197,11 @@ class VideoAnnotator:
         return stats
 
     @staticmethod
-    def _get_video_metadata(
-        video_path: Path,
-    ) -> tuple[float, int, int, int]:
-        """Get video metadata via ffprobe. Returns (fps, width, height, total_frames).
+    def _get_video_metadata(video_path: Path) -> VideoMetadata:
+        """Get video metadata via ffprobe.
 
         Raises RuntimeError if ffprobe fails or returns invalid metadata.
         """
-
         cmd = [
             "ffprobe",
             "-v", "quiet",
@@ -181,10 +225,18 @@ class VideoAnnotator:
             )
 
         data = json.loads(result.stdout)
-        stream = data["streams"][0]
+        streams = data.get("streams")
+        if not streams:
+            raise RuntimeError(f"ffprobe returned no video streams for {video_path}")
+        stream = streams[0]
+
         r_rate = stream.get("r_frame_rate", "30/1")
-        num, den = map(int, r_rate.split("/"))
-        fps = num / den if den else 30.0
+        try:
+            num, den = map(int, r_rate.split("/"))
+            fps = num / den if den else 30.0
+        except (ValueError, ZeroDivisionError):
+            fps = 30.0
+
         width = int(stream.get("width", 0))
         height = int(stream.get("height", 0))
         nb_frames_raw = stream.get("nb_frames", "0")
@@ -199,12 +251,30 @@ class VideoAnnotator:
             except (ValueError, TypeError):
                 duration = 0.0
             total_frames = int(duration * fps)
+
+        # Parse codec and bitrate for auto-matching
+        codec_name = stream.get("codec_name")
+        bit_rate_raw = stream.get("bit_rate")
+        bit_rate = None
+        if bit_rate_raw is not None:
+            try:
+                bit_rate = int(bit_rate_raw)
+            except (ValueError, TypeError):
+                bit_rate = None
+        if bit_rate is not None and not (_MIN_BITRATE <= bit_rate <= _MAX_BITRATE):
+            bit_rate = None
+
         if width > 0 and height > 0 and fps > 0:
             logger.debug(
                 f"ffprobe metadata: {width}x{height} @ {fps:.2f}fps, "
-                f"~{total_frames} frames, codec={stream.get('codec_name', '?')}"
+                f"~{total_frames} frames, codec={codec_name or '?'}, "
+                f"bitrate={bit_rate or '?'}"
             )
-            return fps, width, height, total_frames
+            return VideoMetadata(
+                fps=fps, width=width, height=height,
+                total_frames=total_frames,
+                codec_name=codec_name, bit_rate=bit_rate,
+            )
 
         raise RuntimeError(
             f"ffprobe returned invalid metadata: {width}x{height} @ {fps}fps "

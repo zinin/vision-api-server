@@ -8,6 +8,7 @@ import pytest
 from hw_accel import HWAccelConfig, HWAccelType
 from video_annotator import (
     VideoAnnotator,
+    VideoMetadata,
     AnnotationParams,
 )
 from visualization import DetectionBox, DetectionVisualizer
@@ -89,13 +90,17 @@ class TestGetVideoMetadata:
             "width": 1920,
             "height": 1080,
             "nb_frames": "900",
+            "codec_name": "h264",
+            "bit_rate": "8000000",
         }
         with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
-            fps, w, h, total = VideoAnnotator._get_video_metadata(Path("video.mp4"))
-        assert fps == 30.0
-        assert w == 1920
-        assert h == 1080
-        assert total == 900
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.fps == 30.0
+        assert meta.width == 1920
+        assert meta.height == 1080
+        assert meta.total_frames == 900
+        assert meta.codec_name == "h264"
+        assert meta.bit_rate == 8000000
 
     def test_ffprobe_estimates_from_duration(self):
         stream = {
@@ -106,9 +111,9 @@ class TestGetVideoMetadata:
             "duration": "10.0",
         }
         with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
-            fps, w, h, total = VideoAnnotator._get_video_metadata(Path("video.mp4"))
-        assert fps == 25.0
-        assert total == 250
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.fps == 25.0
+        assert meta.total_frames == 250
 
     def test_ffprobe_fractional_fps(self):
         stream = {
@@ -118,8 +123,8 @@ class TestGetVideoMetadata:
             "nb_frames": "100",
         }
         with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
-            fps, w, h, total = VideoAnnotator._get_video_metadata(Path("video.mp4"))
-        assert fps == pytest.approx(29.97, abs=0.01)
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.fps == pytest.approx(29.97, abs=0.01)
 
     def test_ffprobe_invalid_metadata_raises_error(self):
         """When ffprobe returns invalid metadata (e.g. 0x0), raise RuntimeError."""
@@ -147,6 +152,101 @@ class TestGetVideoMetadata:
         with patch("video_annotator.subprocess.run", return_value=result):
             with pytest.raises(RuntimeError, match="ffprobe returned non-zero"):
                 VideoAnnotator._get_video_metadata(Path("video.mp4"))
+
+    def test_missing_codec_name_returns_none(self):
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.codec_name is None
+
+    def test_missing_bit_rate_returns_none(self):
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+            "codec_name": "h264",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.codec_name == "h264"
+        assert meta.bit_rate is None
+
+    def test_non_numeric_bit_rate_returns_none(self):
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+            "codec_name": "h264",
+            "bit_rate": "N/A",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.bit_rate is None
+
+    def test_zero_bit_rate_returns_none(self):
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+            "codec_name": "h264",
+            "bit_rate": "0",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.bit_rate is None
+
+    def test_too_small_bit_rate_returns_none(self):
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+            "codec_name": "h264",
+            "bit_rate": "50000",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.bit_rate is None
+
+    def test_too_large_bit_rate_returns_none(self):
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+            "codec_name": "h264",
+            "bit_rate": "999999999999",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.bit_rate is None
+
+    def test_empty_streams_raises_error(self):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps({"streams": []})
+        with patch("video_annotator.subprocess.run", return_value=result):
+            with pytest.raises(RuntimeError, match="no video streams"):
+                VideoAnnotator._get_video_metadata(Path("video.mp4"))
+
+    def test_invalid_frame_rate_format_defaults_to_30(self):
+        stream = {
+            "r_frame_rate": "invalid",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.fps == 30.0
 
 
 # --- _extract_detections ---
@@ -471,3 +571,197 @@ class TestAnnotatePipeline:
         # All progress values should be <= 99
         for call in callback.call_args_list:
             assert call.args[0] <= 99
+
+
+class TestAutoCodecResolve:
+    """Test VIDEO_CODEC=auto resolution from input metadata."""
+
+    def _make_frames(self, num_frames: int, width: int = 640, height: int = 480):
+        return [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
+
+    def _setup_ffmpeg_mocks(self, frames: list[np.ndarray]):
+        mock_decoder = MagicMock()
+        mock_decoder.read_frame.side_effect = list(frames) + [None]
+        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
+        mock_decoder.__exit__ = MagicMock(return_value=False)
+
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+
+        mock_decoder_cls = MagicMock(return_value=mock_decoder)
+        mock_encoder_cls = MagicMock(return_value=mock_encoder)
+
+        return mock_decoder_cls, mock_encoder_cls, mock_encoder
+
+    def _ffprobe_result(self, stream: dict) -> MagicMock:
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps({"streams": [stream]})
+        return result
+
+    def test_auto_hevc_with_bitrate(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """auto mode: hevc input with bitrate -> h265 codec + bitrate in encoder."""
+        frames = self._make_frames(2)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": "2", "codec_name": "hevc", "bit_rate": "8000000",
+        }
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
+        ):
+            annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+        # codec is the 7th positional arg (index 6), crf/bitrate are kwargs
+        encoder_call = mock_encoder_cls.call_args
+        assert encoder_call.args[6] == "h265"
+        assert encoder_call.kwargs.get("bitrate") == 8000000
+
+    def test_auto_h264_with_bitrate(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """auto mode: h264 input with bitrate -> h264 codec + bitrate."""
+        frames = self._make_frames(2)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": "2", "codec_name": "h264", "bit_rate": "5000000",
+        }
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
+        ):
+            annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+        encoder_call = mock_encoder_cls.call_args
+        assert encoder_call.args[6] == "h264"
+        assert encoder_call.kwargs.get("bitrate") == 5000000
+
+    def test_auto_hevc_no_bitrate_uses_crf(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """auto mode: hevc input without bitrate -> h265 codec + CRF 18."""
+        frames = self._make_frames(2)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": "2", "codec_name": "hevc",
+        }
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
+        ):
+            annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+        encoder_call = mock_encoder_cls.call_args
+        assert encoder_call.args[6] == "h265"
+        assert encoder_call.kwargs.get("crf") == 18
+        assert encoder_call.kwargs.get("bitrate") is None
+
+    def test_auto_unsupported_codec_fallback(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """auto mode: vp9 input -> fallback to h264 + CRF 18."""
+        frames = self._make_frames(2)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": "2", "codec_name": "vp9", "bit_rate": "6000000",
+        }
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
+        ):
+            annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+        encoder_call = mock_encoder_cls.call_args
+        assert encoder_call.args[6] == "h264"
+        assert encoder_call.kwargs.get("crf") == 18
+
+    def test_auto_crf_always_18_even_if_configured(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """auto mode: CRF fallback is always 18, regardless of configured crf."""
+        frames = self._make_frames(2)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": "2", "codec_name": "hevc",
+        }
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto", crf=23)
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
+        ):
+            annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+        encoder_call = mock_encoder_cls.call_args
+        assert encoder_call.kwargs.get("crf") == 18
+
+    def test_explicit_codec_ignores_source(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """Explicit VIDEO_CODEC=h264 ignores source codec/bitrate."""
+        frames = self._make_frames(2)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": "2", "codec_name": "hevc", "bit_rate": "8000000",
+        }
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            codec="h264", crf=23,
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
+        ):
+            annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+        encoder_call = mock_encoder_cls.call_args
+        assert encoder_call.args[6] == "h264"
+        assert encoder_call.kwargs.get("crf") == 23

@@ -199,10 +199,10 @@ git commit -m "docs: update all documentation to reference YOLO26 models (VAS-5)
 **Step 1: Grep for any remaining yolo11 references**
 
 ```bash
-grep -r "yolo11" --include="*.py" --include="*.md" --include="*.yml" --include="*.yaml" --include="*.txt" --include="*.env*" .
+grep -r "yolo11" --include="*.py" --include="*.md" --include="*.yml" --include="*.yaml" --include="*.txt" --include="*.env*" --exclude-dir="docs/plans" .
 ```
 
-Expected: Only the design document (`docs/plans/2026-02-15-yolo26-migration-design.md`) should reference `yolo11`.
+Expected: No matches. The `docs/plans/` directory is excluded because design, plan, and review documents naturally reference `yolo11` in the context of migration.
 
 **Step 2: Run full test suite**
 

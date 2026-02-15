@@ -655,6 +655,33 @@ class TestAutoCodecResolve:
         assert encoder_call.args[6] == "h264"
         assert encoder_call.kwargs.get("bitrate") == 5000000
 
+    def test_auto_av1_with_bitrate(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """auto mode: av1 input with bitrate -> av1 codec + bitrate."""
+        frames = self._make_frames(2)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": "2", "codec_name": "av1", "bit_rate": "4000000",
+        }
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
+        ):
+            annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+        encoder_call = mock_encoder_cls.call_args
+        assert encoder_call.args[6] == "av1"
+        assert encoder_call.kwargs.get("bitrate") == 4000000
+
     def test_auto_hevc_no_bitrate_uses_crf(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """auto mode: hevc input without bitrate -> h265 codec + CRF 18."""
         frames = self._make_frames(2)

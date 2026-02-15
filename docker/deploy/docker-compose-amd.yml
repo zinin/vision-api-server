@@ -11,7 +11,7 @@ services:
       YOLO_MODEL_TTL: ${YOLO_MODEL_TTL:-900}
       YOLO_DEVICE: ${YOLO_DEVICE:-cuda:0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      VIDEO_CODEC: ${VIDEO_CODEC:-h264}
+      VIDEO_CODEC: ${VIDEO_CODEC:-auto}
       VIDEO_CRF: ${VIDEO_CRF:-18}
       HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
     restart: unless-stopped

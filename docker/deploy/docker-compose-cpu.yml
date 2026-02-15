@@ -8,7 +8,7 @@ services:
       YOLO_MODEL_TTL: ${YOLO_MODEL_TTL:-900}
       YOLO_DEVICE: cpu
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      VIDEO_CODEC: ${VIDEO_CODEC:-h264}
+      VIDEO_CODEC: ${VIDEO_CODEC:-auto}
       VIDEO_CRF: ${VIDEO_CRF:-18}
     volumes:
       - models:/models

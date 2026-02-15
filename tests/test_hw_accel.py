@@ -60,6 +60,47 @@ class TestHWAccelConfig:
         config = HWAccelConfig(accel_type=HWAccelType.NVIDIA)
         assert config.global_encode_args == []
 
+    # --- Bitrate mode tests ---
+
+    def test_cpu_encode_args_bitrate_mode(self):
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        args = config.get_encode_args("h264", bitrate=8000000)
+        assert "libx264" in args
+        assert "-b:v" in args
+        assert "8000000" in args
+        assert "-crf" not in args
+
+    def test_nvidia_encode_args_bitrate_mode(self):
+        config = HWAccelConfig(accel_type=HWAccelType.NVIDIA)
+        args = config.get_encode_args("h264", bitrate=5000000)
+        assert "h264_nvenc" in args
+        assert "-b:v" in args
+        assert "5000000" in args
+        assert "-cq" not in args
+
+    def test_amd_encode_args_bitrate_mode(self):
+        config = HWAccelConfig(accel_type=HWAccelType.AMD)
+        args = config.get_encode_args("h264", bitrate=6000000)
+        assert "h264_vaapi" in args
+        assert "-b:v" in args
+        assert "6000000" in args
+        assert "-qp" not in args
+
+    def test_crf_mode_still_works(self):
+        """Existing CRF behavior unchanged when bitrate is not passed."""
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        args = config.get_encode_args("h264", crf=23)
+        assert "-crf" in args
+        assert "23" in args
+        assert "-b:v" not in args
+
+    def test_bitrate_takes_precedence_over_crf(self):
+        """When both bitrate and crf are passed, bitrate wins."""
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        args = config.get_encode_args("h264", crf=18, bitrate=5000000)
+        assert "-b:v" in args
+        assert "-crf" not in args
+
 
 class TestDetectHwAccel:
     def _mock_subprocess(self, hwaccels_output: str, encoders_output: str):

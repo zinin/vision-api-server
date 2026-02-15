@@ -52,29 +52,45 @@ class HWAccelConfig:
             return ["-vaapi_device", self.vaapi_device]
         return []
 
-    def get_encode_args(self, codec: str, crf: int) -> list[str]:
-        """Codec-specific FFmpeg args (appear AFTER inputs)."""
+    def get_encode_args(self, codec: str, crf: int | None = None, bitrate: int | None = None) -> list[str]:
+        """Codec-specific FFmpeg args (appear AFTER inputs).
+
+        Args:
+            codec: Target codec name (h264, h265, av1).
+            crf: Constant Rate Factor for quality (CRF/CQ/QP mode).
+            bitrate: Target bitrate in bps (e.g. 8000000).
+                     When provided, takes precedence over crf.
+        """
         encoder_map = _ENCODER_MAP.get(self.accel_type, _ENCODER_MAP[HWAccelType.CPU])
         encoder = encoder_map.get(codec)
 
         # Fallback to CPU encoder if not available for this accel type
         if encoder is None:
             encoder = _ENCODER_MAP[HWAccelType.CPU].get(codec, "libx264")
-            return self._cpu_encode_args(encoder, crf)
+            return self._cpu_encode_args(encoder, crf=crf, bitrate=bitrate)
 
         if self.accel_type == HWAccelType.NVIDIA:
-            return ["-c:v", encoder, "-preset", "p4", "-rc", "vbr", "-cq", str(crf),
+            if bitrate is not None:
+                return ["-c:v", encoder, "-b:v", str(bitrate), "-pix_fmt", "yuv420p"]
+            return ["-c:v", encoder, "-preset", "p4", "-rc", "vbr", "-cq", str(crf or 18),
                     "-pix_fmt", "yuv420p"]
         if self.accel_type == HWAccelType.AMD:
+            if bitrate is not None:
+                return [
+                    "-vf", "format=nv12,hwupload",
+                    "-c:v", encoder, "-b:v", str(bitrate),
+                ]
             return [
                 "-vf", "format=nv12,hwupload",
-                "-c:v", encoder, "-qp", str(crf),
+                "-c:v", encoder, "-qp", str(crf or 18),
             ]
-        return self._cpu_encode_args(encoder, crf)
+        return self._cpu_encode_args(encoder, crf=crf, bitrate=bitrate)
 
     @staticmethod
-    def _cpu_encode_args(encoder: str, crf: int) -> list[str]:
-        return ["-c:v", encoder, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+    def _cpu_encode_args(encoder: str, crf: int | None = None, bitrate: int | None = None) -> list[str]:
+        if bitrate is not None:
+            return ["-c:v", encoder, "-b:v", str(bitrate), "-pix_fmt", "yuv420p"]
+        return ["-c:v", encoder, "-crf", str(crf or 18), "-pix_fmt", "yuv420p"]
 
 
 def _ffmpeg_query(args: list[str]) -> str:

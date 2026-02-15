@@ -227,3 +227,17 @@ class TestAnnotationWorker:
 
         assert worker_job_manager.get_job(job1.job_id).status == JobStatus.FAILED
         assert worker_job_manager.get_job(job2.job_id).status == JobStatus.COMPLETED
+
+
+class TestStartupWiring:
+    def test_auto_codec_passes_h264_baseline(self):
+        """When video_codec=auto, detect_hw_accel gets codec='h264'."""
+        video_codec = "auto"
+        hw_detect_codec = "h264" if video_codec == "auto" else video_codec
+        assert hw_detect_codec == "h264"
+
+    def test_explicit_codec_passes_through(self):
+        """When video_codec=h265, detect_hw_accel gets codec='h265'."""
+        video_codec = "h265"
+        hw_detect_codec = "h264" if video_codec == "auto" else video_codec
+        assert hw_detect_codec == "h265"

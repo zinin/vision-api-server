@@ -116,9 +116,12 @@ async def lifespan(app: FastAPI):
         # Detect hardware acceleration for video encoding/decoding
         from hw_accel import detect_hw_accel
 
+        # When video_codec is "auto", use h264 as baseline for hw encoder validation.
+        # Actual per-file codec is resolved at encode time in VideoAnnotator.
+        hw_detect_codec = "h264" if settings.video_codec == "auto" else settings.video_codec
         hw_config = detect_hw_accel(
             mode=settings.video_hw_accel,
-            codec=settings.video_codec,
+            codec=hw_detect_codec,
             vaapi_device=settings.vaapi_device,
         )
         app.state.hw_config = hw_config

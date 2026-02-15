@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from config import Settings
+from hw_accel import HWAccelConfig, HWAccelType
 from job_manager import JobManager, JobStatus
 from video_annotator import AnnotationStats
 
@@ -39,6 +40,7 @@ def worker_app(worker_job_manager, worker_model_manager):
     app = MagicMock()
     app.state.job_manager = worker_job_manager
     app.state.model_manager = worker_model_manager
+    app.state.hw_config = HWAccelConfig(accel_type=HWAccelType.CPU)
     return app
 
 

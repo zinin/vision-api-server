@@ -107,11 +107,11 @@ async def lifespan(app: FastAPI):
 
         app.state.model_manager = model_manager
 
-        # Verify ffmpeg/ffprobe are available for video annotation
-        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-            logger.warning(
-                "ffmpeg/ffprobe not found — video annotation will have limited functionality"
-            )
+        # Verify ffmpeg/ffprobe are available (required for video annotation)
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("FFmpeg is required but not found in PATH")
+        if not shutil.which("ffprobe"):
+            raise RuntimeError("ffprobe is required but not found in PATH")
 
         # Verify ffmpeg is available
         try:
@@ -119,6 +119,17 @@ async def lifespan(app: FastAPI):
             logger.info("FFmpeg verified and ready for video processing")
         except RuntimeError as e:
             logger.warning(f"Video processing unavailable: {e}")
+
+        # Detect hardware acceleration for video encoding/decoding
+        from hw_accel import detect_hw_accel
+
+        hw_config = detect_hw_accel(
+            mode=settings.video_hw_accel,
+            codec=settings.video_codec,
+            vaapi_device=settings.vaapi_device,
+        )
+        app.state.hw_config = hw_config
+        logger.info(f"Video hardware acceleration: {hw_config.accel_type.value}")
 
         # Initialize JobManager
         job_manager = JobManager(
@@ -198,6 +209,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     model=model_entry.model,
                     visualizer=model_entry.visualizer,
                     class_names=model_entry.model.names,
+                    hw_config=app.state.hw_config,
                     codec=settings.video_codec,
                     crf=settings.video_crf,
                 )

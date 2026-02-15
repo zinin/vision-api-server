@@ -13,7 +13,7 @@ services:
       VIDEO_CRF: ${VIDEO_CRF:-18}
       YOLO_DEVICE: 'cuda:0'
       NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     deploy:
       resources:
         reservations:

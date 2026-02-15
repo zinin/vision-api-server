@@ -72,8 +72,12 @@ VAAPI_DEVICE=/dev/dri/renderD128        # VAAPI render device path
 
 ## Testing
 
+Tests must run inside a virtual environment:
+
 ```bash
-pip install -r requirements-dev.txt
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 

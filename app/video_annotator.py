@@ -187,9 +187,17 @@ class VideoAnnotator:
         fps = num / den if den else 30.0
         width = int(stream.get("width", 0))
         height = int(stream.get("height", 0))
-        total_frames = int(stream.get("nb_frames", 0))
+        nb_frames_raw = stream.get("nb_frames", "0")
+        try:
+            total_frames = int(nb_frames_raw)
+        except (ValueError, TypeError):
+            total_frames = 0
         if total_frames == 0:
-            duration = float(stream.get("duration", 0))
+            duration_raw = stream.get("duration", "0")
+            try:
+                duration = float(duration_raw)
+            except (ValueError, TypeError):
+                duration = 0.0
             total_frames = int(duration * fps)
         if width > 0 and height > 0 and fps > 0:
             logger.debug(

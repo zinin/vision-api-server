@@ -82,6 +82,8 @@ class FFmpegDecoder:
         if self._process.stdout:
             self._process.stdout.close()
         self._stderr_thread.join(timeout=5)
+        if self._process.stderr:
+            self._process.stderr.close()
         try:
             self._process.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -127,7 +129,7 @@ class FFmpegEncoder:
             "-i", "pipe:0",
             "-i", str(original_path),
             "-map", "0:v:0", "-map", "1:a:0?",
-            "-map_metadata", "0",
+            "-map_metadata", "1",
         ]
         cmd += hw_config.get_encode_args(codec, crf)  # codec-specific args (after inputs)
         cmd += ["-c:a", "aac", "-shortest", str(output_path)]
@@ -150,13 +152,21 @@ class FFmpegEncoder:
                 f"FFmpeg encoder crashed (rc={rc}): "
                 f"{_format_stderr(self._stderr_lines)}"
             )
-        self._process.stdin.write(frame.tobytes())
+        try:
+            self._process.stdin.write(frame.tobytes())
+        except (BrokenPipeError, OSError) as e:
+            raise RuntimeError(
+                f"FFmpeg encoder pipe broken: {e}. "
+                f"stderr: {_format_stderr(self._stderr_lines)}"
+            ) from e
 
     def close(self) -> None:
         """Close stdin, wait for FFmpeg to finish, check return code."""
         if self._process.stdin:
             self._process.stdin.close()
         self._stderr_thread.join(timeout=10)
+        if self._process.stderr:
+            self._process.stderr.close()
         try:
             self._process.wait(timeout=300)
         except subprocess.TimeoutExpired:
@@ -177,7 +187,7 @@ class FFmpegEncoder:
             # Still clean up, but don't raise another error from close().
             try:
                 self.close()
-            except RuntimeError:
-                pass  # suppress close error; the original exception takes priority
+            except RuntimeError as close_err:
+                logger.warning(f"Suppressed encoder close error (original exception propagating): {close_err}")
         else:
             self.close()

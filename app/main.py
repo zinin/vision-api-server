@@ -113,13 +113,6 @@ async def lifespan(app: FastAPI):
         if not shutil.which("ffprobe"):
             raise RuntimeError("ffprobe is required but not found in PATH")
 
-        # Verify ffmpeg is available
-        try:
-            VideoFrameExtractor()
-            logger.info("FFmpeg verified and ready for video processing")
-        except RuntimeError as e:
-            logger.warning(f"Video processing unavailable: {e}")
-
         # Detect hardware acceleration for video encoding/decoding
         from hw_accel import detect_hw_accel
 

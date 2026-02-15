@@ -1,12 +1,11 @@
 import json
-import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import cv2
 import numpy as np
 import pytest
 
+from hw_accel import HWAccelConfig, HWAccelType
 from video_annotator import (
     VideoAnnotator,
     AnnotationParams,
@@ -56,8 +55,13 @@ def mock_visualizer():
 
 
 @pytest.fixture
-def annotator(mock_model, mock_visualizer):
-    return VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
+def hw_config():
+    return HWAccelConfig(accel_type=HWAccelType.CPU)
+
+
+@pytest.fixture
+def annotator(mock_model, mock_visualizer, hw_config):
+    return VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
 
 
 @pytest.fixture
@@ -117,49 +121,32 @@ class TestGetVideoMetadata:
             fps, w, h, total = VideoAnnotator._get_video_metadata(Path("video.mp4"))
         assert fps == pytest.approx(29.97, abs=0.01)
 
-    def test_ffprobe_invalid_falls_back_to_cv2(self):
+    def test_ffprobe_invalid_metadata_raises_error(self):
+        """When ffprobe returns invalid metadata (e.g. 0x0), raise RuntimeError."""
         stream = {
             "r_frame_rate": "30/1",
             "width": 0,
             "height": 0,
             "nb_frames": "0",
         }
-        mock_cap = MagicMock()
-        mock_cap.get.side_effect = lambda prop: {
-            cv2.CAP_PROP_FRAME_WIDTH: 1280.0,
-            cv2.CAP_PROP_FRAME_HEIGHT: 720.0,
-            cv2.CAP_PROP_FPS: 25.0,
-            cv2.CAP_PROP_FRAME_COUNT: 500.0,
-        }.get(prop, 0)
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            with pytest.raises(RuntimeError, match="ffprobe returned invalid"):
+                VideoAnnotator._get_video_metadata(Path("video.mp4"))
 
-        with (
-            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
-            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
-        ):
-            fps, w, h, total = VideoAnnotator._get_video_metadata(Path("video.mp4"))
-        assert w == 1280
-        assert h == 720
-        assert fps == 25.0
-        assert total == 500
-        mock_cap.release.assert_called_once()
+    def test_ffprobe_error_raises_error(self):
+        """When ffprobe command fails (e.g. FileNotFoundError), raise RuntimeError."""
+        with patch("video_annotator.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(RuntimeError, match="ffprobe failed"):
+                VideoAnnotator._get_video_metadata(Path("video.mp4"))
 
-    def test_ffprobe_error_falls_back_to_cv2(self):
-        mock_cap = MagicMock()
-        mock_cap.get.side_effect = lambda prop: {
-            cv2.CAP_PROP_FRAME_WIDTH: 640.0,
-            cv2.CAP_PROP_FRAME_HEIGHT: 480.0,
-            cv2.CAP_PROP_FPS: 30.0,
-            cv2.CAP_PROP_FRAME_COUNT: 300.0,
-        }.get(prop, 0)
-
-        with (
-            patch("video_annotator.subprocess.run", side_effect=FileNotFoundError),
-            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
-        ):
-            fps, w, h, total = VideoAnnotator._get_video_metadata(Path("video.mp4"))
-        assert w == 640
-        assert h == 480
-        mock_cap.release.assert_called_once()
+    def test_ffprobe_nonzero_returncode_raises_error(self):
+        """When ffprobe returns non-zero exit code, raise RuntimeError."""
+        result = MagicMock()
+        result.returncode = 1
+        result.stdout = ""
+        with patch("video_annotator.subprocess.run", return_value=result):
+            with pytest.raises(RuntimeError, match="ffprobe returned non-zero"):
+                VideoAnnotator._get_video_metadata(Path("video.mp4"))
 
 
 # --- _extract_detections ---
@@ -211,81 +198,43 @@ class TestDrawDetections:
         ]
         annotator._draw_detections(sample_frame, dets, default_params, font_scale=0.5)
         assert mock_visualizer.draw_detection.call_count == 2
-        # Verify font_scale is passed
         for call in mock_visualizer.draw_detection.call_args_list:
             assert call.kwargs["font_scale"] == 0.5
-
-
-# --- _merge_audio ---
-
-class TestMergeAudio:
-    def test_success(self, annotator, tmp_path):
-        original = tmp_path / "original.mp4"
-        video_only = tmp_path / "video_only.mp4"
-        output = tmp_path / "output.mp4"
-        original.touch()
-        video_only.touch()
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        with patch("video_annotator.subprocess.run", return_value=mock_result) as mock_run:
-            with patch("video_annotator.shutil.copy2") as mock_copy:
-                annotator._merge_audio(original, video_only, output)
-        mock_run.assert_called_once()
-        mock_copy.assert_not_called()
-
-    def test_ffmpeg_fail_fallback(self, annotator, tmp_path):
-        original = tmp_path / "original.mp4"
-        video_only = tmp_path / "video_only.mp4"
-        output = tmp_path / "output.mp4"
-        original.touch()
-        video_only.touch()
-
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stderr = "some error"
-        with patch("video_annotator.subprocess.run", return_value=mock_result):
-            with patch("video_annotator.shutil.copy2") as mock_copy:
-                annotator._merge_audio(original, video_only, output)
-        mock_copy.assert_called_once_with(str(video_only), str(output))
-
-    def test_timeout_fallback(self, annotator, tmp_path):
-        original = tmp_path / "original.mp4"
-        video_only = tmp_path / "video_only.mp4"
-        output = tmp_path / "output.mp4"
-        original.touch()
-        video_only.touch()
-
-        with patch(
-            "video_annotator.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd="ffmpeg", timeout=300),
-        ):
-            with patch("video_annotator.shutil.copy2") as mock_copy:
-                annotator._merge_audio(original, video_only, output)
-        mock_copy.assert_called_once()
 
 
 # --- annotate() pipeline ---
 
 class TestAnnotatePipeline:
-    def _setup_pipeline_mocks(self, num_frames: int, width: int = 640, height: int = 480):
-        """Set up common mocks for annotate pipeline tests."""
+    def _make_frames(self, num_frames: int, width: int = 640, height: int = 480):
+        """Create a list of frames for the decoder mock to return."""
         frames = [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
-        read_returns = [(True, f) for f in frames] + [(False, None)]
+        return frames
 
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
-        mock_cap.read.side_effect = read_returns
+    def _setup_ffmpeg_mocks(self, frames: list[np.ndarray]):
+        """Set up mock FFmpegDecoder and FFmpegEncoder.
 
-        mock_writer = MagicMock()
-        mock_writer.isOpened.return_value = True
+        Returns (mock_decoder_cls, mock_encoder_cls, mock_encoder_instance).
+        """
+        mock_decoder = MagicMock()
+        # read_frame returns frames one by one, then None
+        mock_decoder.read_frame.side_effect = list(frames) + [None]
+        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
+        mock_decoder.__exit__ = MagicMock(return_value=False)
 
-        return mock_cap, mock_writer
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
 
-    def test_full_pipeline(self, mock_model, mock_visualizer, tmp_path):
+        mock_decoder_cls = MagicMock(return_value=mock_decoder)
+        mock_encoder_cls = MagicMock(return_value=mock_encoder)
+
+        return mock_decoder_cls, mock_encoder_cls, mock_encoder
+
+    def test_full_pipeline(self, mock_model, mock_visualizer, hw_config, tmp_path):
         num_frames = 6
         detect_every = 3
-        mock_cap, mock_writer = self._setup_pipeline_mocks(num_frames)
+        frames = self._make_frames(num_frames)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
 
         mock_model.predict.return_value = [
             _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
@@ -301,25 +250,16 @@ class TestAnnotatePipeline:
         ffprobe_result.returncode = 0
         ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
 
-        merge_result = MagicMock()
-        merge_result.returncode = 0
-
         input_path = tmp_path / "input.mp4"
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
-
-        def subprocess_side_effect(cmd, **kwargs):
-            if cmd[0] == "ffprobe":
-                return ffprobe_result
-            return merge_result
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
 
         with (
-            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
-            patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
-            patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
-            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe_result),
         ):
             stats = annotator.annotate(input_path, output_path, AnnotationParams(detect_every=detect_every))
 
@@ -328,12 +268,13 @@ class TestAnnotatePipeline:
         assert stats.detected_frames == 2
         # Frames 1, 2, 4, 5 are tracked frames
         assert stats.tracked_frames == 4
-        assert mock_writer.write.call_count == num_frames
+        assert mock_encoder.write_frame.call_count == num_frames
 
-    def test_detect_every_1(self, mock_model, mock_visualizer, tmp_path):
+    def test_detect_every_1(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """When detect_every=1, every frame gets YOLO detection, no hold frames."""
         num_frames = 4
-        mock_cap, mock_writer = self._setup_pipeline_mocks(num_frames)
+        frames = self._make_frames(num_frames)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
 
         mock_model.predict.return_value = [
             _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
@@ -349,25 +290,16 @@ class TestAnnotatePipeline:
         ffprobe_result.returncode = 0
         ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
 
-        merge_result = MagicMock()
-        merge_result.returncode = 0
-
         input_path = tmp_path / "input.mp4"
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
-
-        def subprocess_side_effect(cmd, **kwargs):
-            if cmd[0] == "ffprobe":
-                return ffprobe_result
-            return merge_result
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
 
         with (
-            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
-            patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
-            patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
-            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe_result),
         ):
             stats = annotator.annotate(
                 input_path, output_path, AnnotationParams(detect_every=1)
@@ -378,10 +310,11 @@ class TestAnnotatePipeline:
         assert stats.tracked_frames == 0
         assert mock_model.predict.call_count == num_frames
 
-    def test_hold_reuses_detections(self, mock_model, mock_visualizer, tmp_path):
+    def test_hold_reuses_detections(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """Intermediate frames reuse last YOLO detections (hold mode)."""
         num_frames = 3
-        mock_cap, mock_writer = self._setup_pipeline_mocks(num_frames)
+        frames = self._make_frames(num_frames)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
 
         mock_model.predict.return_value = [
             _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
@@ -397,25 +330,16 @@ class TestAnnotatePipeline:
         ffprobe_result.returncode = 0
         ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
 
-        merge_result = MagicMock()
-        merge_result.returncode = 0
-
         input_path = tmp_path / "input.mp4"
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
-
-        def subprocess_side_effect(cmd, **kwargs):
-            if cmd[0] == "ffprobe":
-                return ffprobe_result
-            return merge_result
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
 
         with (
-            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
-            patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
-            patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
-            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe_result),
         ):
             stats = annotator.annotate(
                 input_path, output_path, AnnotationParams(detect_every=3)
@@ -428,10 +352,11 @@ class TestAnnotatePipeline:
         assert stats.total_detections == 3
         assert mock_visualizer.draw_detection.call_count == 3
 
-    def test_hold_clears_on_empty_detection(self, mock_model, mock_visualizer, tmp_path):
+    def test_hold_clears_on_empty_detection(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """When detection frame returns no objects, hold frames also show nothing."""
         num_frames = 4
-        mock_cap, mock_writer = self._setup_pipeline_mocks(num_frames)
+        frames = self._make_frames(num_frames)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
 
         # Frame 0: 1 detection. Frame 3: 0 detections.
         mock_model.predict.side_effect = [
@@ -449,25 +374,16 @@ class TestAnnotatePipeline:
         ffprobe_result.returncode = 0
         ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
 
-        merge_result = MagicMock()
-        merge_result.returncode = 0
-
         input_path = tmp_path / "input.mp4"
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
-
-        def subprocess_side_effect(cmd, **kwargs):
-            if cmd[0] == "ffprobe":
-                return ffprobe_result
-            return merge_result
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
 
         with (
-            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
-            patch("video_annotator.cv2.VideoWriter", return_value=mock_writer),
-            patch("video_annotator.cv2.VideoWriter_fourcc", return_value=0),
-            patch("video_annotator.subprocess.run", side_effect=subprocess_side_effect),
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe_result),
         ):
             stats = annotator.annotate(
                 input_path, output_path, AnnotationParams(detect_every=3)
@@ -480,12 +396,25 @@ class TestAnnotatePipeline:
         assert stats.total_detections == 3
         assert mock_visualizer.draw_detection.call_count == 3
 
-    def test_cannot_open_video(self, mock_model, mock_visualizer, tmp_path):
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = False
+    def test_decoder_failure_raises_error(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """When FFmpegDecoder.read_frame raises RuntimeError, annotate propagates it."""
+        mock_decoder = MagicMock()
+        mock_decoder.read_frame.side_effect = RuntimeError("FFmpeg decoder crashed (rc=1)")
+        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
+        mock_decoder.__exit__ = MagicMock(return_value=False)
+
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+
+        mock_decoder_cls = MagicMock(return_value=mock_decoder)
+        mock_encoder_cls = MagicMock(return_value=mock_encoder)
 
         ffprobe_stream = {
-            "r_frame_rate": "30/1", "width": 640, "height": 480, "nb_frames": "100",
+            "r_frame_rate": "30/1",
+            "width": 640,
+            "height": 480,
+            "nb_frames": "100",
         }
         ffprobe_result = MagicMock()
         ffprobe_result.returncode = 0
@@ -494,11 +423,51 @@ class TestAnnotatePipeline:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names)
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
 
         with (
-            patch("video_annotator.cv2.VideoCapture", return_value=mock_cap),
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
             patch("video_annotator.subprocess.run", return_value=ffprobe_result),
         ):
-            with pytest.raises(RuntimeError, match="Cannot open video"):
+            with pytest.raises(RuntimeError, match="FFmpeg decoder crashed"):
                 annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+    def test_progress_callback(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """Progress callback is called during processing."""
+        num_frames = 20
+        frames = self._make_frames(num_frames)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        ffprobe_stream = {
+            "r_frame_rate": "30/1",
+            "width": 640,
+            "height": 480,
+            "nb_frames": str(num_frames),
+        }
+        ffprobe_result = MagicMock()
+        ffprobe_result.returncode = 0
+        ffprobe_result.stdout = json.dumps({"streams": [ffprobe_stream]})
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        output_path = tmp_path / "output.mp4"
+
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+        callback = MagicMock()
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe_result),
+        ):
+            stats = annotator.annotate(input_path, output_path, AnnotationParams(), progress_callback=callback)
+
+        assert callback.call_count > 0
+        # All progress values should be <= 99
+        for call in callback.call_args_list:
+            assert call.args[0] <= 99

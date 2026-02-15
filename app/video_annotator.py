@@ -1,24 +1,18 @@
 import json
 import logging
 import subprocess
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-import cv2
 import numpy as np
 
+from ffmpeg_pipe import FFmpegDecoder, FFmpegEncoder
+from hw_accel import HWAccelConfig
 from visualization import DetectionVisualizer, DetectionBox
 
 logger = logging.getLogger(__name__)
-
-CODEC_MAP = {
-    "h264": "libx264",
-    "h265": "libx265",
-    "av1": "libsvtav1",
-}
 
 
 @dataclass(slots=True)
@@ -57,12 +51,14 @@ class VideoAnnotator:
         model: Any,
         visualizer: DetectionVisualizer,
         class_names: dict[int, str],
+        hw_config: HWAccelConfig,
         codec: str = "h264",
         crf: int = 18,
     ):
         self.model = model
         self.visualizer = visualizer
         self.class_names = class_names
+        self.hw_config = hw_config
         self.codec = codec
         self.crf = crf
 
@@ -84,7 +80,6 @@ class VideoAnnotator:
             params: Annotation parameters
             progress_callback: Called with progress 0-99 during processing
         """
-        # Get metadata via ffprobe (more reliable than cv2.CAP_PROP for VFR video)
         fps, width, height, total_frames = self._get_video_metadata(input_path)
 
         model_name = getattr(self.model, "model_name", None) or getattr(self.model, "ckpt_path", "unknown")
@@ -96,33 +91,19 @@ class VideoAnnotator:
             f"detect_every={params.detect_every}, conf={params.conf}"
         )
 
-        cap = cv2.VideoCapture(str(input_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {input_path}")
-        logger.debug(f"VideoCapture opened: {input_path}")
+        stats = AnnotationStats(total_frames=total_frames)
+        current_detections: list[DetectionBox] = []
+        font_scale = self.visualizer.calculate_adaptive_font_scale(height)
+        frame_num = 0
+        start_time = time.perf_counter()
 
-        writer = None
-        try:
-
-            video_only_path = output_path.parent / "video_only.mp4"
-
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(
-                str(video_only_path), fourcc, fps, (width, height)
-            )
-            if not writer.isOpened():
-                raise RuntimeError("Cannot create video writer")
-            logger.info(f"VideoWriter created: {video_only_path}, codec=mp4v, {width}x{height} @ {fps:.1f}fps")
-
-            stats = AnnotationStats(total_frames=total_frames)
-            current_detections: list[DetectionBox] = []
-            font_scale = self.visualizer.calculate_adaptive_font_scale(height)
-            frame_num = 0
-            start_time = time.perf_counter()
+        with FFmpegDecoder(input_path, width, height, self.hw_config) as decoder, \
+             FFmpegEncoder(input_path, output_path, width, height, fps,
+                           self.hw_config, self.codec, self.crf) as encoder:
 
             while True:
-                ret, frame = cap.read()
-                if not ret:
+                frame = decoder.read_frame()
+                if frame is None:
                     break
 
                 if frame_num % params.detect_every == 0:
@@ -147,47 +128,35 @@ class VideoAnnotator:
                     stats.total_detections += len(current_detections)
 
                 self._draw_detections(frame, current_detections, params, font_scale)
-                writer.write(frame)
+                encoder.write_frame(frame)
                 frame_num += 1
 
                 if progress_callback and total_frames > 0 and frame_num % 10 == 0:
                     progress = int((frame_num / total_frames) * 100)
                     progress_callback(min(progress, 99))
 
-            writer.release()
-            writer = None
-            stats.total_frames = frame_num
-            stats.processing_time_ms = int(
-                (time.perf_counter() - start_time) * 1000
-            )
+        stats.total_frames = frame_num
+        stats.processing_time_ms = int(
+            (time.perf_counter() - start_time) * 1000
+        )
 
-            fps_actual = frame_num / max(stats.processing_time_ms / 1000, 0.001)
-            logger.info(
-                f"Frame processing complete: {frame_num} frames in {stats.processing_time_ms}ms "
-                f"({fps_actual:.1f} fps), detected={stats.detected_frames}, "
-                f"tracked={stats.tracked_frames}, total_detections={stats.total_detections}"
-            )
+        fps_actual = frame_num / max(stats.processing_time_ms / 1000, 0.001)
+        logger.info(
+            f"Frame processing complete: {frame_num} frames in {stats.processing_time_ms}ms "
+            f"({fps_actual:.1f} fps), detected={stats.detected_frames}, "
+            f"tracked={stats.tracked_frames}, total_detections={stats.total_detections}"
+        )
 
-            self._merge_audio(input_path, video_only_path, output_path)
-
-            try:
-                if video_only_path.exists():
-                    video_only_path.unlink()
-            except OSError as e:
-                logger.warning(f"Failed to clean up intermediate file: {e}")
-
-            return stats
-
-        finally:
-            if writer is not None:
-                writer.release()
-            cap.release()
+        return stats
 
     @staticmethod
     def _get_video_metadata(
         video_path: Path,
     ) -> tuple[float, int, int, int]:
-        """Get video metadata via ffprobe. Returns (fps, width, height, total_frames)."""
+        """Get video metadata via ffprobe. Returns (fps, width, height, total_frames).
+
+        Raises RuntimeError if ffprobe fails or returns invalid metadata.
+        """
 
         cmd = [
             "ffprobe",
@@ -202,45 +171,37 @@ class VideoAnnotator:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=30
             )
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                stream = data["streams"][0]
-                # Parse fps from r_frame_rate (e.g. "30/1")
-                r_rate = stream.get("r_frame_rate", "30/1")
-                num, den = map(int, r_rate.split("/"))
-                fps = num / den if den else 30.0
-                width = int(stream.get("width", 0))
-                height = int(stream.get("height", 0))
-                total_frames = int(stream.get("nb_frames", 0))
-                if total_frames == 0:
-                    # Estimate from duration
-                    duration = float(stream.get("duration", 0))
-                    total_frames = int(duration * fps)
-                # Validate metadata is usable
-                if width > 0 and height > 0 and fps > 0:
-                    logger.debug(
-                        f"ffprobe metadata: {width}x{height} @ {fps:.2f}fps, "
-                        f"~{total_frames} frames, codec={stream.get('codec_name', '?')}"
-                    )
-                    return fps, width, height, total_frames
-                logger.warning(
-                    f"ffprobe returned invalid metadata: {width}x{height} @ {fps}fps"
-                )
         except Exception as e:
-            logger.warning(f"ffprobe failed: {e}, falling back to cv2")
+            raise RuntimeError(f"ffprobe failed: {e}") from e
 
-        # Fallback to cv2
-        logger.info("Using cv2 fallback for video metadata")
-        cap = cv2.VideoCapture(str(video_path))
-        try:
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            logger.debug(f"cv2 metadata: {width}x{height} @ {fps:.2f}fps, ~{total_frames} frames")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffprobe returned non-zero exit code ({result.returncode}) "
+                f"for {video_path}"
+            )
+
+        data = json.loads(result.stdout)
+        stream = data["streams"][0]
+        r_rate = stream.get("r_frame_rate", "30/1")
+        num, den = map(int, r_rate.split("/"))
+        fps = num / den if den else 30.0
+        width = int(stream.get("width", 0))
+        height = int(stream.get("height", 0))
+        total_frames = int(stream.get("nb_frames", 0))
+        if total_frames == 0:
+            duration = float(stream.get("duration", 0))
+            total_frames = int(duration * fps)
+        if width > 0 and height > 0 and fps > 0:
+            logger.debug(
+                f"ffprobe metadata: {width}x{height} @ {fps:.2f}fps, "
+                f"~{total_frames} frames, codec={stream.get('codec_name', '?')}"
+            )
             return fps, width, height, total_frames
-        finally:
-            cap.release()
+
+        raise RuntimeError(
+            f"ffprobe returned invalid metadata: {width}x{height} @ {fps}fps "
+            f"for {video_path}"
+        )
 
     def _extract_detections(
         self, results: list, class_filter: list[str] | None
@@ -289,40 +250,3 @@ class VideoAnnotator:
                 font_scale=font_scale,
                 text_thickness=1,
             )
-
-    def _merge_audio(
-        self, original: Path, video_only: Path, output: Path
-    ) -> None:
-        """Re-encode video with target codec and merge audio from original using FFmpeg."""
-        encoder = CODEC_MAP.get(self.codec, "libx264")
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", str(video_only),
-            "-i", str(original),
-            "-c:v", encoder,
-            "-crf", str(self.crf),
-            "-c:a", "aac",
-            "-map", "0:v:0",
-            "-map", "1:a:0?",
-            "-shortest",
-            str(output),
-        ]
-        logger.info("Merging audio from original video")
-        logger.debug(f"FFmpeg command: {' '.join(cmd)}")
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300
-            )
-            if result.returncode == 0:
-                logger.info(f"Audio merge complete: {output}")
-            else:
-                logger.warning(
-                    f"FFmpeg audio merge failed (rc={result.returncode}): "
-                    f"{result.stderr[:500]}"
-                )
-                # Fallback: use video without audio
-                shutil.copy2(str(video_only), str(output))
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logger.warning(f"FFmpeg audio merge failed ({type(e).__name__}), using video only")
-            shutil.copy2(str(video_only), str(output))

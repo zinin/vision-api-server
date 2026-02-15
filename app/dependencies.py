@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from ultralytics import YOLO
     from visualization import DetectionVisualizer
     from model_manager import ModelManager
+    from job_manager import JobManager
 
 
 @dataclass(slots=True)
@@ -40,4 +41,12 @@ async def get_model_manager(request: Request) -> "ModelManager":
     manager = getattr(request.app.state, "model_manager", None)
     if manager is None:
         raise RuntimeError("Model manager not initialized")
+    return manager
+
+
+async def get_job_manager(request: Request) -> "JobManager":
+    """Get JobManager from app state."""
+    manager = getattr(request.app.state, "job_manager", None)
+    if manager is None:
+        raise RuntimeError("Job manager not initialized")
     return manager

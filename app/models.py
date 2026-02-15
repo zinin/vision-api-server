@@ -157,3 +157,31 @@ class FrameExtractionResponse(BaseModel):
     frames_extracted: int = Field(description="Number of frames extracted")
     frames: list[ExtractedFrameData] = Field(description="Extracted frames with image data")
     processing_time_ms: int = Field(description="Processing time in milliseconds")
+
+
+class JobCreatedResponse(BaseModel):
+    """Response when a video annotation job is created."""
+    job_id: str = Field(description="Unique job identifier")
+    status: str = Field(description="Job status")
+    message: str = Field(description="Human-readable message")
+
+
+class JobStats(BaseModel):
+    """Statistics for a completed annotation job."""
+    total_frames: int = Field(description="Total frames in video")
+    detected_frames: int = Field(description="Frames with YOLO detection")
+    tracked_frames: int = Field(description="Frames with held detections (reused from last YOLO run)")
+    total_detections: int = Field(description="Total object detections")
+    processing_time_ms: int = Field(description="Total processing time in ms")
+
+
+class JobStatusResponse(BaseModel):
+    """Response for job status query."""
+    job_id: str = Field(description="Unique job identifier")
+    status: str = Field(description="Job status: queued, processing, completed, failed")
+    progress: int = Field(ge=0, le=100, description="Progress percentage")
+    created_at: str = Field(description="Job creation timestamp ISO format")
+    completed_at: str | None = Field(default=None, description="Completion timestamp")
+    download_url: str | None = Field(default=None, description="URL to download result")
+    error: str | None = Field(default=None, description="Error message if failed")
+    stats: JobStats | None = Field(default=None, description="Job statistics")

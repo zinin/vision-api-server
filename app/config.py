@@ -1,7 +1,7 @@
 import json
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import field_validator
+from pydantic import field_validator, Field
 from functools import lru_cache
 
 
@@ -17,9 +17,19 @@ class Settings(BaseSettings):
     yolo_model_ttl: int = 900  # 15 minutes TTL for cached models
     max_file_size: int = 10 * 1024 * 1024
     allowed_extensions: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp"})
-    debug: bool = False
+    log_level: str = "INFO"
     inference_timeout: float = 30.0
     max_executor_workers: int = 4
+
+    # Video annotation job settings
+    video_job_ttl: int = Field(default=3600, ge=60)  # 1 hour TTL for completed jobs
+    video_jobs_dir: str = "/tmp/vision_jobs"
+    max_queued_jobs: int = Field(default=10, ge=1)
+    default_detect_every: int = Field(default=5, ge=1, le=300)
+    video_codec: str = "auto"  # auto | h264 | h265 | av1
+    video_crf: int = Field(default=18, ge=0, le=63)
+    video_hw_accel: str = "auto"  # auto | nvidia | amd | cpu
+    vaapi_device: str = "/dev/dri/renderD128"  # VAAPI render device path
 
     @property
     def preload_model_map(self) -> dict[str, str]:
@@ -62,6 +72,22 @@ class Settings(BaseSettings):
             raise ValueError("max_file_size must be positive")
         if v > 100 * 1024 * 1024:  # 100MB limit
             raise ValueError("max_file_size cannot exceed 100MB")
+        return v
+
+    @field_validator("video_codec")
+    @classmethod
+    def validate_video_codec(cls, v: str) -> str:
+        allowed = ("auto", "h264", "h265", "av1")
+        if v not in allowed:
+            raise ValueError(f"video_codec must be one of: {allowed}")
+        return v
+
+    @field_validator("video_hw_accel")
+    @classmethod
+    def validate_video_hw_accel(cls, v: str) -> str:
+        allowed = ("auto", "nvidia", "amd", "cpu")
+        if v not in allowed:
+            raise ValueError(f"video_hw_accel must be one of: {allowed}")
         return v
 
     @field_validator("yolo_model_ttl")

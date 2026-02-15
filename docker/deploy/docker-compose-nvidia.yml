@@ -9,8 +9,11 @@ services:
       YOLO_MODELS: ${YOLO_MODELS:-{"yolo11s.pt":"cuda:0","yolo11x.pt":"cuda:0"}}
       YOLO_MODEL_TTL: ${YOLO_MODEL_TTL:-900}
       YOLO_DEVICE: ${YOLO_DEVICE:-cuda:0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      VIDEO_CODEC: ${VIDEO_CODEC:-auto}
+      VIDEO_CRF: ${VIDEO_CRF:-18}
       NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     deploy:
       resources:
         reservations:

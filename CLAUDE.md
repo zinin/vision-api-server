@@ -29,6 +29,10 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/config.py` | Pydantic settings, env vars |
 | `app/models.py` | Request/response Pydantic models |
 | `app/dependencies.py` | FastAPI dependency injection |
+| `app/hw_accel.py` | Hardware acceleration detection (NVIDIA/AMD/CPU) |
+| `app/ffmpeg_pipe.py` | FFmpeg pipe-based video decoder/encoder |
+| `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
+| `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
 
 ## Endpoints
 
@@ -38,6 +42,9 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `/detect/video` | POST | Video detection with smart frames |
 | `/detect/visualize` | POST | Image with drawn bboxes |
 | `/extract/frames` | POST | Extract frames as base64 |
+| `/detect/video/visualize` | POST | Submit video for annotation (async, returns job_id) |
+| `/jobs/{job_id}` | GET | Job status and progress |
+| `/jobs/{job_id}/download` | GET | Download annotated video |
 | `/models` | GET | List loaded/cached models |
 | `/health` | GET | Health check |
 
@@ -51,8 +58,26 @@ YOLO_MODEL_TTL=900                      # Cache TTL seconds (min 60)
 MAX_FILE_SIZE=10485760                  # Max image size (default 10MB)
 MAX_EXECUTOR_WORKERS=4                  # ThreadPool workers
 INFERENCE_TIMEOUT=30.0                  # Timeout seconds
-DEBUG=false                             # Detailed errors
+LOG_LEVEL=INFO                          # Logging level (DEBUG, INFO, WARNING, ERROR)
+VIDEO_JOB_TTL=3600                      # Completed job TTL seconds
+VIDEO_JOBS_DIR=/tmp/vision_jobs         # Job files directory
+MAX_QUEUED_JOBS=10                      # Queue limit
+DEFAULT_DETECT_EVERY=5                  # YOLO every N frames
+VIDEO_CODEC=auto                        # auto (match source) | h264 | h265 | av1
+                                        # To force previous behavior: VIDEO_CODEC=h264
+VIDEO_CRF=18                            # Quality: 0=lossless, 18=near-lossless, 23=default
+VIDEO_HW_ACCEL=auto                     # auto | nvidia | amd | cpu
+VAAPI_DEVICE=/dev/dri/renderD128        # VAAPI render device path
 ```
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+```
+
+Tests cover config, Pydantic models, JobManager, and VideoAnnotator (mocked YOLO/FFmpeg).
 
 ## Key Patterns
 
@@ -61,6 +86,8 @@ DEBUG=false                             # Detailed errors
 **Two-Tier Caching**: Preloaded (never evicted) + cached (TTL-based eviction).
 
 **Smart Frames**: FFmpeg scene detection with fallback to interval-based extraction.
+
+**Video Annotation**: Async job API — YOLO every Nth frame + hold mode (reuse detections) for intermediate frames. Single worker, in-memory job state (requires `workers=1`).
 
 ## Limits
 
@@ -77,3 +104,9 @@ Container: 8000 → Host: 3001
 See `.claude/rules/` for detailed documentation:
 - `api.md` — Endpoints, parameters, examples
 - `docker.md` — Docker deployment, scripts
+
+## Jira
+
+Project tracker: https://jira.zinin.ru/ (project key: **VAS**)
+Available via MCP `mcp-atlassian` — use `jira_search`, `jira_get_issue`, `jira_create_issue` etc. with `project_key: "FV"`.
+When creating issues, assign them to user **azinin**.

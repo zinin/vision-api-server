@@ -8,6 +8,9 @@ services:
     environment:
       - YOLO_MODELS=${YOLO_MODELS:-'{"yolo11s.pt":"cpu","yolo11x.pt":"cpu"}'}
       - YOLO_MODEL_TTL=${YOLO_MODEL_TTL:-900}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - VIDEO_CODEC=${VIDEO_CODEC:-auto}
+      - VIDEO_CRF=${VIDEO_CRF:-18}
       - YOLO_DEVICE=cpu
     restart: unless-stopped
     healthcheck:

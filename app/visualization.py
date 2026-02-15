@@ -83,7 +83,7 @@ class DetectionVisualizer:
                 ]
         return self._color_cache[class_id]
 
-    def _calculate_adaptive_font_scale(self, image_height: int) -> float:
+    def calculate_adaptive_font_scale(self, image_height: int) -> float:
         """Calculate font scale based on image size."""
         reference_height = 720
         scale_factor = image_height / reference_height
@@ -118,7 +118,7 @@ class DetectionVisualizer:
 
         actual_font_scale = (
             font_scale if font_scale is not None
-            else self._calculate_adaptive_font_scale(image.shape[0])
+            else self.calculate_adaptive_font_scale(image.shape[0])
         )
 
         # Extract all detections
@@ -146,7 +146,7 @@ class DetectionVisualizer:
 
         # Draw all detections
         for det in detections:
-            self._draw_detection(
+            self.draw_detection(
                 annotated, det, line_width,
                 show_labels, show_conf,
                 actual_font_scale, text_thickness
@@ -154,7 +154,7 @@ class DetectionVisualizer:
 
         return annotated
 
-    def _draw_detection(
+    def draw_detection(
             self,
             image: np.ndarray,
             det: DetectionBox,

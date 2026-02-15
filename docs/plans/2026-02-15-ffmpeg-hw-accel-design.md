@@ -41,16 +41,18 @@ NVIDIA (NVDEC/NVENC) → AMD (VAAPI) → CPU (software codecs)
 **HWAccelConfig** (dataclass):
 - `accel_type: HWAccelType`
 - `decode_args: list[str]` — FFmpeg args for decoder
-- `encode_args_fn(codec, crf) → list[str]` — FFmpeg args for encoder by codec/quality
+- `global_encode_args: list[str]` — global FFmpeg args for encoder (must appear BEFORE `-i`), e.g. `-vaapi_device` for AMD
+- `get_encode_args(codec, crf) → list[str]` — codec-specific FFmpeg args for encoder (appear AFTER inputs)
 
 **Detection** (run once at startup, cached):
 1. `ffmpeg -hwaccels` → parse available hwaccels (cuda, vaapi)
 2. `ffmpeg -encoders` → check for configured codec's encoder (e.g. `h264_nvenc`, `hevc_nvenc`, `av1_nvenc` depending on `VIDEO_CODEC`)
 3. Select best available, cache result
+4. **CPU encoder validation**: after final fallback to CPU, verify that the CPU encoder for the configured codec (`libx264`/`libx265`/`libsvtav1`) is available via `_has_encoder()`. Fail-fast with `RuntimeError` if not.
 
 When `VIDEO_HW_ACCEL` is forced (`nvidia`/`amd`) but hardware not available → log warning, fallback to CPU.
 
-**FFmpeg is mandatory** after this change (no more cv2 fallback). Startup must verify FFmpeg is installed.
+**FFmpeg and ffprobe are mandatory** after this change (no more cv2 fallback). Startup must verify both `ffmpeg` and `ffprobe` are installed via `shutil.which()`.
 
 **Codec mapping:**
 
@@ -79,7 +81,7 @@ cmd += ['-i', input_path, '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
 
 FFmpeg auto-rotates by default (applies display rotation metadata). Raw output already correct orientation.
 
-**Stderr handling**: daemon thread reads stderr asynchronously to prevent pipe buffer deadlock.
+**Stderr handling**: daemon thread reads stderr asynchronously into `collections.deque(maxlen=100)` of `bytes` to prevent pipe buffer deadlock. Thread-safe (deque + GIL). Decode to str only when formatting error messages.
 **Frame buffer**: `np.frombuffer` returns read-only array → `.copy()` required for OpenCV drawing.
 **Process health**: `read_frame()` checks `process.poll()` to detect mid-stream crashes.
 
@@ -93,7 +95,9 @@ API:
 Context manager. Launches FFmpeg subprocess that accepts raw BGR24 frames via stdin, encodes with target codec, and merges audio from original video.
 
 ```python
-cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning']
+cmd += hw_config.global_encode_args  # e.g. ['-vaapi_device', '/dev/dri/renderD128'] — MUST be before -i
+cmd += [
     '-f', 'rawvideo', '-pix_fmt', 'bgr24',
     '-s', f'{width}x{height}', '-r', str(fps),
     '-i', 'pipe:0',
@@ -101,11 +105,14 @@ cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
     '-map', '0:v:0', '-map', '1:a:0?',
     '-map_metadata', '0',
 ]
-cmd += hw_config.encode_args(codec, crf)
+cmd += hw_config.get_encode_args(codec, crf)  # codec-specific args (after inputs)
+cmd += ['-pix_fmt', 'yuv420p']  # maximum client playback compatibility
 cmd += ['-c:a', 'aac', '-shortest', str(output_path)]
 ```
 
-**Stderr handling**: daemon thread reads stderr asynchronously (same as decoder).
+**Note:** `-pix_fmt yuv420p` ensures H.264/H.265 output uses the most compatible pixel format. Without it, FFmpeg may default to yuv444p from bgr24 input, causing playback issues on many clients. VAAPI already uses `format=nv12` in its filter chain.
+
+**Stderr handling**: daemon thread reads stderr asynchronously into `collections.deque(maxlen=100)` of `bytes` (same as decoder). Thread-safe via deque + GIL.
 
 API:
 - `__enter__` → starts process, starts stderr drain thread

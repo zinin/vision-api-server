@@ -261,7 +261,15 @@ class HWAccelConfig:
             return ["-hwaccel", "vaapi", "-hwaccel_device", self.vaapi_device]
         return []
 
+    @property
+    def global_encode_args(self) -> list[str]:
+        """Global FFmpeg args that MUST appear BEFORE -i (e.g. -vaapi_device)."""
+        if self.accel_type == HWAccelType.AMD:
+            return ["-vaapi_device", self.vaapi_device]
+        return []
+
     def get_encode_args(self, codec: str, crf: int) -> list[str]:
+        """Codec-specific FFmpeg args (appear AFTER inputs)."""
         encoder_map = _ENCODER_MAP.get(self.accel_type, _ENCODER_MAP[HWAccelType.CPU])
         encoder = encoder_map.get(codec)
 
@@ -271,10 +279,10 @@ class HWAccelConfig:
             return self._cpu_encode_args(encoder, crf)
 
         if self.accel_type == HWAccelType.NVIDIA:
-            return ["-c:v", encoder, "-preset", "p4", "-rc", "vbr", "-cq", str(crf)]
+            return ["-c:v", encoder, "-preset", "p4", "-rc", "vbr", "-cq", str(crf),
+                    "-pix_fmt", "yuv420p"]
         if self.accel_type == HWAccelType.AMD:
             return [
-                "-vaapi_device", self.vaapi_device,
                 "-vf", "format=nv12,hwupload",
                 "-c:v", encoder, "-qp", str(crf),
             ]
@@ -282,7 +290,7 @@ class HWAccelConfig:
 
     @staticmethod
     def _cpu_encode_args(encoder: str, crf: int) -> list[str]:
-        return ["-c:v", encoder, "-crf", str(crf)]
+        return ["-c:v", encoder, "-crf", str(crf), "-pix_fmt", "yuv420p"]
 
 
 def _ffmpeg_query(args: list[str]) -> str:
@@ -345,6 +353,14 @@ def detect_hw_accel(mode: str = "auto", codec: str = "h264", vaapi_device: str =
             logger.warning(f"AMD/VAAPI detection failed: {e}")
         if mode == "amd":
             logger.warning("AMD/VAAPI requested but not available, falling back to CPU")
+
+    # CPU fallback — validate that the encoder for configured codec is available
+    cpu_encoder = _ENCODER_MAP[HWAccelType.CPU].get(codec)
+    if cpu_encoder and not _has_encoder(cpu_encoder):
+        raise RuntimeError(
+            f"CPU encoder '{cpu_encoder}' for codec '{codec}' not found in FFmpeg. "
+            f"Install FFmpeg with '{cpu_encoder}' support or change VIDEO_CODEC."
+        )
 
     logger.info("Hardware acceleration: CPU (software codecs)")
     return HWAccelConfig(accel_type=HWAccelType.CPU)
@@ -470,6 +486,7 @@ Create `app/ffmpeg_pipe.py`:
 import logging
 import subprocess
 import threading
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -479,13 +496,20 @@ from hw_accel import HWAccelConfig
 logger = logging.getLogger(__name__)
 
 
-def _drain_stderr(process: subprocess.Popen, collected: list[str]) -> None:
-    """Daemon thread target: read stderr line-by-line to prevent pipe buffer deadlock."""
+def _drain_stderr(process: subprocess.Popen, collected: deque[bytes]) -> None:
+    """Daemon thread target: read stderr line-by-line to prevent pipe buffer deadlock.
+    Collects bytes (Popen uses text=False). Thread-safe via deque + GIL."""
     try:
         for line in process.stderr:
             collected.append(line)
     except (ValueError, OSError):
         pass  # pipe closed
+
+
+def _format_stderr(lines: deque[bytes], max_lines: int = 10) -> str:
+    """Decode last N stderr lines for error messages."""
+    tail = list(lines)[-max_lines:]
+    return b"".join(tail).decode("utf-8", errors="replace")[:500]
 
 
 class FFmpegDecoder:
@@ -508,7 +532,7 @@ class FFmpegDecoder:
         self._width = width
         self._height = height
         self._frame_size = width * height * 3  # BGR24
-        self._stderr_lines: list[str] = []
+        self._stderr_lines: deque[bytes] = deque(maxlen=100)
 
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
         cmd += hw_config.decode_args
@@ -530,9 +554,9 @@ class FFmpegDecoder:
         if not raw or len(raw) < self._frame_size:
             # Check if process crashed (vs normal EOF)
             if self._process.poll() is not None and self._process.returncode != 0:
-                stderr_text = "".join(str(l) for l in self._stderr_lines[-10:])
                 raise RuntimeError(
-                    f"FFmpeg decoder crashed (rc={self._process.returncode}): {stderr_text[:500]}"
+                    f"FFmpeg decoder crashed (rc={self._process.returncode}): "
+                    f"{_format_stderr(self._stderr_lines)}"
                 )
             return None
         return np.frombuffer(raw, dtype=np.uint8).reshape(
@@ -725,10 +749,11 @@ class FFmpegEncoder:
         codec: str,
         crf: int,
     ):
-        self._stderr_lines: list[str] = []
+        self._stderr_lines: deque[bytes] = deque(maxlen=100)
 
-        cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+        cmd += hw_config.global_encode_args  # e.g. [-vaapi_device, ...] — MUST be before -i
+        cmd += [
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "pipe:0",
@@ -736,7 +761,7 @@ class FFmpegEncoder:
             "-map", "0:v:0", "-map", "1:a:0?",
             "-map_metadata", "0",
         ]
-        cmd += hw_config.get_encode_args(codec, crf)
+        cmd += hw_config.get_encode_args(codec, crf)  # codec-specific args (after inputs)
         cmd += ["-c:a", "aac", "-shortest", str(output_path)]
 
         logger.debug(f"FFmpegEncoder command: {' '.join(cmd)}")
@@ -752,9 +777,9 @@ class FFmpegEncoder:
     def write_frame(self, frame: np.ndarray) -> None:
         """Write one BGR24 frame. Checks process health before writing."""
         if self._process.poll() is not None:
-            stderr_text = "".join(str(l) for l in self._stderr_lines[-10:])
             raise RuntimeError(
-                f"FFmpeg encoder crashed (rc={self._process.returncode}): {stderr_text[:500]}"
+                f"FFmpeg encoder crashed (rc={self._process.returncode}): "
+                f"{_format_stderr(self._stderr_lines)}"
             )
         self._process.stdin.write(frame.tobytes())
 
@@ -771,10 +796,9 @@ class FFmpegEncoder:
             self._process.kill()
             self._process.wait(timeout=5)
         if self._process.returncode != 0:
-            stderr_text = "".join(str(l) for l in self._stderr_lines[-20:])
             raise RuntimeError(
                 f"FFmpeg encoder failed (rc={self._process.returncode}): "
-                f"{stderr_text[:500] if stderr_text else 'no stderr'}"
+                f"{_format_stderr(self._stderr_lines, max_lines=20) or 'no stderr'}"
             )
 
     def __enter__(self):
@@ -1039,11 +1063,13 @@ Check existing test_worker.py first — if it uses mock VideoAnnotator, verify t
 
 In `app/main.py` lifespan, after job_manager setup:
 
-1. **Verify FFmpeg is installed** (mandatory after this change):
+1. **Verify FFmpeg and ffprobe are installed** (mandatory after this change):
 ```python
 import shutil
 if not shutil.which("ffmpeg"):
     raise RuntimeError("FFmpeg is required but not found in PATH")
+if not shutil.which("ffprobe"):
+    raise RuntimeError("ffprobe is required but not found in PATH")
 ```
 
 2. **Detect hardware acceleration** passing configured codec and vaapi device:

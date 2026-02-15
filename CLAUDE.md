@@ -29,6 +29,8 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/config.py` | Pydantic settings, env vars |
 | `app/models.py` | Request/response Pydantic models |
 | `app/dependencies.py` | FastAPI dependency injection |
+| `app/hw_accel.py` | Hardware acceleration detection (NVIDIA/AMD/CPU) |
+| `app/ffmpeg_pipe.py` | FFmpeg pipe-based video decoder/encoder |
 | `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
 | `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
 
@@ -63,6 +65,8 @@ MAX_QUEUED_JOBS=10                      # Queue limit
 DEFAULT_DETECT_EVERY=5                  # YOLO every N frames
 VIDEO_CODEC=h264                        # Output codec: h264, h265, av1
 VIDEO_CRF=18                            # Quality: 0=lossless, 18=near-lossless, 23=default
+VIDEO_HW_ACCEL=auto                     # auto | nvidia | amd | cpu
+VAAPI_DEVICE=/dev/dri/renderD128        # VAAPI render device path
 ```
 
 ## Testing

@@ -4,7 +4,7 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     environment:
-      YOLO_MODELS: ${YOLO_MODELS:-{"yolo11s.pt":"cpu","yolo11x.pt":"cpu"}}
+      YOLO_MODELS: ${YOLO_MODELS:-{"yolo26s.pt":"cpu","yolo26x.pt":"cpu"}}
       YOLO_MODEL_TTL: ${YOLO_MODEL_TTL:-900}
       YOLO_DEVICE: cpu
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

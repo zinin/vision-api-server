@@ -81,7 +81,7 @@ class DetectionResponse(BaseModel):
                 ],
                 "processing_time": 45,
                 "image_size": {"width": 1920, "height": 1080},
-                "model": "yolo11s.pt"
+                "model": "yolo26s.pt"
             }
         }
     )

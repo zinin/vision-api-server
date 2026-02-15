@@ -52,7 +52,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 
 `.env` file or environment variables:
 ```
-YOLO_MODELS='{"yolo11s.pt":"cuda:0"}'  # JSON: model->device
+YOLO_MODELS='{"yolo26s.pt":"cuda:0"}'  # JSON: model->device
 YOLO_DEVICE=cuda                        # Default device for dynamic loads
 YOLO_MODEL_TTL=900                      # Cache TTL seconds (min 60)
 MAX_FILE_SIZE=10485760                  # Max image size (default 10MB)

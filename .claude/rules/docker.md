@@ -51,7 +51,7 @@ Edit `docker/.env`:
 COMPOSE_PROJECT_NAME=detect-server
 
 # Models to preload at startup (JSON format)
-YOLO_MODELS='{"yolo11s.pt":"cuda:0"}'
+YOLO_MODELS='{"yolo26s.pt":"cuda:0"}'
 
 # Default device for on-demand loaded models
 YOLO_DEVICE=cuda:0
@@ -171,7 +171,7 @@ And set `YOLO_MODELS` to use `/models/` path prefix.
 ## Troubleshooting
 
 **CUDA out of memory:**
-- Use smaller model (yolo11n.pt, yolo11s.pt)
+- Use smaller model (yolo26n.pt, yolo26s.pt)
 - Reduce `imgsz` parameter
 - Check other GPU processes
 
@@ -179,5 +179,5 @@ And set `YOLO_MODELS` to use `/models/` path prefix.
 - Ensure `ffmpeg` is in Dockerfile apt-get install
 
 **Slow startup:**
-- First run downloads models (~25MB for yolo11s.pt)
+- First run downloads models (~25MB for yolo26s.pt)
 - Use volume mount for model persistence

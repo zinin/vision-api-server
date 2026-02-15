@@ -104,7 +104,7 @@ class ModelManager:
         """Preload models at startup. These models are never evicted.
 
         Args:
-            model_device_map: Mapping of model name to device (e.g. {"yolo11s.pt": "cpu"})
+            model_device_map: Mapping of model name to device (e.g. {"yolo26s.pt": "cpu"})
         """
         for model_name, device in model_device_map.items():
             if model_name in self._preloaded:
@@ -125,7 +125,7 @@ class ModelManager:
         Get a model by name. Loads on-demand if not already loaded.
 
         Args:
-            model_name: Model name (e.g. 'yolo11s.pt'). If None, returns default model.
+            model_name: Model name (e.g. 'yolo26s.pt'). If None, returns default model.
 
         Returns:
             ModelEntry with the loaded model and visualizer.

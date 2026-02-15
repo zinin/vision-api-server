@@ -310,7 +310,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
 ConfidenceQuery = Annotated[float, Query(ge=0.0, le=1.0, description="Confidence threshold")]
 ImageSizeQuery = Annotated[int, Query(ge=32, le=2016, description="Image size for inference")]
 MaxDetQuery = Annotated[int, Query(ge=1, le=1000, description="Maximum detections")]
-ModelQuery = Annotated[str | None, Query(description="Model name (e.g. yolo11s.pt). If not specified, uses default model.")]
+ModelQuery = Annotated[str | None, Query(description="Model name (e.g. yolo26s.pt). If not specified, uses default model.")]
 
 # Video-specific query parameters
 SceneThresholdQuery = Annotated[
@@ -384,7 +384,7 @@ async def detect_objects(
     - **conf**: Confidence threshold (0.0 - 1.0)
     - **imgsz**: Image size for processing
     - **max_det**: Maximum number of detections to return
-    - **model**: Model name (e.g. yolo11s.pt). If not specified, uses first preloaded model.
+    - **model**: Model name (e.g. yolo26s.pt). If not specified, uses first preloaded model.
     """
     model_name = model
     if model_name is None:
@@ -464,7 +464,7 @@ async def detect_objects_in_video(
     - **scene_threshold**: Scene change sensitivity (0.01-0.5, lower = more frames)
     - **min_interval**: Minimum seconds between extracted frames
     - **max_frames**: Maximum total frames to analyze
-    - **model**: Model name (e.g. yolo11s.pt). If not specified, uses first preloaded model.
+    - **model**: Model name (e.g. yolo26s.pt). If not specified, uses first preloaded model.
     """
     start_time = time.perf_counter()
     model_name = model
@@ -753,7 +753,7 @@ async def detect_and_visualize(
 
     Returns an image with drawn bounding boxes, labels, and confidence scores.
 
-    - **model**: Model name (e.g. yolo11s.pt). If not specified, uses first preloaded model.
+    - **model**: Model name (e.g. yolo26s.pt). If not specified, uses first preloaded model.
     """
     model_name = model
     if model_name is None:

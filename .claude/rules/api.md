@@ -17,7 +17,7 @@ Image object detection returning JSON.
 | `conf` | float | 0.5 | 0.0-1.0 | Confidence threshold |
 | `imgsz` | int | 640 | 32-2016 | Inference image size |
 | `max_det` | int | 100 | 1-1000 | Max detections |
-| `model` | string | null | — | Model name (e.g. yolo11s.pt) |
+| `model` | string | null | — | Model name (e.g. yolo26s.pt) |
 
 **Response:**
 ```json
@@ -34,7 +34,7 @@ Image object detection returning JSON.
   "count": 1,
   "processing_time_ms": 45,
   "image_size": [1920, 1080],
-  "model": "yolo11s.pt"
+  "model": "yolo26s.pt"
 }
 ```
 
@@ -109,8 +109,8 @@ List loaded models with status.
 **Response:**
 ```json
 {
-  "preloaded": [{"name": "yolo11s.pt", "device": "cuda:0"}],
-  "cached": [{"name": "yolo11m.pt", "device": "cuda:0", "expires_in_seconds": 800}],
+  "preloaded": [{"name": "yolo26s.pt", "device": "cuda:0"}],
+  "cached": [{"name": "yolo26m.pt", "device": "cuda:0", "expires_in_seconds": 800}],
   "default_device": "cuda:0",
   "ttl_seconds": 900
 }
@@ -147,7 +147,7 @@ curl -X POST "http://localhost:3001/detect?conf=0.6" \
   -F "file=@image.jpg"
 
 # With specific model
-curl -X POST "http://localhost:3001/detect?model=yolo11m.pt" \
+curl -X POST "http://localhost:3001/detect?model=yolo26m.pt" \
   -F "file=@image.jpg"
 
 # Video detection
@@ -179,9 +179,9 @@ All errors return JSON:
 
 ## Models
 
-Available YOLO11 models (ordered by speed/accuracy):
-- `yolo11n.pt` — Nano, fastest
-- `yolo11s.pt` — Small, good balance
-- `yolo11m.pt` — Medium
-- `yolo11l.pt` — Large
-- `yolo11x.pt` — Extra large, most accurate
+Available YOLO26 models (ordered by speed/accuracy):
+- `yolo26n.pt` — Nano, fastest
+- `yolo26s.pt` — Small, good balance
+- `yolo26m.pt` — Medium
+- `yolo26l.pt` — Large
+- `yolo26x.pt` — Extra large, most accurate

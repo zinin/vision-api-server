@@ -1,4 +1,5 @@
-FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04
+#FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1

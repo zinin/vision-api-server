@@ -71,7 +71,7 @@ async def _run_worker_until_job_done(app, settings, job_manager, timeout=5.0):
 class TestAnnotationWorker:
     @pytest.mark.asyncio
     async def test_success(self, worker_app, worker_settings, worker_job_manager, tmp_path):
-        job = worker_job_manager.create_job(params={"model": "yolo11s.pt"})
+        job = worker_job_manager.create_job(params={"model": "yolo26s.pt"})
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
         job.input_path.touch()
 

@@ -52,7 +52,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 
 `.env` file or environment variables:
 ```
-YOLO_MODELS='{"yolo11s.pt":"cuda:0"}'  # JSON: model->device
+YOLO_MODELS='{"yolo26s.pt":"cuda:0"}'  # JSON: model->device
 YOLO_DEVICE=cuda                        # Default device for dynamic loads
 YOLO_MODEL_TTL=900                      # Cache TTL seconds (min 60)
 MAX_FILE_SIZE=10485760                  # Max image size (default 10MB)
@@ -72,8 +72,12 @@ VAAPI_DEVICE=/dev/dri/renderD128        # VAAPI render device path
 
 ## Testing
 
+Tests must run inside a virtual environment:
+
 ```bash
-pip install -r requirements-dev.txt
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 

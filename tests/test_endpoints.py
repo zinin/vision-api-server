@@ -35,7 +35,7 @@ def mock_model_manager():
     entry.model = MagicMock()
     entry.model.names = {0: "person", 1: "car"}
     entry.visualizer = MagicMock()
-    entry.model_name = "yolo11s.pt"
+    entry.model_name = "yolo26s.pt"
     mm.get_model = AsyncMock(return_value=entry)
     return mm
 

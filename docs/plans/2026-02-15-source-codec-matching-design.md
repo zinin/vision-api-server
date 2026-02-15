@@ -59,6 +59,10 @@ ffprobe already runs — just parse two additional fields from `stream`:
 - `stream["codec_name"]` → `"h264"`, `"hevc"`, `"av1"`, `"vp9"`, etc.
 - `stream["bit_rate"]` → `"8234567"` (string, may be absent)
 
+**Bitrate validation:** values outside `[100_000, 200_000_000]` (100 kbps — 200 Mbps) are treated as absent → fallback to CRF 18. Handles ffprobe returning `"0"`, negative, or anomalously large values.
+
+**ffprobe hardening:** handle empty `streams` array (raise RuntimeError) and non-standard `r_frame_rate` format (fallback to 30.0 fps).
+
 **Codec name mapping (ffprobe → internal):**
 
 | ffprobe `codec_name` | Internal `codec` |

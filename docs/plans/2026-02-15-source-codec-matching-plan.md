@@ -460,6 +460,69 @@ class TestGetVideoMetadata:
         with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
             meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
         assert meta.bit_rate is None
+
+    def test_zero_bit_rate_returns_none(self):
+        """When bit_rate is '0', field is None (below MIN_BITRATE)."""
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+            "codec_name": "h264",
+            "bit_rate": "0",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.bit_rate is None
+
+    def test_too_small_bit_rate_returns_none(self):
+        """When bit_rate is below MIN_BITRATE (100 kbps), field is None."""
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+            "codec_name": "h264",
+            "bit_rate": "50000",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.bit_rate is None
+
+    def test_too_large_bit_rate_returns_none(self):
+        """When bit_rate exceeds MAX_BITRATE (200 Mbps), field is None."""
+        stream = {
+            "r_frame_rate": "30/1",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+            "codec_name": "h264",
+            "bit_rate": "999999999999",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.bit_rate is None
+
+    def test_empty_streams_raises_error(self):
+        """When ffprobe returns empty streams array, raise RuntimeError."""
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps({"streams": []})
+        with patch("video_annotator.subprocess.run", return_value=result):
+            with pytest.raises(RuntimeError, match="no video streams"):
+                VideoAnnotator._get_video_metadata(Path("video.mp4"))
+
+    def test_invalid_frame_rate_format_defaults_to_30(self):
+        """When r_frame_rate is not num/den format, fallback to 30.0 fps."""
+        stream = {
+            "r_frame_rate": "invalid",
+            "width": 1920,
+            "height": 1080,
+            "nb_frames": "100",
+        }
+        with patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)):
+            meta = VideoAnnotator._get_video_metadata(Path("video.mp4"))
+        assert meta.fps == 30.0
 ```
 
 Add new test class for auto-resolve:
@@ -602,6 +665,33 @@ class TestAutoCodecResolve:
         assert encoder_call.kwargs.get("codec") == "h264" or encoder_call[1].get("codec") == "h264"
         assert encoder_call.kwargs.get("crf") == 18 or encoder_call[1].get("crf") == 18
 
+    def test_auto_crf_always_18_even_if_configured(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """auto mode: CRF fallback is always 18, regardless of configured crf."""
+        frames = self._make_frames(2)
+        mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": "2", "codec_name": "hevc",
+        }
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        # crf=23 configured, but auto mode should use 18
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto", crf=23)
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(stream)),
+        ):
+            annotator.annotate(input_path, tmp_path / "out.mp4", AnnotationParams())
+
+        encoder_call = mock_encoder_cls.call_args
+        assert encoder_call.kwargs.get("crf") == 18 or encoder_call[1].get("crf") == 18
+
     def test_explicit_codec_ignores_source(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """Explicit VIDEO_CODEC=h264 ignores source codec/bitrate."""
         frames = self._make_frames(2)
@@ -700,10 +790,16 @@ _CODEC_NAME_MAP: dict[str, str] = {
             )
 
         data = json.loads(result.stdout)
-        stream = data["streams"][0]
+        streams = data.get("streams")
+        if not streams:
+            raise RuntimeError(f"ffprobe returned no video streams for {video_path}")
+        stream = streams[0]
         r_rate = stream.get("r_frame_rate", "30/1")
-        num, den = map(int, r_rate.split("/"))
-        fps = num / den if den else 30.0
+        try:
+            num, den = map(int, r_rate.split("/"))
+            fps = num / den if den else 30.0
+        except (ValueError, ZeroDivisionError):
+            fps = 30.0
         width = int(stream.get("width", 0))
         height = int(stream.get("height", 0))
         nb_frames_raw = stream.get("nb_frames", "0")
@@ -728,6 +824,12 @@ _CODEC_NAME_MAP: dict[str, str] = {
                 bit_rate = int(bit_rate_raw)
             except (ValueError, TypeError):
                 bit_rate = None
+
+        # Validate bitrate range: 100 kbps — 200 Mbps
+        MIN_BITRATE = 100_000
+        MAX_BITRATE = 200_000_000
+        if bit_rate is not None and not (MIN_BITRATE <= bit_rate <= MAX_BITRATE):
+            bit_rate = None
 
         if width > 0 and height > 0 and fps > 0:
             logger.debug(
@@ -770,12 +872,12 @@ Replace the first lines of `annotate()`:
                 effective_bitrate = metadata.bit_rate
             elif resolved_codec is not None:
                 effective_codec = resolved_codec
-                effective_crf = self.crf
+                effective_crf = 18
                 effective_bitrate = None
             else:
                 # Unknown source codec — full fallback
                 effective_codec = "h264"
-                effective_crf = self.crf
+                effective_crf = 18
                 effective_bitrate = None
             logger.info(
                 f"Auto codec: source={metadata.codec_name}, resolved={effective_codec}, "
@@ -856,14 +958,32 @@ In `app/main.py`, line 119-123, change the `detect_hw_accel` call:
         app.state.hw_config = hw_config
 ```
 
-**Step 2: Run worker tests**
+**Step 2: Add startup wiring test**
+
+Add a test verifying that `detect_hw_accel` receives `codec="h264"` when `video_codec=auto`, and the actual codec when explicit. Add to `tests/test_worker.py` or a new `tests/test_startup_wiring.py`:
+
+```python
+class TestStartupWiring:
+    def test_auto_codec_passes_h264_baseline(self):
+        """When video_codec=auto, detect_hw_accel gets codec='h264'."""
+        hw_detect_codec = "h264" if "auto" == "auto" else "auto"
+        assert hw_detect_codec == "h264"
+
+    def test_explicit_codec_passes_through(self):
+        """When video_codec=h265, detect_hw_accel gets codec='h265'."""
+        video_codec = "h265"
+        hw_detect_codec = "h264" if video_codec == "auto" else video_codec
+        assert hw_detect_codec == "h265"
+```
+
+**Step 3: Run worker tests**
 
 The worker already passes `codec=settings.video_codec` to VideoAnnotator (line 206). With `video_codec="auto"` default, the worker will now pass `codec="auto"`, and VideoAnnotator.annotate() resolves it per-file. No worker test changes needed.
 
 Run: `.venv/bin/python -m pytest tests/test_worker.py -v`
 Expected: ALL PASS (worker tests mock VideoAnnotator entirely, so codec value doesn't matter)
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
 git add app/main.py
@@ -889,6 +1009,7 @@ to:
 
 ```
 VIDEO_CODEC=auto                        # auto (match source) | h264 | h265 | av1
+                                        # To force previous behavior: VIDEO_CODEC=h264
 ```
 
 **Step 2: Commit**

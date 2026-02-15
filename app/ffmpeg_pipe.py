@@ -24,7 +24,7 @@ def _drain_stderr(process: subprocess.Popen, collected: deque[bytes]) -> None:
 def _format_stderr(lines: deque[bytes], max_lines: int = 10) -> str:
     """Decode last N stderr lines for error messages."""
     tail = list(lines)[-max_lines:]
-    return b"".join(tail).decode("utf-8", errors="replace")[:500]
+    return b"".join(tail).decode("utf-8", errors="replace")[:2000]
 
 
 class FFmpegDecoder:
@@ -89,6 +89,9 @@ class FFmpegDecoder:
         except subprocess.TimeoutExpired:
             self._process.kill()
             self._process.wait(timeout=5)
+        stderr_output = _format_stderr(self._stderr_lines, max_lines=50)
+        if stderr_output:
+            logger.debug(f"FFmpeg decoder stderr:\n{stderr_output}")
         if self._process.returncode and self._process.returncode != 0:
             logger.warning(f"FFmpeg decoder exited with code {self._process.returncode}")
 
@@ -172,10 +175,13 @@ class FFmpegEncoder:
         except subprocess.TimeoutExpired:
             self._process.kill()
             self._process.wait(timeout=10)
+        stderr_output = _format_stderr(self._stderr_lines, max_lines=50)
+        if stderr_output:
+            logger.debug(f"FFmpeg encoder stderr:\n{stderr_output}")
         if self._process.returncode and self._process.returncode != 0:
             raise RuntimeError(
                 f"FFmpeg encoder failed (rc={self._process.returncode}): "
-                f"{_format_stderr(self._stderr_lines)}"
+                f"{stderr_output}"
             )
 
     def __enter__(self):

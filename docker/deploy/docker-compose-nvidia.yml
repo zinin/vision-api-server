@@ -12,6 +12,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       VIDEO_CODEC: ${VIDEO_CODEC:-auto}
       VIDEO_CRF: ${VIDEO_CRF:-18}
+      VIDEO_HW_ACCEL: ${VIDEO_HW_ACCEL:-nvidia}
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     deploy:

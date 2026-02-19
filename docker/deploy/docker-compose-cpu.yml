@@ -10,6 +10,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       VIDEO_CODEC: ${VIDEO_CODEC:-auto}
       VIDEO_CRF: ${VIDEO_CRF:-18}
+      VIDEO_HW_ACCEL: cpu
     volumes:
       - models:/models
     restart: unless-stopped

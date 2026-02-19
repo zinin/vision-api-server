@@ -11,6 +11,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       VIDEO_CODEC: ${VIDEO_CODEC:-auto}
       VIDEO_CRF: ${VIDEO_CRF:-18}
+      VIDEO_HW_ACCEL: ${VIDEO_HW_ACCEL:-amd}
       HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
       YOLO_DEVICE: 'cuda:0'
     restart: unless-stopped

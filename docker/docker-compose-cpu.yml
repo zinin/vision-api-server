@@ -11,6 +11,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - VIDEO_CODEC=${VIDEO_CODEC:-auto}
       - VIDEO_CRF=${VIDEO_CRF:-18}
+      - VIDEO_HW_ACCEL=cpu
       - YOLO_DEVICE=cpu
     restart: unless-stopped
     healthcheck:

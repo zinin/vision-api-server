@@ -156,16 +156,16 @@ flowchart TB
         E3["/detect/video/visualize"]
     end
 
-    E1 --> TPE["ThreadPoolExecutor\n(YOLO inference)"]
+    E1 --> TPE["ThreadPoolExecutor<br/>(YOLO inference)"]
     E2 --> FFE["FFmpeg Scene Detection"]
     E2 --> TPE
-    E3 --> JM["JobManager\n(async queue)"]
+    E3 --> JM["JobManager<br/>(async queue)"]
 
-    TPE --> MM["ModelManager\n(two-tier cache)"]
-    JM --> VA["VideoAnnotator\n(YOLO every Nth frame + hold mode)"]
+    TPE --> MM["ModelManager<br/>(two-tier cache)"]
+    JM --> VA["VideoAnnotator<br/>(YOLO every Nth frame + hold mode)"]
     VA --> MM
-    VA --> FP["FFmpeg Pipe\n(decode → encode)"]
-    FP --> HW["HW Acceleration\nNVIDIA (NVENC) · AMD (VAAPI) · CPU"]
+    VA --> FP["FFmpeg Pipe<br/>(decode → encode)"]
+    FP --> HW["HW Acceleration<br/>NVIDIA (NVENC) · AMD (VAAPI) · CPU"]
 ```
 
 ### Key Design Decisions

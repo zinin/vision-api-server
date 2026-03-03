@@ -222,4 +222,7 @@ python -m pytest tests/ -v
 
 ## License
 
-All rights reserved.
+Copyright (C) 2026 Alexander Zinin <mail@zinin.ru>
+
+Licensed under the GNU Affero General Public License v3.0 or later
+(AGPL-3.0-or-later). See `LICENSE`.

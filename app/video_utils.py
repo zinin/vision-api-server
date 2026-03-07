@@ -101,12 +101,11 @@ class VideoFrameExtractor:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError as e:
-            logger.error(f"ffprobe failed for video: {video_path}")
-            logger.error(f"ffprobe stderr: {e.stderr}")
-            logger.error(f"ffprobe stdout: {e.stdout}")
-            raise RuntimeError(
-                f"Failed to get video info: ffprobe returned exit code {e.returncode}. "
-                f"stderr: {e.stderr.strip()}"
+            logger.warning(f"ffprobe failed for video: {video_path}")
+            logger.warning(f"ffprobe stderr: {e.stderr}")
+            raise ValueError(
+                "File could not be read as a valid video. "
+                "The file may be corrupted or not a supported video format."
             ) from e
 
         output = result.stdout.strip()
@@ -227,6 +226,12 @@ class VideoFrameExtractor:
             f"resolution={video_info.width}x{video_info.height}, "
             f"mid_time={mid_time:.2f}s"
         )
+
+        if video_info.width == 0 or video_info.height == 0:
+            raise ValueError(
+                "File contains no video stream. "
+                "Only audio or metadata streams were found."
+            )
 
         # Create temp directory if not provided
         cleanup_dir = output_dir is None

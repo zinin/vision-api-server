@@ -507,6 +507,8 @@ async def detect_objects_in_video(
             min_interval=min_interval,
             max_frames=max_frames
         )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(
             status_code=500,
@@ -669,6 +671,8 @@ async def extract_video_frames(
             min_interval=min_interval,
             max_frames=max_frames
         )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(
             status_code=500,

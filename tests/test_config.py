@@ -55,3 +55,50 @@ class TestVideoCodecAuto:
     def test_invalid_codec_rejected(self):
         with pytest.raises(ValidationError):
             Settings(yolo_models='{}', video_codec="vp9")
+
+
+class TestStabilizerSettings:
+    def test_defaults(self):
+        s = Settings(yolo_models='{}')
+        assert s.stabilizer_conf_factor == 0.4
+        assert s.stabilizer_iou_threshold == 0.3
+        assert s.stabilizer_min_vote_conf == 0.3
+        assert s.stabilizer_grace_center == 2.0
+        assert s.stabilizer_grace_edge == 0.5
+        assert s.stabilizer_center_zone == 0.6
+        assert s.stabilizer_max_staleness == 5.0
+
+    def test_custom_values(self):
+        s = Settings(
+            yolo_models='{}',
+            stabilizer_conf_factor=0.3,
+            stabilizer_iou_threshold=0.5,
+            stabilizer_grace_center=3.0,
+        )
+        assert s.stabilizer_conf_factor == 0.3
+        assert s.stabilizer_iou_threshold == 0.5
+        assert s.stabilizer_grace_center == 3.0
+
+    def test_conf_factor_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            Settings(yolo_models='{}', stabilizer_conf_factor=0.0)
+
+    def test_conf_factor_must_be_lte_1(self):
+        with pytest.raises(ValidationError):
+            Settings(yolo_models='{}', stabilizer_conf_factor=1.5)
+
+    def test_iou_threshold_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            Settings(yolo_models='{}', stabilizer_iou_threshold=0.0)
+
+    def test_max_staleness_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            Settings(yolo_models='{}', stabilizer_max_staleness=0.0)
+
+    def test_grace_non_negative(self):
+        s = Settings(yolo_models='{}', stabilizer_grace_center=0.0, stabilizer_grace_edge=0.0)
+        assert s.stabilizer_grace_center == 0.0
+
+    def test_grace_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            Settings(yolo_models='{}', stabilizer_grace_center=-1.0)

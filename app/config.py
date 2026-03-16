@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     video_hw_accel: str = "auto"  # auto | nvidia | amd | cpu
     vaapi_device: str = "/dev/dri/renderD128"  # VAAPI render device path
 
+    # Detection stabilizer settings
+    stabilizer_conf_factor: float = Field(default=0.4, gt=0, le=1)
+    stabilizer_iou_threshold: float = Field(default=0.3, gt=0, le=1)
+    stabilizer_min_vote_conf: float = Field(default=0.3, ge=0, le=1)
+    stabilizer_grace_center: float = Field(default=2.0, ge=0)
+    stabilizer_grace_edge: float = Field(default=0.5, ge=0)
+    stabilizer_center_zone: float = Field(default=0.6, gt=0, le=1)
+    stabilizer_max_staleness: float = Field(default=5.0, gt=0)
+
     @property
     def preload_model_map(self) -> dict[str, str]:
         """Parse YOLO_MODELS JSON into model->device mapping."""

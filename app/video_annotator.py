@@ -8,6 +8,12 @@ from typing import Any, Callable
 
 import numpy as np
 
+from detection_stabilizer import (
+    DetectionStabilizer,
+    RawDetection,
+    StabilizedFrame,
+    StabilizerConfig,
+)
 from ffmpeg_pipe import FFmpegDecoder, FFmpegEncoder
 from hw_accel import HWAccelConfig
 from visualization import DetectionVisualizer, DetectionBox
@@ -113,6 +119,7 @@ class VideoAnnotator:
         hw_config: HWAccelConfig,
         codec: str = "h264",
         crf: int = 18,
+        stabilizer_config: StabilizerConfig | None = None,
     ):
         self.model = model
         self.visualizer = visualizer
@@ -120,6 +127,7 @@ class VideoAnnotator:
         self.hw_config = hw_config
         self.codec = codec
         self.crf = crf
+        self.stabilizer_config = stabilizer_config or StabilizerConfig()
 
     def annotate(
         self,
@@ -129,7 +137,11 @@ class VideoAnnotator:
         progress_callback: Callable[[int], None] | None = None,
     ) -> AnnotationStats:
         """
-        Annotate video with bounding boxes.
+        Annotate video with bounding boxes using two-pass decode pipeline.
+
+        Pass 1: decode video + run YOLO (no frames saved to disk).
+        Stabilize detections across tracks.
+        Pass 2: decode video again + render stabilized detections.
 
         This is a blocking method — run in a thread pool from async code.
 
@@ -141,29 +153,8 @@ class VideoAnnotator:
         """
         metadata = self._get_video_metadata(input_path)
 
-        # Resolve effective codec and quality from source when auto
-        if self.codec == "auto":
-            resolved_codec = _CODEC_NAME_MAP.get(metadata.codec_name, None)
-            if resolved_codec is not None and metadata.bit_rate is not None:
-                effective_codec = resolved_codec
-                effective_crf = None
-                effective_bitrate = metadata.bit_rate
-            elif resolved_codec is not None:
-                effective_codec = resolved_codec
-                effective_crf = 18
-                effective_bitrate = None
-            else:
-                effective_codec = "h264"
-                effective_crf = 18
-                effective_bitrate = None
-            logger.info(
-                f"Auto codec: source={metadata.codec_name}, resolved={effective_codec}, "
-                f"bitrate={effective_bitrate}, crf={effective_crf}"
-            )
-        else:
-            effective_codec = self.codec
-            effective_crf = self.crf
-            effective_bitrate = None
+        # Resolve codec (unchanged logic)
+        effective_codec, effective_crf, effective_bitrate = self._resolve_codec(metadata)
 
         model_name = getattr(self.model, "model_name", None) or getattr(self.model, "ckpt_path", "unknown")
         model_device = getattr(self.model, "device", "unknown")
@@ -175,16 +166,93 @@ class VideoAnnotator:
         )
 
         stats = AnnotationStats(total_frames=metadata.total_frames)
-        current_detections: list[DetectionBox] = []
-        font_scale = self.visualizer.calculate_adaptive_font_scale(metadata.height)
-        frame_num = 0
         start_time = time.perf_counter()
 
-        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder, \
-             FFmpegEncoder(input_path, output_path, metadata.width, metadata.height, metadata.fps,
-                           self.hw_config, effective_codec,
-                           crf=effective_crf, bitrate=effective_bitrate) as encoder:
+        # Pass 1: decode + YOLO (no frames saved to disk)
+        yolo_conf = params.conf * self.stabilizer_config.conf_factor
+        raw_detections, actual_frames = self._pass1_collect(
+            input_path, metadata, params, yolo_conf,
+            progress_callback, stats,
+        )
+        stats.total_frames = actual_frames
 
+        # Stabilize
+        stabilizer = DetectionStabilizer(self.stabilizer_config)
+        stabilized = stabilizer.stabilize(
+            raw_detections,
+            frame_width=metadata.width,
+            frame_height=metadata.height,
+            fps=metadata.fps,
+            total_frames=actual_frames,
+            detect_every=params.detect_every,
+            conf_threshold=params.conf,
+        )
+
+        # Apply class filter after stabilization (filter by stable_class)
+        if params.classes:
+            stabilized = {
+                fn: StabilizedFrame(
+                    detections=[d for d in sf.detections if d.class_name in params.classes]
+                )
+                for fn, sf in stabilized.items()
+                if any(d.class_name in params.classes for d in sf.detections)
+            }
+
+        # Count stats from stabilized output
+        for frame_num in range(actual_frames):
+            if frame_num in stabilized:
+                stats.total_detections += len(stabilized[frame_num].detections)
+                if frame_num % params.detect_every != 0:
+                    stats.tracked_frames += 1
+
+        # Pass 2: decode again + render
+        font_scale = self.visualizer.calculate_adaptive_font_scale(metadata.height)
+        self._pass2_render(
+            input_path, output_path, metadata, params, stabilized,
+            effective_codec, effective_crf, effective_bitrate,
+            font_scale, actual_frames, progress_callback,
+        )
+
+        stats.processing_time_ms = int((time.perf_counter() - start_time) * 1000)
+        fps_actual = actual_frames / max(stats.processing_time_ms / 1000, 0.001)
+        logger.info(
+            f"Frame processing complete: {actual_frames} frames in {stats.processing_time_ms}ms "
+            f"({fps_actual:.1f} fps), detected={stats.detected_frames}, "
+            f"tracked={stats.tracked_frames}, total_detections={stats.total_detections}"
+        )
+        return stats
+
+    def _resolve_codec(self, metadata: VideoMetadata):
+        """Resolve effective codec, crf, and bitrate. Returns (codec, crf, bitrate)."""
+        if self.codec == "auto":
+            resolved_codec = _CODEC_NAME_MAP.get(metadata.codec_name, None)
+            if resolved_codec is not None and metadata.bit_rate is not None:
+                result = (resolved_codec, None, metadata.bit_rate)
+            elif resolved_codec is not None:
+                result = (resolved_codec, 18, None)
+            else:
+                result = ("h264", 18, None)
+            logger.info(
+                f"Auto codec: source={metadata.codec_name}, resolved={result[0]}, "
+                f"bitrate={result[2]}, crf={result[1]}"
+            )
+            return result
+        return self.codec, self.crf, None
+
+    def _pass1_collect(
+        self,
+        input_path: Path,
+        metadata: VideoMetadata,
+        params: AnnotationParams,
+        yolo_conf: float,
+        progress_callback: Callable[[int], None] | None,
+        stats: AnnotationStats,
+    ) -> tuple[dict[int, list[RawDetection]], int]:
+        """Pass 1: decode frames, run YOLO, collect raw detections (no disk cache)."""
+        raw_detections: dict[int, list[RawDetection]] = {}
+        frame_num = 0
+
+        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder:
             while True:
                 frame = decoder.read_frame()
                 if frame is None:
@@ -193,45 +261,24 @@ class VideoAnnotator:
                 if frame_num % params.detect_every == 0:
                     results = self.model.predict(
                         source=frame,
-                        conf=params.conf,
+                        conf=yolo_conf,
                         imgsz=params.imgsz,
                         max_det=params.max_det,
                         verbose=False,
                     )
-                    current_detections = self._extract_detections(
-                        results, params.classes
-                    )
+                    # No class filter here — all classes go to stabilizer
+                    dets = self._extract_raw_detections(results, frame_num, class_filter=None)
+                    if dets:
+                        raw_detections[frame_num] = dets
                     stats.detected_frames += 1
-                    stats.total_detections += len(current_detections)
-                    logger.debug(
-                        f"Frame {frame_num}: YOLO detected "
-                        f"{len(current_detections)} objects"
-                    )
-                else:
-                    stats.tracked_frames += 1
-                    stats.total_detections += len(current_detections)
 
-                self._draw_detections(frame, current_detections, params, font_scale)
-                encoder.write_frame(frame)
                 frame_num += 1
 
                 if progress_callback and metadata.total_frames > 0 and frame_num % 10 == 0:
-                    progress = int((frame_num / metadata.total_frames) * 100)
-                    progress_callback(min(progress, 99))
+                    progress = int((frame_num / metadata.total_frames) * 80)
+                    progress_callback(min(progress, 80))
 
-        stats.total_frames = frame_num
-        stats.processing_time_ms = int(
-            (time.perf_counter() - start_time) * 1000
-        )
-
-        fps_actual = frame_num / max(stats.processing_time_ms / 1000, 0.001)
-        logger.info(
-            f"Frame processing complete: {frame_num} frames in {stats.processing_time_ms}ms "
-            f"({fps_actual:.1f} fps), detected={stats.detected_frames}, "
-            f"tracked={stats.tracked_frames}, total_detections={stats.total_detections}"
-        )
-
-        return stats
+        return raw_detections, frame_num
 
     @staticmethod
     def _get_video_metadata(video_path: Path) -> VideoMetadata:
@@ -313,9 +360,10 @@ class VideoAnnotator:
             f"for {video_path}"
         )
 
-    def _extract_detections(
-        self, results: list, class_filter: list[str] | None
-    ) -> list[DetectionBox]:
+    def _extract_raw_detections(
+        self, results: list, frame_num: int, class_filter: list[str] | None
+    ) -> list[RawDetection]:
+        """Extract RawDetection list from YOLO results with optional class filter."""
         detections = []
         for result in results:
             if result.boxes is None or len(result.boxes) == 0:
@@ -325,23 +373,55 @@ class VideoAnnotator:
             conf = result.boxes.conf.cpu().numpy()
             for i in range(len(cls)):
                 class_id = int(cls[i])
-                class_name = self.class_names.get(
-                    class_id, f"class_{class_id}"
-                )
+                class_name = self.class_names.get(class_id, f"class_{class_id}")
                 if class_filter and class_name not in class_filter:
                     continue
-                detections.append(
-                    DetectionBox(
-                        x1=int(xyxy[i][0]),
-                        y1=int(xyxy[i][1]),
-                        x2=int(xyxy[i][2]),
-                        y2=int(xyxy[i][3]),
-                        class_id=class_id,
-                        class_name=class_name,
-                        confidence=float(conf[i]),
-                    )
-                )
+                detections.append(RawDetection(
+                    frame_num=frame_num,
+                    x1=int(xyxy[i][0]), y1=int(xyxy[i][1]),
+                    x2=int(xyxy[i][2]), y2=int(xyxy[i][3]),
+                    class_id=class_id, class_name=class_name,
+                    confidence=float(conf[i]),
+                ))
         return detections
+
+    def _pass2_render(
+        self,
+        input_path: Path,
+        output_path: Path,
+        metadata: VideoMetadata,
+        params: AnnotationParams,
+        stabilized: dict[int, StabilizedFrame],
+        effective_codec: str,
+        effective_crf: int | None,
+        effective_bitrate: int | None,
+        font_scale: float,
+        total_frames: int,
+        progress_callback: Callable[[int], None] | None,
+    ) -> None:
+        """Pass 2: decode video again, draw stabilized detections, encode."""
+        frame_num = 0
+
+        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder, \
+             FFmpegEncoder(input_path, output_path, metadata.width, metadata.height,
+                           metadata.fps, self.hw_config, effective_codec,
+                           crf=effective_crf, bitrate=effective_bitrate) as encoder:
+
+            while True:
+                frame = decoder.read_frame()
+                if frame is None:
+                    break
+
+                if frame_num in stabilized:
+                    self._draw_detections(frame, stabilized[frame_num].detections,
+                                          params, font_scale)
+
+                encoder.write_frame(frame)
+                frame_num += 1
+
+                if progress_callback and total_frames > 0 and frame_num % 10 == 0:
+                    progress = 80 + int((frame_num / total_frames) * 19)
+                    progress_callback(min(progress, 99))
 
     def _draw_detections(
         self,

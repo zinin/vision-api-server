@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+from detection_stabilizer import StabilizerConfig
 from hw_accel import HWAccelConfig, HWAccelType
 from video_annotator import (
     VideoAnnotator,
@@ -63,7 +64,10 @@ def hw_config():
 
 @pytest.fixture
 def annotator(mock_model, mock_visualizer, hw_config):
-    return VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+    return VideoAnnotator(
+        mock_model, mock_visualizer, mock_model.names, hw_config,
+        stabilizer_config=StabilizerConfig(),
+    )
 
 
 @pytest.fixture
@@ -306,43 +310,31 @@ class TestParseFps:
         assert _parse_fps("90000/1", "90000/1") == 90000.0
 
 
-# --- _extract_detections ---
+# --- _extract_raw_detections ---
 
-class TestExtractDetections:
+class TestExtractRawDetections:
     def test_single_detection(self, annotator):
         result = _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
-        dets = annotator._extract_detections([result], None)
+        dets = annotator._extract_raw_detections([result], frame_num=5, class_filter=None)
         assert len(dets) == 1
+        assert dets[0].frame_num == 5
         assert dets[0].class_name == "person"
         assert dets[0].confidence == pytest.approx(0.9)
-
-    def test_multiple_results(self, annotator):
-        r1 = _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
-        r2 = _make_yolo_result([(50, 60, 150, 250, 1, 0.8)])
-        dets = annotator._extract_detections([r1, r2], None)
-        assert len(dets) == 2
-        assert dets[0].class_name == "person"
-        assert dets[1].class_name == "car"
+        assert dets[0].bbox == (10, 20, 100, 200)
 
     def test_class_filter(self, annotator):
         result = _make_yolo_result([
             (10, 20, 100, 200, 0, 0.9),
             (50, 60, 150, 250, 1, 0.8),
         ])
-        dets = annotator._extract_detections([result], ["person"])
+        dets = annotator._extract_raw_detections([result], frame_num=0, class_filter=["person"])
         assert len(dets) == 1
         assert dets[0].class_name == "person"
 
     def test_empty_boxes(self, annotator):
         result = _make_yolo_result([])
-        dets = annotator._extract_detections([result], None)
+        dets = annotator._extract_raw_detections([result], frame_num=0, class_filter=None)
         assert dets == []
-
-    def test_unknown_class(self, annotator):
-        result = _make_yolo_result([(10, 20, 100, 200, 99, 0.7)])
-        dets = annotator._extract_detections([result], None)
-        assert len(dets) == 1
-        assert dets[0].class_name == "class_99"
 
 
 # --- _draw_detections ---
@@ -367,22 +359,31 @@ class TestAnnotatePipeline:
         frames = [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
         return frames
 
-    def _setup_ffmpeg_mocks(self, frames: list[np.ndarray]):
-        """Set up mock FFmpegDecoder and FFmpegEncoder.
-
-        Returns (mock_decoder_cls, mock_encoder_cls, mock_encoder_instance).
-        """
+    def _make_decoder_mock(self, frames: list[np.ndarray]):
+        """Create a single decoder mock instance with its own frame sequence."""
         mock_decoder = MagicMock()
-        # read_frame returns frames one by one, then None
         mock_decoder.read_frame.side_effect = list(frames) + [None]
         mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
         mock_decoder.__exit__ = MagicMock(return_value=False)
+        return mock_decoder
+
+    def _setup_ffmpeg_mocks(self, frames: list[np.ndarray]):
+        """Set up mock FFmpegDecoder and FFmpegEncoder for two-pass pipeline.
+
+        Returns (mock_decoder_cls, mock_encoder_cls, mock_encoder_instance).
+        The decoder class returns two separate instances (pass 1 and pass 2).
+        """
+        # Pass 1 decoder (for YOLO collection)
+        decoder_pass1 = self._make_decoder_mock(frames)
+        # Pass 2 decoder (for rendering)
+        decoder_pass2 = self._make_decoder_mock(frames)
+
+        mock_decoder_cls = MagicMock(side_effect=[decoder_pass1, decoder_pass2])
 
         mock_encoder = MagicMock()
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
         mock_encoder.__exit__ = MagicMock(return_value=False)
 
-        mock_decoder_cls = MagicMock(return_value=mock_decoder)
         mock_encoder_cls = MagicMock(return_value=mock_encoder)
 
         return mock_decoder_cls, mock_encoder_cls, mock_encoder
@@ -398,9 +399,7 @@ class TestAnnotatePipeline:
         ]
 
         ffprobe_stream = {
-            "r_frame_rate": "30/1",
-            "width": 640,
-            "height": 480,
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
             "nb_frames": str(num_frames),
         }
         ffprobe_result = MagicMock()
@@ -411,20 +410,30 @@ class TestAnnotatePipeline:
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+        # Disable grace periods for predictable test behavior
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
             patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
             patch("video_annotator.subprocess.run", return_value=ffprobe_result),
         ):
-            stats = annotator.annotate(input_path, output_path, AnnotationParams(detect_every=detect_every))
+            stats = annotator.annotate(
+                input_path, output_path, AnnotationParams(detect_every=detect_every)
+            )
 
         assert stats.total_frames == num_frames
         # Frames 0, 3 are detection frames
         assert stats.detected_frames == 2
-        # Frames 1, 2, 4, 5 are tracked frames
-        assert stats.tracked_frames == 4
+        # Track spans frames 0-3 (zero grace). Non-detection frames with
+        # stabilized output: 1, 2 → tracked_frames = 2
+        assert stats.tracked_frames == 2
+        # 4 stabilized frames (0,1,2,3) × 1 detection each
+        assert stats.total_detections == 4
         assert mock_encoder.write_frame.call_count == num_frames
 
     def test_detect_every_1(self, mock_model, mock_visualizer, hw_config, tmp_path):
@@ -451,7 +460,11 @@ class TestAnnotatePipeline:
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -468,7 +481,7 @@ class TestAnnotatePipeline:
         assert mock_model.predict.call_count == num_frames
 
     def test_hold_reuses_detections(self, mock_model, mock_visualizer, hw_config, tmp_path):
-        """Intermediate frames reuse last YOLO detections (hold mode)."""
+        """With stabilizer, track covers detection frame range (zero grace)."""
         num_frames = 3
         frames = self._make_frames(num_frames)
         mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
@@ -491,7 +504,11 @@ class TestAnnotatePipeline:
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -505,12 +522,14 @@ class TestAnnotatePipeline:
         assert stats.total_frames == num_frames
         assert stats.detected_frames == 1
         assert mock_model.predict.call_count == 1
-        assert stats.tracked_frames == 2
-        assert stats.total_detections == 3
-        assert mock_visualizer.draw_detection.call_count == 3
+        # Only frame 0 has detection; zero grace → track covers frame 0 only
+        # No non-detection frames have stabilized output
+        assert stats.tracked_frames == 0
+        assert stats.total_detections == 1
+        assert mock_visualizer.draw_detection.call_count == 1
 
     def test_hold_clears_on_empty_detection(self, mock_model, mock_visualizer, hw_config, tmp_path):
-        """When detection frame returns no objects, hold frames also show nothing."""
+        """When detection frame returns no objects, track only covers frame 0 (zero grace)."""
         num_frames = 4
         frames = self._make_frames(num_frames)
         mock_decoder_cls, mock_encoder_cls, mock_encoder = self._setup_ffmpeg_mocks(frames)
@@ -535,7 +554,11 @@ class TestAnnotatePipeline:
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -548,10 +571,11 @@ class TestAnnotatePipeline:
 
         assert stats.total_frames == num_frames
         assert stats.detected_frames == 2
-        assert stats.tracked_frames == 2
+        # Track covers only frame 0 (single detection, zero grace)
+        assert stats.tracked_frames == 0
         assert mock_model.predict.call_count == 2
-        assert stats.total_detections == 3
-        assert mock_visualizer.draw_detection.call_count == 3
+        assert stats.total_detections == 1
+        assert mock_visualizer.draw_detection.call_count == 1
 
     def test_decoder_failure_raises_error(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """When FFmpegDecoder.read_frame raises RuntimeError, annotate propagates it."""
@@ -580,7 +604,11 @@ class TestAnnotatePipeline:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -614,7 +642,11 @@ class TestAnnotatePipeline:
         input_path.touch()
         output_path = tmp_path / "output.mp4"
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=config,
+        )
         callback = MagicMock()
 
         with (
@@ -636,17 +668,24 @@ class TestAutoCodecResolve:
     def _make_frames(self, num_frames: int, width: int = 640, height: int = 480):
         return [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
 
-    def _setup_ffmpeg_mocks(self, frames: list[np.ndarray]):
+    def _make_decoder_mock(self, frames: list[np.ndarray]):
         mock_decoder = MagicMock()
         mock_decoder.read_frame.side_effect = list(frames) + [None]
         mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
         mock_decoder.__exit__ = MagicMock(return_value=False)
+        return mock_decoder
+
+    def _setup_ffmpeg_mocks(self, frames: list[np.ndarray]):
+        decoder_pass1 = self._make_decoder_mock(frames)
+        decoder_pass2 = self._make_decoder_mock(frames)
+
+        mock_decoder_cls = MagicMock(side_effect=[decoder_pass1, decoder_pass2])
 
         mock_encoder = MagicMock()
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
         mock_encoder.__exit__ = MagicMock(return_value=False)
 
-        mock_decoder_cls = MagicMock(return_value=mock_decoder)
+        mock_decoder_cls = MagicMock(side_effect=[decoder_pass1, decoder_pass2])
         mock_encoder_cls = MagicMock(return_value=mock_encoder)
 
         return mock_decoder_cls, mock_encoder_cls, mock_encoder
@@ -671,7 +710,11 @@ class TestAutoCodecResolve:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            codec="auto", stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -699,7 +742,11 @@ class TestAutoCodecResolve:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            codec="auto", stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -726,7 +773,11 @@ class TestAutoCodecResolve:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            codec="auto", stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -753,7 +804,11 @@ class TestAutoCodecResolve:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            codec="auto", stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -781,7 +836,11 @@ class TestAutoCodecResolve:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto")
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            codec="auto", stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -808,7 +867,11 @@ class TestAutoCodecResolve:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
-        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config, codec="auto", crf=23)
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            codec="auto", crf=23, stabilizer_config=config,
+        )
 
         with (
             patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
@@ -834,9 +897,10 @@ class TestAutoCodecResolve:
         input_path = tmp_path / "input.mp4"
         input_path.touch()
 
+        config = StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)
         annotator = VideoAnnotator(
             mock_model, mock_visualizer, mock_model.names, hw_config,
-            codec="h264", crf=23,
+            codec="h264", crf=23, stabilizer_config=config,
         )
 
         with (

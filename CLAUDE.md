@@ -33,6 +33,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/ffmpeg_pipe.py` | FFmpeg pipe-based video decoder/encoder |
 | `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
 | `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
+| `app/detection_stabilizer.py` | Detection track stabilizer, IoU matching, class voting |
 
 ## Endpoints
 
@@ -55,6 +56,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 YOLO_MODELS='{"yolo26s.pt":"cuda:0"}'  # JSON: model->device
 YOLO_DEVICE=cuda                        # Default device for dynamic loads
 YOLO_MODEL_TTL=900                      # Cache TTL seconds (min 60)
+MODELS_DIR=/models                      # Model files directory (Docker volume)
 MAX_FILE_SIZE=10485760                  # Max image size (default 10MB)
 MAX_EXECUTOR_WORKERS=4                  # ThreadPool workers
 INFERENCE_TIMEOUT=30.0                  # Timeout seconds
@@ -68,6 +70,13 @@ VIDEO_CODEC=auto                        # auto (match source) | h264 | h265 | av
 VIDEO_CRF=18                            # Quality: 0=lossless, 18=near-lossless, 23=default
 VIDEO_HW_ACCEL=auto                     # auto | nvidia | amd | cpu
 VAAPI_DEVICE=/dev/dri/renderD128        # VAAPI render device path
+STABILIZER_CONF_FACTOR=0.4      # YOLO conf multiplier for stabilizer (0-1]
+STABILIZER_IOU_THRESHOLD=0.3    # IoU threshold for track matching (0-1]
+STABILIZER_MIN_VOTE_CONF=0.3    # Min conf for class voting [0-1]
+STABILIZER_GRACE_CENTER=2.0     # Grace period seconds, object in center
+STABILIZER_GRACE_EDGE=0.5       # Grace period seconds, object at edge
+STABILIZER_CENTER_ZONE=0.6      # Frame fraction considered "center" (0-1]
+STABILIZER_MAX_STALENESS=5.0    # Max seconds before track becomes stale
 ```
 
 ## Testing
@@ -92,6 +101,8 @@ Tests cover config, Pydantic models, JobManager, and VideoAnnotator (mocked YOLO
 **Smart Frames**: FFmpeg scene detection with fallback to interval-based extraction.
 
 **Video Annotation**: Async job API — YOLO every Nth frame + hold mode (reuse detections) for intermediate frames. Single worker, in-memory job state (requires `workers=1`).
+
+**Detection Stabilizer**: Two-pass decode pipeline. Pass 1 decodes video + collects YOLO detections with lowered conf (no disk cache). DetectionStabilizer links detections into tracks via IoU, votes on stable class, fills gaps bidirectionally with position-aware grace periods. Pass 2 decodes video again + renders stabilized boxes. Class filtering applied after stabilization.
 
 ## Limits
 

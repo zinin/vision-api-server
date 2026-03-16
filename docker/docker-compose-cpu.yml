@@ -13,6 +13,9 @@ services:
       - VIDEO_CRF=${VIDEO_CRF:-18}
       - VIDEO_HW_ACCEL=cpu
       - YOLO_DEVICE=cpu
+      - MODELS_DIR=/models
+    volumes:
+      - models:/models
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -20,3 +23,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+
+volumes:
+  models:

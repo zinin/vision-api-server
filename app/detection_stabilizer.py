@@ -182,3 +182,197 @@ class DetectionStabilizer:
         winner_id = max(scores, key=lambda k: scores[k])
         track.stable_class_id = winner_id
         track.stable_class_name = names[winner_id]
+
+    def _is_in_center(self, det: RawDetection, frame_width: int, frame_height: int) -> bool:
+        """Check if bbox center is within the central zone of the frame."""
+        cx = (det.x1 + det.x2) / 2
+        cy = (det.y1 + det.y2) / 2
+        margin_x = frame_width * (1 - self.config.center_zone) / 2
+        margin_y = frame_height * (1 - self.config.center_zone) / 2
+        return (margin_x <= cx <= frame_width - margin_x and
+                margin_y <= cy <= frame_height - margin_y)
+
+    def _grace_frames(self, det: RawDetection, frame_width: int, frame_height: int,
+                      fps: float) -> int:
+        """Compute grace period in frames based on bbox position."""
+        if self._is_in_center(det, frame_width, frame_height):
+            return int(self.config.grace_center_sec * fps)
+        return int(self.config.grace_edge_sec * fps)
+
+    def _fill_gaps(
+        self,
+        track: Track,
+        frame_width: int,
+        frame_height: int,
+        fps: float,
+        total_frames: int,
+        detect_every: int,
+        unmatched_weak: dict[int, list[RawDetection]],
+    ) -> None:
+        """Bidirectional gap filling: backward extension + grace periods."""
+        if not track.detections:
+            return
+
+        sorted_frames = sorted(track.detections.keys())
+        first_det_frame = sorted_frames[0]
+        last_det_frame = sorted_frames[-1]
+
+        # Backward extension: step back strictly by detect_every
+        earliest_det = track.detections[first_det_frame]
+        current_bbox = earliest_det.bbox
+        target_frame = first_det_frame - detect_every
+        while target_frame >= 0:
+            if target_frame not in unmatched_weak:
+                break  # no detections on this frame — stop, don't skip
+            best_match = None
+            best_iou = 0.0
+            for det in unmatched_weak[target_frame]:
+                iou = compute_iou(current_bbox, det.bbox)
+                if iou >= self.config.iou_threshold and iou > best_iou:
+                    best_match = det
+                    best_iou = iou
+            if best_match is None:
+                break  # no IoU match — stop
+            track.detections[target_frame] = best_match
+            unmatched_weak[target_frame].remove(best_match)
+            current_bbox = best_match.bbox
+            target_frame -= detect_every
+
+        # Recalculate after backward extension
+        sorted_frames = sorted(track.detections.keys())
+        first_det_frame = sorted_frames[0]
+        last_det_frame = sorted_frames[-1]
+
+        # Grace periods
+        first_det = track.detections[first_det_frame]
+        last_det = track.detections[last_det_frame]
+
+        backward_grace = self._grace_frames(first_det, frame_width, frame_height, fps)
+        forward_grace = self._grace_frames(last_det, frame_width, frame_height, fps)
+
+        track.first_frame = max(0, first_det_frame - backward_grace)
+        track.last_frame = min(total_frames - 1, last_det_frame + forward_grace)
+
+    @staticmethod
+    def _interpolate_bbox(
+        det_a: RawDetection,
+        det_b: RawDetection,
+        frame_num: int,
+    ) -> tuple[int, int, int, int]:
+        """Linearly interpolate bbox between two detections."""
+        if det_a.frame_num == det_b.frame_num:
+            return det_a.bbox
+
+        t = (frame_num - det_a.frame_num) / (det_b.frame_num - det_a.frame_num)
+        x1 = round(det_a.x1 + t * (det_b.x1 - det_a.x1))
+        y1 = round(det_a.y1 + t * (det_b.y1 - det_a.y1))
+        x2 = round(det_a.x2 + t * (det_b.x2 - det_a.x2))
+        y2 = round(det_a.y2 + t * (det_b.y2 - det_a.y2))
+        return (x1, y1, x2, y2)
+
+    @staticmethod
+    def _get_bbox_for_frame(
+        track: Track, frame_num: int, sorted_frames: list[int]
+    ) -> tuple[int, int, int, int]:
+        """Get interpolated bbox for a frame.
+
+        Args:
+            sorted_frames: pre-sorted list of detection frame numbers for this track.
+        """
+        # Exact match
+        if frame_num in track.detections:
+            return track.detections[frame_num].bbox
+
+        # Before first detection — hold first bbox
+        if frame_num < sorted_frames[0]:
+            return track.detections[sorted_frames[0]].bbox
+
+        # After last detection — hold last bbox
+        if frame_num > sorted_frames[-1]:
+            return track.detections[sorted_frames[-1]].bbox
+
+        # Between two detections — interpolate (binary search for efficiency)
+        idx = bisect.bisect_right(sorted_frames, frame_num)
+        prev_frame = sorted_frames[idx - 1]
+        next_frame = sorted_frames[idx]
+
+        return DetectionStabilizer._interpolate_bbox(
+            track.detections[prev_frame],
+            track.detections[next_frame],
+            frame_num,
+        )
+
+    @staticmethod
+    def _get_track_confidence(track: Track) -> float:
+        """Max confidence among detections of the winning class."""
+        return max(
+            (d.confidence for d in track.detections.values()
+             if d.class_id == track.stable_class_id),
+            default=0.0,
+        )
+
+    def stabilize(
+        self,
+        raw_detections: dict[int, list[RawDetection]],
+        frame_width: int,
+        frame_height: int,
+        fps: float,
+        total_frames: int,
+        detect_every: int,
+        conf_threshold: float,
+    ) -> dict[int, StabilizedFrame]:
+        """Main entry point: raw detections in, stabilized frames out.
+
+        Returns a sparse dict: only frames with at least one active track are
+        included. The caller should treat missing keys as "no detections on this frame".
+        """
+        import copy
+        tracks, unmatched_weak = self._build_tracks(
+            raw_detections, conf_threshold, detect_every, fps
+        )
+
+        # Deep copy unmatched_weak so backward extension for one track
+        # doesn't affect others nondeterministically
+        unmatched_weak_copy = copy.deepcopy(unmatched_weak)
+
+        for track in tracks:
+            self._vote_class(track)
+            self._fill_gaps(
+                track, frame_width, frame_height, fps,
+                total_frames, detect_every, unmatched_weak_copy,
+            )
+
+        logger.info(
+            f"Stabilization: {len(tracks)} tracks from "
+            f"{sum(len(d) for d in raw_detections.values())} raw detections"
+        )
+
+        # Precompute sorted frame lists per track for efficient interpolation
+        track_sorted_frames = {
+            track.track_id: sorted(track.detections.keys()) for track in tracks
+        }
+
+        # Precompute per-track confidence (max of winning class)
+        track_confs = {
+            track.track_id: self._get_track_confidence(track) for track in tracks
+        }
+
+        # Generate per-frame output (sparse — only frames with detections)
+        result: dict[int, StabilizedFrame] = {}
+        for frame_num in range(total_frames):
+            boxes: list[DetectionBox] = []
+            for track in tracks:
+                if track.first_frame <= frame_num <= track.last_frame:
+                    bbox = self._get_bbox_for_frame(
+                        track, frame_num, track_sorted_frames[track.track_id]
+                    )
+                    boxes.append(DetectionBox(
+                        x1=bbox[0], y1=bbox[1], x2=bbox[2], y2=bbox[3],
+                        class_id=track.stable_class_id,
+                        class_name=track.stable_class_name,
+                        confidence=track_confs[track.track_id],
+                    ))
+            if boxes:
+                result[frame_num] = StabilizedFrame(detections=boxes)
+
+        return result

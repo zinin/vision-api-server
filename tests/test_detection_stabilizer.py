@@ -190,3 +190,107 @@ class TestClassVoting:
         stabilizer._vote_class(track)
         assert track.stable_class_id == 1
         assert track.stable_class_name == "car"
+
+
+class TestGapFilling:
+    def _config(self, **overrides):
+        defaults = dict(grace_center_sec=2.0, grace_edge_sec=0.5, center_zone=0.6)
+        defaults.update(overrides)
+        return StabilizerConfig(**defaults)
+
+    def test_forward_grace_period_center(self):
+        config = self._config(grace_center_sec=1.0, grace_edge_sec=0.5)
+        stabilizer = DetectionStabilizer(config)
+        track = Track(track_id=0, detections={
+            50: _make_raw(50, 400, 400, 600, 600, conf=0.9),
+        })
+        stabilizer._vote_class(track)
+        stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
+                              total_frames=200, detect_every=5, unmatched_weak={})
+        assert track.last_frame == 60
+        assert track.first_frame == 40
+
+    def test_forward_grace_period_edge(self):
+        config = self._config(grace_center_sec=2.0, grace_edge_sec=0.5)
+        stabilizer = DetectionStabilizer(config)
+        track = Track(track_id=0, detections={
+            50: _make_raw(50, 900, 400, 1000, 600, conf=0.9),
+        })
+        stabilizer._vote_class(track)
+        stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
+                              total_frames=200, detect_every=5, unmatched_weak={})
+        assert track.last_frame == 55
+        assert track.first_frame == 45
+
+    def test_grace_period_capped_at_total_frames(self):
+        config = self._config(grace_center_sec=10.0)
+        stabilizer = DetectionStabilizer(config)
+        track = Track(track_id=0, detections={
+            95: _make_raw(95, 400, 400, 600, 600, conf=0.9),
+        })
+        stabilizer._vote_class(track)
+        stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
+                              total_frames=100, detect_every=5, unmatched_weak={})
+        assert track.last_frame == 99
+
+    def test_grace_period_capped_at_zero(self):
+        config = self._config(grace_center_sec=10.0)
+        stabilizer = DetectionStabilizer(config)
+        track = Track(track_id=0, detections={
+            3: _make_raw(3, 400, 400, 600, 600, conf=0.9),
+        })
+        stabilizer._vote_class(track)
+        stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
+                              total_frames=200, detect_every=5, unmatched_weak={})
+        assert track.first_frame == 0
+
+    def test_backward_extension_with_unmatched_weak(self):
+        config = self._config(grace_center_sec=0.0, grace_edge_sec=0.0)
+        stabilizer = DetectionStabilizer(config)
+        track = Track(track_id=0, detections={
+            15: _make_raw(15, 100, 100, 200, 200, conf=0.9),
+        })
+        unmatched = {
+            5: [_make_raw(5, 95, 95, 195, 195, conf=0.3)],
+            10: [_make_raw(10, 98, 98, 198, 198, conf=0.25)],
+        }
+        stabilizer._vote_class(track)
+        stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
+                              total_frames=100, detect_every=5, unmatched_weak=unmatched)
+        assert 5 in track.detections
+        assert 10 in track.detections
+        assert track.first_frame == 5
+        assert track.last_frame == 15
+
+    def test_backward_extension_stops_on_no_match(self):
+        config = self._config(grace_center_sec=0.0, grace_edge_sec=0.0)
+        stabilizer = DetectionStabilizer(config)
+        track = Track(track_id=0, detections={
+            15: _make_raw(15, 100, 100, 200, 200, conf=0.9),
+        })
+        unmatched = {
+            5: [_make_raw(5, 800, 800, 900, 900, conf=0.3)],
+            10: [_make_raw(10, 98, 98, 198, 198, conf=0.25)],
+        }
+        stabilizer._vote_class(track)
+        stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
+                              total_frames=100, detect_every=5, unmatched_weak=unmatched)
+        assert 10 in track.detections
+        assert 5 not in track.detections
+
+    def test_interpolation_between_detections(self):
+        config = self._config(grace_center_sec=0.0, grace_edge_sec=0.0, iou_threshold=0.0)
+        stabilizer = DetectionStabilizer(config)
+        raw = {
+            0: [_make_raw(0, 100, 100, 200, 200, conf=0.9)],
+            10: [_make_raw(10, 200, 200, 300, 300, conf=0.9)],
+        }
+        result = stabilizer.stabilize(
+            raw, frame_width=1000, frame_height=1000,
+            fps=10.0, total_frames=11, detect_every=10, conf_threshold=0.5,
+        )
+        mid = result[5].detections[0]
+        assert mid.x1 == 150
+        assert mid.y1 == 150
+        assert mid.x2 == 250
+        assert mid.y2 == 250

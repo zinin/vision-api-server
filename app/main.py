@@ -38,6 +38,7 @@ from models import (
 from visualization import encode_image_to_bytes
 from job_manager import JobManager, JobStatus
 from video_annotator import VideoAnnotator, AnnotationParams
+from detection_stabilizer import StabilizerConfig
 from inference_utils import get_executor
 from video_utils import extract_frames_from_video, VideoFrameExtractor
 
@@ -201,6 +202,15 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     continue
                 logger.debug(f"Job {job_id}: model loaded, device={model_entry.device}")
 
+                stabilizer_config = StabilizerConfig(
+                    conf_factor=settings.stabilizer_conf_factor,
+                    iou_threshold=settings.stabilizer_iou_threshold,
+                    min_vote_conf=settings.stabilizer_min_vote_conf,
+                    grace_center_sec=settings.stabilizer_grace_center,
+                    grace_edge_sec=settings.stabilizer_grace_edge,
+                    center_zone=settings.stabilizer_center_zone,
+                    max_staleness_sec=settings.stabilizer_max_staleness,
+                )
                 annotator = VideoAnnotator(
                     model=model_entry.model,
                     visualizer=model_entry.visualizer,
@@ -208,6 +218,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     hw_config=app.state.hw_config,
                     codec=settings.video_codec,
                     crf=settings.video_crf,
+                    stabilizer_config=stabilizer_config,
                 )
 
                 params = AnnotationParams(

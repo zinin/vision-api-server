@@ -89,6 +89,7 @@ Expected: FAIL — `detection_stabilizer` module does not exist.
 # app/detection_stabilizer.py
 from __future__ import annotations
 
+import bisect
 import logging
 from dataclasses import dataclass, field
 
@@ -694,6 +695,7 @@ Add to `DetectionStabilizer` class in `app/detection_stabilizer.py`:
             if best_match is None:
                 break
             track.detections[frame_num] = best_match
+            unmatched_weak[frame_num].remove(best_match)  # prevent reuse by other tracks
             current_bbox = best_match.bbox
 
         # Recalculate after backward extension
@@ -753,7 +755,6 @@ Add to `DetectionStabilizer` class in `app/detection_stabilizer.py`:
             return det.bbox, det.confidence
 
         # Between two detections — interpolate (binary search for efficiency)
-        import bisect
         idx = bisect.bisect_right(sorted_frames, frame_num)
         prev_frame = sorted_frames[idx - 1]
         next_frame = sorted_frames[idx]

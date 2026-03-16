@@ -80,3 +80,84 @@ def compute_iou(
         return 0.0
 
     return intersection / union
+
+
+class DetectionStabilizer:
+    """Post-processor that stabilizes YOLO detections across video frames."""
+
+    def __init__(self, config: StabilizerConfig):
+        self.config = config
+        self._next_track_id = 0
+
+    def _new_track_id(self) -> int:
+        tid = self._next_track_id
+        self._next_track_id += 1
+        return tid
+
+    def _build_tracks(
+        self,
+        raw_detections: dict[int, list[RawDetection]],
+        conf_threshold: float,
+        detect_every: int,
+        fps: float,
+    ) -> tuple[list[Track], dict[int, list[RawDetection]]]:
+        """Build tracks from raw detections using greedy IoU matching.
+
+        Returns:
+            (tracks, unmatched_weak): tracks list and dict of frame_num → unmatched
+            weak detections for backward extension.
+        """
+        tracks: list[Track] = []
+        unmatched_weak: dict[int, list[RawDetection]] = {}
+        max_staleness_frames = int(self.config.max_staleness_sec * fps) if fps > 0 else 150
+
+        for frame_num in sorted(raw_detections.keys()):
+            detections = raw_detections[frame_num]
+            if not detections:
+                continue
+
+            # Only match against active tracks (last detection within staleness window)
+            active_tracks = [
+                t for t in tracks
+                if max(t.detections.keys()) >= frame_num - max_staleness_frames
+            ]
+
+            # Compute IoU for all (track, detection) pairs
+            pairs: list[tuple[float, int, int]] = []
+            for ti, track in enumerate(active_tracks):
+                latest_frame = max(t for t in track.detections.keys() if t < frame_num) \
+                    if any(t < frame_num for t in track.detections.keys()) else None
+                if latest_frame is None:
+                    continue
+                track_bbox = track.detections[latest_frame].bbox
+                for di, det in enumerate(detections):
+                    iou = compute_iou(track_bbox, det.bbox)
+                    if iou >= self.config.iou_threshold:
+                        pairs.append((iou, ti, di))
+
+            # Greedy 1:1 assignment (highest IoU first)
+            pairs.sort(key=lambda x: x[0], reverse=True)
+            assigned_tracks: set[int] = set()
+            assigned_dets: set[int] = set()
+
+            for iou_val, ti, di in pairs:
+                if ti in assigned_tracks or di in assigned_dets:
+                    continue
+                active_tracks[ti].detections[frame_num] = detections[di]
+                assigned_tracks.add(ti)
+                assigned_dets.add(di)
+
+            # Handle unassigned detections
+            for di, det in enumerate(detections):
+                if di in assigned_dets:
+                    continue
+                if det.confidence >= conf_threshold:
+                    track = Track(
+                        track_id=self._new_track_id(),
+                        detections={frame_num: det},
+                    )
+                    tracks.append(track)
+                else:
+                    unmatched_weak.setdefault(frame_num, []).append(det)
+
+        return tracks, unmatched_weak

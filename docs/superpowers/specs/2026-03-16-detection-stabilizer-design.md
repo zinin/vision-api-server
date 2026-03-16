@@ -37,7 +37,7 @@ Store raw detections
 
 Raw BGR24 frames are written to a single binary file `{job_dir}/frames.raw` during pass 1. Frames have fixed size (`width * height * 3` bytes), so any frame can be read by offset: `frame_num * frame_size`. The cache file is deleted after pass 2 completes. Cleanup on failure is handled by the existing `JobManager` job directory cleanup.
 
-**Disk space limits**: A 1920x1080 video at 30fps produces ~6 MB/frame ≈ 10 GB/minute of raw cache. The existing 500 MB upload limit caps input video length in practice, but long low-bitrate videos can still produce large caches. Before starting pass 1, estimate the cache size as `total_frames * width * height * 3` and refuse the job if it exceeds `STABILIZER_MAX_CACHE_GB` (default 50 GB, env variable). During pass 1, if a disk write fails (ENOSPC), abort the job with a clear error. The `VIDEO_JOBS_DIR` should be on a volume with sufficient space.
+**Disk space limits**: A 1920x1080 video at 30fps produces ~6 MB/frame ≈ 10 GB/minute of raw cache. The existing 500 MB upload limit caps input video length in practice, but long low-bitrate videos can still produce large caches. Before starting pass 1, estimate the cache size as `total_frames * width * height * 3` and refuse the job if it exceeds `STABILIZER_MAX_CACHE_GB` (default 50 GB, env variable). If `total_frames` is 0 or unreasonably low (ffprobe didn't report it), skip the pre-check and rely on the runtime guard: during pass 1, if a disk write fails (ENOSPC), abort the job with a clear error. The `VIDEO_JOBS_DIR` should be on a volume with sufficient space.
 
 ### Confidence Threshold Strategy
 
@@ -131,7 +131,7 @@ For each track:
 
 For each track, determine the active frame range:
 
-**Backward extension**: From the first detection in the track, look backward through the `unmatched_weak` detections (collected in Step 1) on earlier detection frames. For each earlier frame, check if any unmatched weak detection has IoU >= `iou_threshold` with the track's earliest known bbox. If so, adopt it into the track and extend `first_frame`. Continue backward until no match is found.
+**Backward extension**: From the first detection in the track, look backward through the `unmatched_weak` detections (collected in Step 1) on earlier *detection* frames (multiples of `detect_every` — these are the only frames where YOLO ran and unmatched detections exist). For each earlier detection frame, check if any unmatched weak detection has IoU >= `iou_threshold` with the track's earliest known bbox. If so, adopt it into the track and extend `first_frame`. Continue backward until no match is found.
 
 **Forward extension (grace period)**: From the last detection, extend `last_frame` by a grace period that depends on position:
 - Compute the center of the last known bbox
@@ -147,7 +147,7 @@ For each track, determine the active frame range:
 
 For each frame 0..total_frames-1:
 - Collect all tracks active on this frame
-- For each track: produce a `DetectionBox` with `stable_class_id`, `stable_class_name` (from voting), interpolated coordinates, and the confidence from the temporally nearest real detection (ensures correct color mapping in visualizer and meaningful confidence display)
+- For each track: produce a `DetectionBox` with `class_id=track.stable_class_id`, `class_name=track.stable_class_name` (from voting), interpolated coordinates (rounded to `int`), and the confidence from the temporally nearest real detection (ensures correct color mapping in visualizer and meaningful confidence display)
 - Return as `StabilizedFrame`
 
 ## Changes to Existing Files
@@ -170,11 +170,11 @@ Env variables: `STABILIZER_CONF_FACTOR`, `STABILIZER_IOU_THRESHOLD`, `STABILIZER
 
 ### `app/video_annotator.py`
 
-`VideoAnnotator.__init__()`: accept `StabilizerConfig`.
+`VideoAnnotator.__init__()`: add `stabilizer_config: StabilizerConfig` as an additional parameter alongside existing `model`, `visualizer`, `class_names`, `hw_config`, `codec`, `crf`.
 
 `VideoAnnotator.annotate()`: replace single loop with:
 
-1. **Pass 1**: decode frames, write to `frames.raw`, run YOLO with `conf * config.conf_factor`, apply class filter, collect `dict[int, list[RawDetection]]`. Record actual frame count.
+1. **Pass 1**: decode frames, write to `frames.raw` (located at `output_path.parent / "frames.raw"` — same job directory as output), run YOLO with `conf * config.conf_factor`, apply class filter, collect `dict[int, list[RawDetection]]`. Record actual frame count.
 2. **Stabilize**: call `DetectionStabilizer.stabilize()` with actual frame count from pass 1 (not ffprobe estimate).
 3. **Pass 2**: open `frames.raw` for reading, iterate frames, draw from `StabilizedFrame`, encode.
 4. **Cleanup**: delete `frames.raw`.

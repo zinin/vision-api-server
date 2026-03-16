@@ -37,9 +37,15 @@ Store raw detections
 
 Raw BGR24 frames are written to a single binary file `{job_dir}/frames.raw` during pass 1. Frames have fixed size (`width * height * 3` bytes), so any frame can be read by offset: `frame_num * frame_size`. The cache file is deleted after pass 2 completes. Cleanup on failure is handled by the existing `JobManager` job directory cleanup.
 
+**Disk space limits**: A 1920x1080 video at 30fps produces ~6 MB/frame ≈ 10 GB/minute of raw cache. The existing 500 MB upload limit caps input video length in practice, but long low-bitrate videos can still produce large caches. Before starting pass 1, estimate the cache size as `total_frames * width * height * 3` and refuse the job if it exceeds `STABILIZER_MAX_CACHE_GB` (default 50 GB, env variable). During pass 1, if a disk write fails (ENOSPC), abort the job with a clear error. The `VIDEO_JOBS_DIR` should be on a volume with sufficient space.
+
 ### Confidence Threshold Strategy
 
 YOLO is called with `conf * STABILIZER_CONF_FACTOR` (default factor: 0.4, so user conf=0.5 becomes 0.2 for YOLO). This captures weak detections that would otherwise be lost. The original user `conf` is used as the threshold for creating *new* tracks — weak detections can only extend existing tracks, not start new ones.
+
+### Class Filtering
+
+If the user specifies `classes` (class name filter), filtering is applied *after* YOLO inference but *before* detections are fed to the stabilizer. This ensures that lowered confidence does not introduce unwanted classes into the stabilization pipeline. The stabilizer only sees detections that pass the class filter.
 
 ## DetectionStabilizer Module
 
@@ -112,7 +118,7 @@ Process detection frames in order. For each detection on frame N, find the best-
 - IoU < threshold for all tracks AND `confidence >= conf_threshold` → create new track
 - IoU >= threshold AND `confidence < conf_threshold` → add to existing track (lowered bar for known objects)
 
-Matching is greedy: sort all (track, detection) pairs by IoU descending, assign 1:1 (Hungarian algorithm is an option for later, but greedy is sufficient for typical sparse detections).
+Matching is greedy, per detection frame: sort all (track, detection) pairs by IoU descending, assign 1:1 — each detection goes to at most one track, each track gets at most one detection per frame. Unmatched detections with `confidence < conf_threshold` are stored in a separate `unmatched_weak` list for use in backward extension (Step 3). Hungarian algorithm is an option for later, but greedy is sufficient for typical sparse detections.
 
 #### Step 2: Class Voting
 
@@ -125,7 +131,7 @@ For each track:
 
 For each track, determine the active frame range:
 
-**Backward extension**: From the first detection in the track, look backward through earlier detection frames for weak detections (below `conf_threshold` but above YOLO's lowered threshold) with IoU overlap. Extend `first_frame` to include these.
+**Backward extension**: From the first detection in the track, look backward through the `unmatched_weak` detections (collected in Step 1) on earlier detection frames. For each earlier frame, check if any unmatched weak detection has IoU >= `iou_threshold` with the track's earliest known bbox. If so, adopt it into the track and extend `first_frame`. Continue backward until no match is found.
 
 **Forward extension (grace period)**: From the last detection, extend `last_frame` by a grace period that depends on position:
 - Compute the center of the last known bbox
@@ -141,7 +147,7 @@ For each track, determine the active frame range:
 
 For each frame 0..total_frames-1:
 - Collect all tracks active on this frame
-- For each track: produce a `DetectionBox` with `stable_class_name`, interpolated coordinates, and the confidence from the nearest real detection
+- For each track: produce a `DetectionBox` with `stable_class_id`, `stable_class_name` (from voting), interpolated coordinates, and the confidence from the temporally nearest real detection (ensures correct color mapping in visualizer and meaningful confidence display)
 - Return as `StabilizedFrame`
 
 ## Changes to Existing Files
@@ -151,15 +157,16 @@ For each frame 0..total_frames-1:
 Add to Pydantic Settings:
 
 ```python
-stabilizer_conf_factor: float = 0.4
-stabilizer_iou_threshold: float = 0.3
-stabilizer_min_vote_conf: float = 0.3
-stabilizer_grace_center: float = 2.0
-stabilizer_grace_edge: float = 0.5
-stabilizer_center_zone: float = 0.6
+stabilizer_conf_factor: float = 0.4       # (0, 1]
+stabilizer_iou_threshold: float = 0.3     # (0, 1]
+stabilizer_min_vote_conf: float = 0.3     # [0, 1]
+stabilizer_grace_center: float = 2.0      # >= 0, seconds
+stabilizer_grace_edge: float = 0.5        # >= 0, seconds
+stabilizer_center_zone: float = 0.6       # (0, 1]
+stabilizer_max_cache_gb: float = 50.0     # > 0, max frame cache size in GB
 ```
 
-Env variables: `STABILIZER_CONF_FACTOR`, `STABILIZER_IOU_THRESHOLD`, `STABILIZER_MIN_VOTE_CONF`, `STABILIZER_GRACE_CENTER`, `STABILIZER_GRACE_EDGE`, `STABILIZER_CENTER_ZONE`.
+Env variables: `STABILIZER_CONF_FACTOR`, `STABILIZER_IOU_THRESHOLD`, `STABILIZER_MIN_VOTE_CONF`, `STABILIZER_GRACE_CENTER`, `STABILIZER_GRACE_EDGE`, `STABILIZER_CENTER_ZONE`, `STABILIZER_MAX_CACHE_GB`. All fields should have Pydantic validators enforcing the bounds listed above.
 
 ### `app/video_annotator.py`
 
@@ -167,12 +174,14 @@ Env variables: `STABILIZER_CONF_FACTOR`, `STABILIZER_IOU_THRESHOLD`, `STABILIZER
 
 `VideoAnnotator.annotate()`: replace single loop with:
 
-1. **Pass 1**: decode frames, write to `frames.raw`, run YOLO with `conf * config.conf_factor`, collect `dict[int, list[RawDetection]]`
-2. **Stabilize**: call `DetectionStabilizer.stabilize()`
-3. **Pass 2**: open `frames.raw` for reading, iterate frames, draw from `StabilizedFrame`, encode
-4. **Cleanup**: delete `frames.raw`
+1. **Pass 1**: decode frames, write to `frames.raw`, run YOLO with `conf * config.conf_factor`, apply class filter, collect `dict[int, list[RawDetection]]`. Record actual frame count.
+2. **Stabilize**: call `DetectionStabilizer.stabilize()` with actual frame count from pass 1 (not ffprobe estimate).
+3. **Pass 2**: open `frames.raw` for reading, iterate frames, draw from `StabilizedFrame`, encode.
+4. **Cleanup**: delete `frames.raw`.
 
-`AnnotationStats`: update `tracked_frames` semantics — now means "frames with interpolated/held detections" rather than "hold mode frames".
+**Progress callback**: Pass 1 (YOLO inference, the slow part) reports 0-80%. Stabilization is near-instant, no progress update. Pass 2 (render) reports 80-99%.
+
+`AnnotationStats`: update `tracked_frames` to mean "frames where at least one track is active via interpolation or grace period (not a direct YOLO detection)". Update the description in `models.py` accordingly.
 
 ### `app/main.py`
 
@@ -206,3 +215,9 @@ Unit tests for `DetectionStabilizer` with synthetic data:
 - **Greedy IoU over Hungarian**: Simpler, fast enough for typical detection density (1-10 objects per frame). IoU matching strategy is isolated and replaceable.
 - **Always enabled**: The old behavior (raw YOLO output) is nearly unusable for video annotation. No reason to keep it as an option.
 - **Stabilizer as separate module**: Clean separation of concerns. Testable without YOLO or FFmpeg. Can be improved independently.
+
+## Out of Scope (v1)
+
+- **Track merging**: Two separate tracks that are actually the same object (e.g., after occlusion) are not merged. They remain as independent tracks.
+- **Non-linear interpolation**: Bbox interpolation is linear. Spline or EMA smoothing may be added later if linear interpolation produces jarring jumps.
+- **Ultralytics built-in tracker**: `model.track()` (BoT-SORT/ByteTrack) is not used in v1 but could replace IoU matching in a future version.

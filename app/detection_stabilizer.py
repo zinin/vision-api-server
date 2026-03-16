@@ -161,3 +161,24 @@ class DetectionStabilizer:
                     unmatched_weak.setdefault(frame_num, []).append(det)
 
         return tracks, unmatched_weak
+
+    def _vote_class(self, track: Track) -> None:
+        """Determine stable class for a track via weighted voting."""
+        scores: dict[int, float] = {}
+        names: dict[int, str] = {}
+
+        for det in track.detections.values():
+            if det.confidence >= self.config.min_vote_conf:
+                scores[det.class_id] = scores.get(det.class_id, 0.0) + det.confidence
+                names[det.class_id] = det.class_name
+
+        if not scores:
+            # Fallback: use highest-confidence detection
+            best = max(track.detections.values(), key=lambda d: d.confidence)
+            track.stable_class_id = best.class_id
+            track.stable_class_name = best.class_name
+            return
+
+        winner_id = max(scores, key=lambda k: scores[k])
+        track.stable_class_id = winner_id
+        track.stable_class_name = names[winner_id]

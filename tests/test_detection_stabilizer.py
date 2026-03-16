@@ -3,6 +3,7 @@ import pytest
 from detection_stabilizer import (
     RawDetection,
     StabilizerConfig,
+    Track,
     compute_iou,
 )
 from detection_stabilizer import DetectionStabilizer
@@ -138,3 +139,54 @@ class TestBuildTracks:
         assert len(tracks) == 2
         for t in tracks:
             assert len(t.detections) == 2
+
+
+class TestClassVoting:
+    def _config(self, **overrides):
+        return StabilizerConfig(**overrides)
+
+    def test_single_class(self):
+        """All detections same class — voting returns that class."""
+        stabilizer = DetectionStabilizer(self._config())
+        track = Track(track_id=0, detections={
+            0: _make_raw(0, 100, 100, 200, 200, class_id=1, class_name="car", conf=0.8),
+            5: _make_raw(5, 100, 100, 200, 200, class_id=1, class_name="car", conf=0.7),
+        })
+        stabilizer._vote_class(track)
+        assert track.stable_class_id == 1
+        assert track.stable_class_name == "car"
+
+    def test_weighted_voting(self):
+        """Class with higher total weighted score wins."""
+        stabilizer = DetectionStabilizer(self._config(min_vote_conf=0.3))
+        track = Track(track_id=0, detections={
+            0: _make_raw(0, 100, 100, 200, 200, class_id=0, class_name="person", conf=0.4),
+            5: _make_raw(5, 100, 100, 200, 200, class_id=1, class_name="car", conf=0.8),
+            10: _make_raw(10, 100, 100, 200, 200, class_id=1, class_name="car", conf=0.7),
+        })
+        stabilizer._vote_class(track)
+        assert track.stable_class_id == 1
+        assert track.stable_class_name == "car"
+
+    def test_low_conf_excluded_from_voting(self):
+        """Detections below min_vote_conf don't participate in voting."""
+        stabilizer = DetectionStabilizer(self._config(min_vote_conf=0.5))
+        track = Track(track_id=0, detections={
+            0: _make_raw(0, 100, 100, 200, 200, class_id=0, class_name="person", conf=0.6),
+            5: _make_raw(5, 100, 100, 200, 200, class_id=1, class_name="car", conf=0.3),
+            10: _make_raw(10, 100, 100, 200, 200, class_id=1, class_name="car", conf=0.4),
+        })
+        stabilizer._vote_class(track)
+        assert track.stable_class_id == 0
+        assert track.stable_class_name == "person"
+
+    def test_empty_track_after_filtering(self):
+        """If all detections are below min_vote_conf, use the highest confidence one."""
+        stabilizer = DetectionStabilizer(self._config(min_vote_conf=0.9))
+        track = Track(track_id=0, detections={
+            0: _make_raw(0, 100, 100, 200, 200, class_id=0, class_name="person", conf=0.3),
+            5: _make_raw(5, 100, 100, 200, 200, class_id=1, class_name="car", conf=0.5),
+        })
+        stabilizer._vote_class(track)
+        assert track.stable_class_id == 1
+        assert track.stable_class_name == "car"

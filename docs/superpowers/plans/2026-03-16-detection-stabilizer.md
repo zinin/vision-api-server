@@ -4,7 +4,7 @@
 
 **Goal:** Add a two-pass video annotation pipeline with detection stabilization to eliminate bbox flickering and class instability.
 
-**Architecture:** New `DetectionStabilizer` module performs IoU-based track building, weighted class voting, and bidirectional gap filling. `VideoAnnotator` is refactored from a single-pass to a two-pass pipeline: pass 1 collects raw detections and caches frames to disk, pass 2 renders stabilized results.
+**Architecture:** New `DetectionStabilizer` module performs IoU-based track building, weighted class voting, and bidirectional gap filling. `VideoAnnotator` is refactored from a single-pass to a two-pass decode pipeline: pass 1 decodes video + runs YOLO (no frames saved to disk), pass 2 decodes again + renders stabilized results.
 
 **Tech Stack:** Python, numpy, dataclasses. No new dependencies.
 
@@ -66,7 +66,7 @@ class TestStabilizerConfig:
         assert config.grace_center_sec == 2.0
         assert config.grace_edge_sec == 0.5
         assert config.center_zone == 0.6
-        assert config.max_cache_gb == 50.0
+        assert config.max_staleness_sec == 5.0
 
 
 class TestRawDetection:
@@ -107,7 +107,7 @@ class StabilizerConfig:
     grace_center_sec: float = 2.0
     grace_edge_sec: float = 0.5
     center_zone: float = 0.6
-    max_cache_gb: float = 50.0
+    max_staleness_sec: float = 5.0
 
 
 @dataclass(slots=True)
@@ -218,7 +218,7 @@ class TestBuildTracks:
             5: [_make_raw(5, 105, 105, 205, 205)],
             10: [_make_raw(10, 110, 110, 210, 210)],
         }
-        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5)
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
         assert len(tracks) == 1
         assert len(tracks[0].detections) == 3
 
@@ -235,7 +235,7 @@ class TestBuildTracks:
                 _make_raw(5, 505, 505, 605, 605),
             ],
         }
-        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5)
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
         assert len(tracks) == 2
 
     def test_low_conf_does_not_create_track(self):
@@ -244,7 +244,7 @@ class TestBuildTracks:
         raw = {
             0: [_make_raw(0, 100, 100, 200, 200, conf=0.3)],
         }
-        tracks, unmatched = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5)
+        tracks, unmatched = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
         assert len(tracks) == 0
         assert len(unmatched[0]) == 1
 
@@ -255,7 +255,7 @@ class TestBuildTracks:
             0: [_make_raw(0, 100, 100, 200, 200, conf=0.8)],
             5: [_make_raw(5, 105, 105, 205, 205, conf=0.3)],
         }
-        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5)
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
         assert len(tracks) == 1
         assert len(tracks[0].detections) == 2
 
@@ -266,7 +266,7 @@ class TestBuildTracks:
             0: [_make_raw(0, 0, 0, 50, 50, conf=0.9)],
             5: [_make_raw(5, 500, 500, 600, 600, conf=0.9)],
         }
-        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5)
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
         assert len(tracks) == 2
 
     def test_greedy_1to1_assignment(self):
@@ -282,7 +282,7 @@ class TestBuildTracks:
                 _make_raw(5, 305, 305, 405, 405, conf=0.9),
             ],
         }
-        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5)
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
         assert len(tracks) == 2
         for t in tracks:
             assert len(t.detections) == 2
@@ -315,6 +315,7 @@ class DetectionStabilizer:
         raw_detections: dict[int, list[RawDetection]],
         conf_threshold: float,
         detect_every: int,
+        fps: float,
     ) -> tuple[list[Track], dict[int, list[RawDetection]]]:
         """Build tracks from raw detections using greedy IoU matching.
 
@@ -324,16 +325,19 @@ class DetectionStabilizer:
         """
         tracks: list[Track] = []
         unmatched_weak: dict[int, list[RawDetection]] = {}
+        max_staleness_frames = int(self.config.max_staleness_sec * fps) if fps > 0 else 150
 
         for frame_num in sorted(raw_detections.keys()):
             detections = raw_detections[frame_num]
             if not detections:
                 continue
 
-            # All existing tracks are candidates — the staleness window is intentionally
-            # wide because YOLO may miss an object for many consecutive detection frames.
-            # Gap filling (Step 3) handles the temporal boundaries; here we just match by IoU.
-            active_tracks = tracks
+            # Only match against active tracks (last detection within staleness window).
+            # Prevents "ghost tracks" spanning minutes of video.
+            active_tracks = [
+                t for t in tracks
+                if max(t.detections.keys()) >= frame_num - max_staleness_frames
+            ]
 
             # Compute IoU for all (track, detection) pairs
             pairs: list[tuple[float, int, int]] = []  # (iou, track_idx, det_idx)
@@ -677,26 +681,26 @@ Add to `DetectionStabilizer` class in `app/detection_stabilizer.py`:
         first_det_frame = sorted_frames[0]
         last_det_frame = sorted_frames[-1]
 
-        # Backward extension: adopt unmatched weak detections
+        # Backward extension: step back strictly by detect_every
         earliest_det = track.detections[first_det_frame]
         current_bbox = earliest_det.bbox
-        check_frames = sorted(
-            [f for f in unmatched_weak if f < first_det_frame],
-            reverse=True,
-        )
-        for frame_num in check_frames:
+        target_frame = first_det_frame - detect_every
+        while target_frame >= 0:
+            if target_frame not in unmatched_weak:
+                break  # no detections on this frame — stop, don't skip
             best_match = None
             best_iou = 0.0
-            for det in unmatched_weak[frame_num]:
+            for det in unmatched_weak[target_frame]:
                 iou = compute_iou(current_bbox, det.bbox)
                 if iou >= self.config.iou_threshold and iou > best_iou:
                     best_match = det
                     best_iou = iou
             if best_match is None:
-                break
-            track.detections[frame_num] = best_match
-            unmatched_weak[frame_num].remove(best_match)  # prevent reuse by other tracks
+                break  # no IoU match — stop
+            track.detections[target_frame] = best_match
+            unmatched_weak[target_frame].remove(best_match)
             current_bbox = best_match.bbox
+            target_frame -= detect_every
 
         # Recalculate after backward extension
         sorted_frames = sorted(track.detections.keys())
@@ -731,46 +735,45 @@ Add to `DetectionStabilizer` class in `app/detection_stabilizer.py`:
         return (x1, y1, x2, y2)
 
     @staticmethod
-    def _get_bbox_and_conf_for_frame(
+    def _get_bbox_for_frame(
         track: Track, frame_num: int, sorted_frames: list[int]
-    ) -> tuple[tuple[int, int, int, int], float]:
-        """Get interpolated bbox and nearest confidence for a frame.
+    ) -> tuple[int, int, int, int]:
+        """Get interpolated bbox for a frame.
 
         Args:
             sorted_frames: pre-sorted list of detection frame numbers for this track.
         """
         # Exact match
         if frame_num in track.detections:
-            det = track.detections[frame_num]
-            return det.bbox, det.confidence
+            return track.detections[frame_num].bbox
 
         # Before first detection — hold first bbox
         if frame_num < sorted_frames[0]:
-            det = track.detections[sorted_frames[0]]
-            return det.bbox, det.confidence
+            return track.detections[sorted_frames[0]].bbox
 
         # After last detection — hold last bbox
         if frame_num > sorted_frames[-1]:
-            det = track.detections[sorted_frames[-1]]
-            return det.bbox, det.confidence
+            return track.detections[sorted_frames[-1]].bbox
 
         # Between two detections — interpolate (binary search for efficiency)
         idx = bisect.bisect_right(sorted_frames, frame_num)
         prev_frame = sorted_frames[idx - 1]
         next_frame = sorted_frames[idx]
 
-        bbox = DetectionStabilizer._interpolate_bbox(
+        return DetectionStabilizer._interpolate_bbox(
             track.detections[prev_frame],
             track.detections[next_frame],
             frame_num,
         )
-        # Confidence from nearest detection
-        if frame_num - prev_frame <= next_frame - frame_num:
-            conf = track.detections[prev_frame].confidence
-        else:
-            conf = track.detections[next_frame].confidence
 
-        return bbox, conf
+    @staticmethod
+    def _get_track_confidence(track: Track) -> float:
+        """Max confidence among detections of the winning class."""
+        return max(
+            (d.confidence for d in track.detections.values()
+             if d.class_id == track.stable_class_id),
+            default=0.0,
+        )
 
     def stabilize(
         self,
@@ -787,15 +790,20 @@ Add to `DetectionStabilizer` class in `app/detection_stabilizer.py`:
         Returns a sparse dict: only frames with at least one active track are
         included. The caller should treat missing keys as "no detections on this frame".
         """
+        import copy
         tracks, unmatched_weak = self._build_tracks(
-            raw_detections, conf_threshold, detect_every
+            raw_detections, conf_threshold, detect_every, fps
         )
+
+        # Deep copy unmatched_weak so backward extension for one track
+        # doesn't affect others nondeterministically
+        unmatched_weak_copy = copy.deepcopy(unmatched_weak)
 
         for track in tracks:
             self._vote_class(track)
             self._fill_gaps(
                 track, frame_width, frame_height, fps,
-                total_frames, detect_every, unmatched_weak,
+                total_frames, detect_every, unmatched_weak_copy,
             )
 
         logger.info(
@@ -805,7 +813,12 @@ Add to `DetectionStabilizer` class in `app/detection_stabilizer.py`:
 
         # Precompute sorted frame lists per track for efficient interpolation
         track_sorted_frames = {
-            id(track): sorted(track.detections.keys()) for track in tracks
+            track.track_id: sorted(track.detections.keys()) for track in tracks
+        }
+
+        # Precompute per-track confidence (max of winning class)
+        track_confs = {
+            track.track_id: self._get_track_confidence(track) for track in tracks
         }
 
         # Generate per-frame output (sparse — only frames with detections)
@@ -814,14 +827,14 @@ Add to `DetectionStabilizer` class in `app/detection_stabilizer.py`:
             boxes: list[DetectionBox] = []
             for track in tracks:
                 if track.first_frame <= frame_num <= track.last_frame:
-                    bbox, conf = self._get_bbox_and_conf_for_frame(
-                        track, frame_num, track_sorted_frames[id(track)]
+                    bbox = self._get_bbox_for_frame(
+                        track, frame_num, track_sorted_frames[track.track_id]
                     )
                     boxes.append(DetectionBox(
                         x1=bbox[0], y1=bbox[1], x2=bbox[2], y2=bbox[3],
                         class_id=track.stable_class_id,
                         class_name=track.stable_class_name,
-                        confidence=conf,
+                        confidence=track_confs[track.track_id],
                     ))
             if boxes:
                 result[frame_num] = StabilizedFrame(detections=boxes)
@@ -865,7 +878,7 @@ class TestStabilizerSettings:
         assert s.stabilizer_grace_center == 2.0
         assert s.stabilizer_grace_edge == 0.5
         assert s.stabilizer_center_zone == 0.6
-        assert s.stabilizer_max_cache_gb == 50.0
+        assert s.stabilizer_max_staleness == 5.0
 
     def test_custom_values(self):
         s = Settings(
@@ -890,9 +903,9 @@ class TestStabilizerSettings:
         with pytest.raises(ValidationError):
             Settings(yolo_models='{}', stabilizer_iou_threshold=0.0)
 
-    def test_max_cache_gb_must_be_positive(self):
+    def test_max_staleness_must_be_positive(self):
         with pytest.raises(ValidationError):
-            Settings(yolo_models='{}', stabilizer_max_cache_gb=0.0)
+            Settings(yolo_models='{}', stabilizer_max_staleness=0.0)
 
     def test_grace_non_negative(self):
         # 0 is valid (disables grace)
@@ -921,7 +934,7 @@ Add to `app/config.py` inside the `Settings` class, after the `vaapi_device` fie
     stabilizer_grace_center: float = Field(default=2.0, ge=0)
     stabilizer_grace_edge: float = Field(default=0.5, ge=0)
     stabilizer_center_zone: float = Field(default=0.6, gt=0, le=1)
-    stabilizer_max_cache_gb: float = Field(default=50.0, gt=0)
+    stabilizer_max_staleness: float = Field(default=5.0, gt=0)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1092,11 +1105,10 @@ Replace `app/video_annotator.py` content. Key changes:
 1. Import `StabilizerConfig`, `RawDetection`, `DetectionStabilizer`, `StabilizedFrame` from `detection_stabilizer`.
 2. Add `stabilizer_config` parameter to `__init__`.
 3. Replace `annotate()` single loop with:
-   - `_pass1_collect()` — decode, cache frames to `frames.raw`, run YOLO, return raw detections and actual frame count.
-   - Call `DetectionStabilizer.stabilize()`.
-   - `_pass2_render()` — read cached frames, draw stabilized detections, encode.
-   - Delete `frames.raw`.
-4. Cache size check before pass 1.
+   - `_pass1_collect()` — decode video via FFmpegDecoder, run YOLO (no class filter, all classes), return raw detections and actual frame count. No frames saved to disk.
+   - Call `DetectionStabilizer.stabilize()`. Apply class filter on stabilized results (by `stable_class_name`).
+   - `_pass2_render()` — decode video again via second FFmpegDecoder, draw stabilized detections, encode.
+4. Stats counted from stabilized output: `total_detections` = sum of rendered boxes, `tracked_frames` = non-detection frames with active tracks.
 5. Progress: 0-80% in pass 1, 80-99% in pass 2.
 
 The full implementation (replace the `annotate` method and add helper methods):
@@ -1141,24 +1153,13 @@ The full implementation (replace the `annotate` method and add helper methods):
             f"detect_every={params.detect_every}, conf={params.conf}"
         )
 
-        # Cache size check
-        cache_path = output_path.parent / "frames.raw"
-        frame_size = metadata.width * metadata.height * 3
-        if metadata.total_frames > 0:
-            estimated_gb = (metadata.total_frames * frame_size) / (1024 ** 3)
-            if estimated_gb > self.stabilizer_config.max_cache_gb:
-                raise RuntimeError(
-                    f"Estimated frame cache {estimated_gb:.1f} GB exceeds limit "
-                    f"{self.stabilizer_config.max_cache_gb} GB"
-                )
-
         stats = AnnotationStats(total_frames=metadata.total_frames)
         start_time = time.perf_counter()
 
-        # Pass 1: collect detections + cache frames
+        # Pass 1: decode + YOLO (no frames saved to disk)
         yolo_conf = params.conf * self.stabilizer_config.conf_factor
         raw_detections, actual_frames = self._pass1_collect(
-            input_path, metadata, params, yolo_conf, cache_path, frame_size,
+            input_path, metadata, params, yolo_conf,
             progress_callback, stats,
         )
         stats.total_frames = actual_frames
@@ -1175,23 +1176,30 @@ The full implementation (replace the `annotate` method and add helper methods):
             conf_threshold=params.conf,
         )
 
-        # Count tracked frames: frames with stabilized output that aren't detection frames
-        for frame_num in range(actual_frames):
-            is_detection_frame = (frame_num % params.detect_every == 0)
-            if frame_num in stabilized and not is_detection_frame:
-                stats.tracked_frames += 1
+        # Apply class filter after stabilization (filter by stable_class)
+        if params.classes:
+            stabilized = {
+                fn: StabilizedFrame(
+                    detections=[d for d in sf.detections if d.class_name in params.classes]
+                )
+                for fn, sf in stabilized.items()
+                if any(d.class_name in params.classes for d in sf.detections)
+            }
 
-        # Pass 2: render
+        # Count stats from stabilized output
+        for frame_num in range(actual_frames):
+            if frame_num in stabilized:
+                stats.total_detections += len(stabilized[frame_num].detections)
+                if frame_num % params.detect_every != 0:
+                    stats.tracked_frames += 1
+
+        # Pass 2: decode again + render
         font_scale = self.visualizer.calculate_adaptive_font_scale(metadata.height)
-        try:
-            self._pass2_render(
-                input_path, output_path, metadata, params, stabilized,
-                effective_codec, effective_crf, effective_bitrate,
-                font_scale, actual_frames, progress_callback,
-            )
-        finally:
-            if cache_path.exists():
-                cache_path.unlink()
+        self._pass2_render(
+            input_path, output_path, metadata, params, stabilized,
+            effective_codec, effective_crf, effective_bitrate,
+            font_scale, actual_frames, progress_callback,
+        )
 
         stats.processing_time_ms = int((time.perf_counter() - start_time) * 1000)
         fps_actual = actual_frames / max(stats.processing_time_ms / 1000, 0.001)
@@ -1225,27 +1233,18 @@ The full implementation (replace the `annotate` method and add helper methods):
         metadata: VideoMetadata,
         params: AnnotationParams,
         yolo_conf: float,
-        cache_path: Path,
-        frame_size: int,
         progress_callback: Callable[[int], None] | None,
         stats: AnnotationStats,
     ) -> tuple[dict[int, list[RawDetection]], int]:
-        """Pass 1: decode frames, cache to disk, run YOLO, collect raw detections."""
+        """Pass 1: decode frames, run YOLO, collect raw detections (no disk cache)."""
         raw_detections: dict[int, list[RawDetection]] = {}
         frame_num = 0
 
-        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder, \
-             open(cache_path, "wb") as cache_file:
-
+        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder:
             while True:
                 frame = decoder.read_frame()
                 if frame is None:
                     break
-
-                try:
-                    cache_file.write(frame.tobytes())
-                except OSError as e:
-                    raise RuntimeError(f"Failed to write frame cache (disk full?): {e}") from e
 
                 if frame_num % params.detect_every == 0:
                     results = self.model.predict(
@@ -1255,11 +1254,11 @@ The full implementation (replace the `annotate` method and add helper methods):
                         max_det=params.max_det,
                         verbose=False,
                     )
-                    dets = self._extract_raw_detections(results, frame_num, params.classes)
+                    # No class filter here — all classes go to stabilizer
+                    dets = self._extract_raw_detections(results, frame_num, class_filter=None)
                     if dets:
                         raw_detections[frame_num] = dets
                     stats.detected_frames += 1
-                    stats.total_detections += len(dets)
 
                 frame_num += 1
 
@@ -1308,28 +1307,25 @@ The full implementation (replace the `annotate` method and add helper methods):
         total_frames: int,
         progress_callback: Callable[[int], None] | None,
     ) -> None:
-        """Pass 2: read cached frames, draw stabilized detections, encode."""
-        cache_path = output_path.parent / "frames.raw"
-        frame_size = metadata.width * metadata.height * 3
+        """Pass 2: decode video again, draw stabilized detections, encode."""
+        frame_num = 0
 
-        with open(cache_path, "rb") as cache_file, \
+        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder, \
              FFmpegEncoder(input_path, output_path, metadata.width, metadata.height,
                            metadata.fps, self.hw_config, effective_codec,
                            crf=effective_crf, bitrate=effective_bitrate) as encoder:
 
-            for frame_num in range(total_frames):
-                raw_bytes = cache_file.read(frame_size)
-                if len(raw_bytes) < frame_size:
+            while True:
+                frame = decoder.read_frame()
+                if frame is None:
                     break
-                frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(
-                    (metadata.height, metadata.width, 3)
-                ).copy()
 
                 if frame_num in stabilized:
                     self._draw_detections(frame, stabilized[frame_num].detections,
                                           params, font_scale)
 
                 encoder.write_frame(frame)
+                frame_num += 1
 
                 if progress_callback and total_frames > 0 and frame_num % 10 == 0:
                     progress = 80 + int((frame_num / total_frames) * 19)
@@ -1342,9 +1338,9 @@ Remove old `_extract_detections` method (replaced by `_extract_raw_detections`).
 
 Run: `python -m pytest tests/test_video_annotator.py -v`
 
-The two-pass pipeline uses real file I/O for frame caching (via `tmp_path`), so no mock needed for cache files. The `_setup_ffmpeg_mocks` only provides frames for pass 1 (the decoder). Pass 2 reads from the cache file on disk.
+The two-pass decode pipeline uses FFmpegDecoder twice (pass 1 for YOLO, pass 2 for render). The mock setup needs to provide frames for both passes. Update `_setup_ffmpeg_mocks` to return a decoder mock that can be instantiated twice (e.g., use `side_effect` on the mock class to return two separate decoder instances, each with their own `read_frame` side_effect).
 
-Key: the stabilizer changes stats semantics. With `StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)`, tracks only span frames where YOLO actually found the object. Adjust assertions accordingly. If a test still fails, debug by checking what the stabilizer produces for the test's detection pattern.
+Key: the stabilizer changes stats semantics. With `StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0)`, tracks only span frames where YOLO actually found the object. `total_detections` now counts stabilized boxes, not raw YOLO hits. Adjust assertions accordingly.
 
 - [ ] **Step 5: Run full test suite**
 
@@ -1381,7 +1377,7 @@ In `_annotation_worker`, update `VideoAnnotator` construction (around line 204):
                     grace_center_sec=settings.stabilizer_grace_center,
                     grace_edge_sec=settings.stabilizer_grace_edge,
                     center_zone=settings.stabilizer_center_zone,
-                    max_cache_gb=settings.stabilizer_max_cache_gb,
+                    max_staleness_sec=settings.stabilizer_max_staleness,
                 )
                 annotator = VideoAnnotator(
                     model=model_entry.model,
@@ -1429,7 +1425,7 @@ STABILIZER_MIN_VOTE_CONF=0.3    # Min conf for class voting [0-1]
 STABILIZER_GRACE_CENTER=2.0     # Grace period seconds, object in center
 STABILIZER_GRACE_EDGE=0.5       # Grace period seconds, object at edge
 STABILIZER_CENTER_ZONE=0.6      # Frame fraction considered "center" (0-1]
-STABILIZER_MAX_CACHE_GB=50      # Max frame cache disk usage in GB
+STABILIZER_MAX_STALENESS=5.0    # Max seconds before track becomes stale
 ```
 
 Add `app/detection_stabilizer.py` to the Architecture table:
@@ -1439,7 +1435,7 @@ Add `app/detection_stabilizer.py` to the Architecture table:
 
 Update the Key Patterns section — add:
 ```
-**Detection Stabilizer**: Two-pass pipeline. Pass 1 caches frames + collects YOLO detections with lowered conf. DetectionStabilizer links detections into tracks via IoU, votes on stable class, fills gaps bidirectionally with position-aware grace periods. Pass 2 renders stabilized boxes.
+**Detection Stabilizer**: Two-pass decode pipeline. Pass 1 decodes video + collects YOLO detections with lowered conf (no disk cache). DetectionStabilizer links detections into tracks via IoU, votes on stable class, fills gaps bidirectionally with position-aware grace periods. Pass 2 decodes video again + renders stabilized boxes. Class filtering applied after stabilization.
 ```
 
 - [ ] **Step 2: Commit**

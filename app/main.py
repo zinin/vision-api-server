@@ -97,7 +97,8 @@ async def lifespan(app: FastAPI):
         # Initialize ModelManager with default device for dynamic loads
         model_manager = ModelManager(
             default_device=settings.yolo_device,
-            ttl_seconds=settings.yolo_model_ttl
+            ttl_seconds=settings.yolo_model_ttl,
+            models_dir=settings.models_dir,
         )
 
         # Preload configured models with their specific devices

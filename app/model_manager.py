@@ -1,8 +1,12 @@
 import asyncio
 import logging
+import os
 import time
+import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.request import urlopen
 
 import torch
 from ultralytics import YOLO
@@ -13,6 +17,10 @@ if TYPE_CHECKING:
     from config import Settings
 
 logger = logging.getLogger(__name__)
+
+DOWNLOAD_TIMEOUT = 30  # socket timeout in seconds (per read operation)
+DOWNLOAD_RETRIES = 3
+ULTRALYTICS_ASSETS_URL = "https://github.com/ultralytics/assets/releases/download/v8.4.0"
 
 
 @dataclass
@@ -47,9 +55,10 @@ class ModelManager:
     - Cached models: loaded on-demand, evicted after TTL
     """
 
-    def __init__(self, default_device: str, ttl_seconds: int = 900):
+    def __init__(self, default_device: str, ttl_seconds: int = 900, models_dir: str = ""):
         self.default_device = default_device
         self.ttl_seconds = ttl_seconds
+        self.models_dir = models_dir
 
         self._preloaded: dict[str, ModelEntry] = {}
         self._cached: dict[str, CachedModelEntry] = {}
@@ -66,12 +75,80 @@ class ModelManager:
             return next(iter(self._preloaded.keys()))
         return None
 
+    @staticmethod
+    def _is_valid_model_file(path: Path) -> bool:
+        """Check if model file is a valid zip archive (PyTorch model format)."""
+        try:
+            with zipfile.ZipFile(path) as zf:
+                zf.namelist()
+            return True
+        except (zipfile.BadZipFile, OSError):
+            return False
+
+    @staticmethod
+    def _download_model(model_name: str, dest: Path) -> None:
+        """Download model from GitHub with timeout and retry."""
+        url = f"{ULTRALYTICS_ASSETS_URL}/{model_name}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".part")
+
+        for attempt in range(1, DOWNLOAD_RETRIES + 1):
+            try:
+                logger.info(f"Downloading {model_name} (attempt {attempt}/{DOWNLOAD_RETRIES})")
+                resp = urlopen(url, timeout=DOWNLOAD_TIMEOUT)
+                total = int(resp.getheader("Content-Length", 0))
+                downloaded = 0
+
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                if total and downloaded != total:
+                    logger.warning(f"Incomplete download: {downloaded}/{total} bytes")
+                    tmp.unlink(missing_ok=True)
+                    continue
+
+                if not ModelManager._is_valid_model_file(tmp):
+                    logger.warning(f"Downloaded file failed integrity check")
+                    tmp.unlink(missing_ok=True)
+                    continue
+
+                tmp.rename(dest)
+                logger.info(f"Model {model_name} downloaded ({downloaded / 1048576:.1f} MB)")
+                return
+
+            except Exception as e:
+                logger.warning(f"Download attempt {attempt} failed: {e}")
+                tmp.unlink(missing_ok=True)
+
+        raise RuntimeError(
+            f"Failed to download {model_name} after {DOWNLOAD_RETRIES} attempts"
+        )
+
+    def _ensure_model_file(self, model_name: str, model_path: str) -> None:
+        """Ensure model file exists and is valid, downloading if needed."""
+        path = Path(model_path)
+        if path.exists():
+            if self._is_valid_model_file(path):
+                return
+            logger.warning(f"Corrupt model file: {model_path}, removing for re-download")
+            path.unlink()
+        self._download_model(model_name, path)
+
     def _load_model_sync(self, model_name: str, device: str) -> ModelEntry:
         """Synchronously load a YOLO model on specified device (blocking)."""
         logger.info(f"Loading model: {model_name} on device: {device}")
+        model_path = os.path.join(self.models_dir, model_name) if self.models_dir else model_name
+
+        if self.models_dir:
+            self._ensure_model_file(model_name, model_path)
 
         try:
-            model = YOLO(model_name)
+            model = YOLO(model_path)
             model.to(device)
         except torch.cuda.OutOfMemoryError:
             raise RuntimeError(

@@ -13,6 +13,7 @@ services:
       VIDEO_CRF: ${VIDEO_CRF:-18}
       VIDEO_HW_ACCEL: ${VIDEO_HW_ACCEL:-nvidia}
       YOLO_DEVICE: 'cuda:0'
+      MODELS_DIR: /models
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     deploy:
@@ -22,9 +23,14 @@ services:
             - driver: nvidia
               capabilities: [gpu]
     restart: unless-stopped
+    volumes:
+      - models:/models
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+volumes:
+  models:

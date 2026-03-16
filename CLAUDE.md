@@ -56,6 +56,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 YOLO_MODELS='{"yolo26s.pt":"cuda:0"}'  # JSON: model->device
 YOLO_DEVICE=cuda                        # Default device for dynamic loads
 YOLO_MODEL_TTL=900                      # Cache TTL seconds (min 60)
+MODELS_DIR=/models                      # Model files directory (Docker volume)
 MAX_FILE_SIZE=10485760                  # Max image size (default 10MB)
 MAX_EXECUTOR_WORKERS=4                  # ThreadPool workers
 INFERENCE_TIMEOUT=30.0                  # Timeout seconds

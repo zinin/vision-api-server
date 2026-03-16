@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     yolo_models: str = '{}'
     yolo_device: str = "cpu"
     yolo_model_ttl: int = 900  # 15 minutes TTL for cached models
+    models_dir: str = ""  # Directory for model files (e.g. /models for Docker volume)
     max_file_size: int = 10 * 1024 * 1024
     allowed_extensions: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp"})
     log_level: str = "INFO"

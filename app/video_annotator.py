@@ -38,8 +38,8 @@ class AnnotationStats:
     """Video annotation processing statistics.
 
     Attributes:
-        tracked_frames: Frames where detections were reused from last
-            YOLO detection (hold mode). Previously: CSRT-tracked frames.
+        tracked_frames: Non-detection frames where at least one stabilized
+            track is active (interpolated or grace-extended).
     """
 
     total_frames: int = 0

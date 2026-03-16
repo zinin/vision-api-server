@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import copy
 import logging
 from dataclasses import dataclass, field
 
@@ -43,6 +44,7 @@ class Track:
     """A tracked object across multiple frames."""
     track_id: int
     detections: dict[int, RawDetection] = field(default_factory=dict)
+    last_det_frame: int = -1  # cached latest detection frame for O(1) staleness check
     stable_class_id: int = 0
     stable_class_name: str = ""
     first_frame: int = 0
@@ -119,17 +121,15 @@ class DetectionStabilizer:
             # Only match against active tracks (last detection within staleness window)
             active_tracks = [
                 t for t in tracks
-                if max(t.detections.keys()) >= frame_num - max_staleness_frames
+                if t.last_det_frame >= frame_num - max_staleness_frames
             ]
 
             # Compute IoU for all (track, detection) pairs
             pairs: list[tuple[float, int, int]] = []
             for ti, track in enumerate(active_tracks):
-                latest_frame = max(t for t in track.detections.keys() if t < frame_num) \
-                    if any(t < frame_num for t in track.detections.keys()) else None
-                if latest_frame is None:
+                if track.last_det_frame < 0 or track.last_det_frame >= frame_num:
                     continue
-                track_bbox = track.detections[latest_frame].bbox
+                track_bbox = track.detections[track.last_det_frame].bbox
                 for di, det in enumerate(detections):
                     iou = compute_iou(track_bbox, det.bbox)
                     if iou >= self.config.iou_threshold:
@@ -144,6 +144,7 @@ class DetectionStabilizer:
                 if ti in assigned_tracks or di in assigned_dets:
                     continue
                 active_tracks[ti].detections[frame_num] = detections[di]
+                active_tracks[ti].last_det_frame = frame_num
                 assigned_tracks.add(ti)
                 assigned_dets.add(di)
 
@@ -155,6 +156,7 @@ class DetectionStabilizer:
                     track = Track(
                         track_id=self._new_track_id(),
                         detections={frame_num: det},
+                        last_det_frame=frame_num,
                     )
                     tracks.append(track)
                 else:
@@ -326,20 +328,21 @@ class DetectionStabilizer:
         Returns a sparse dict: only frames with at least one active track are
         included. The caller should treat missing keys as "no detections on this frame".
         """
-        import copy
+        # Normalize fps to avoid division issues with corrupted metadata
+        if fps <= 0:
+            fps = 30.0
+
         tracks, unmatched_weak = self._build_tracks(
             raw_detections, conf_threshold, detect_every, fps
         )
 
-        # Deep copy unmatched_weak so backward extension for one track
-        # doesn't affect others nondeterministically
-        unmatched_weak_copy = copy.deepcopy(unmatched_weak)
-
         for track in tracks:
             self._vote_class(track)
+            # Each track gets its own copy to prevent order-dependent results
+            weak_copy = copy.deepcopy(unmatched_weak)
             self._fill_gaps(
                 track, frame_width, frame_height, fps,
-                total_frames, detect_every, unmatched_weak_copy,
+                total_frames, detect_every, weak_copy,
             )
 
         logger.info(

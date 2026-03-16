@@ -141,6 +141,160 @@ class TestBuildTracks:
             assert len(t.detections) == 2
 
 
+class TestDuplicateTrackSuppression:
+    """Overlapping YOLO detections on the same frame should not create duplicate tracks."""
+
+    def _config(self, **overrides):
+        return StabilizerConfig(**overrides)
+
+    def test_overlapping_detections_same_frame_create_one_track(self):
+        """Two overlapping high-conf detections on the same frame → one track, not two.
+
+        Bug: YOLO sometimes returns two slightly offset boxes for the same object.
+        Both have conf >= threshold, so both create new tracks. The result is
+        duplicate bounding boxes rendered on the same object.
+        """
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        raw = {
+            0: [
+                _make_raw(0, 100, 100, 300, 300, class_id=0, class_name="dog", conf=0.82),
+                _make_raw(0, 120, 110, 320, 310, class_id=0, class_name="dog", conf=0.77),
+            ],
+        }
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
+        assert len(tracks) == 1, f"Expected 1 track, got {len(tracks)} — duplicate track for same object"
+
+    def test_overlapping_detections_highest_conf_wins(self):
+        """When suppressing duplicates, the highest-confidence detection creates the track."""
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        raw = {
+            0: [
+                _make_raw(0, 100, 100, 300, 300, class_id=0, class_name="dog", conf=0.77),
+                _make_raw(0, 120, 110, 320, 310, class_id=0, class_name="dog", conf=0.82),
+            ],
+        }
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
+        assert len(tracks) == 1
+        # The track should use the higher-confidence detection
+        assert tracks[0].detections[0].confidence == 0.82
+
+    def test_non_overlapping_detections_same_frame_create_separate_tracks(self):
+        """Non-overlapping detections on the same frame should still create separate tracks."""
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        raw = {
+            0: [
+                _make_raw(0, 0, 0, 100, 100, class_id=0, class_name="dog", conf=0.82),
+                _make_raw(0, 500, 500, 700, 700, class_id=1, class_name="bench", conf=0.75),
+            ],
+        }
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
+        assert len(tracks) == 2
+
+    def test_three_overlapping_detections_suppressed_to_one(self):
+        """Three overlapping detections of the same object → one track."""
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        raw = {
+            0: [
+                _make_raw(0, 100, 100, 300, 300, conf=0.82),
+                _make_raw(0, 110, 105, 310, 305, conf=0.77),
+                _make_raw(0, 120, 110, 320, 310, conf=0.70),
+            ],
+        }
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
+        assert len(tracks) == 1
+
+    def test_suppressed_detections_go_to_unmatched_weak(self):
+        """Suppressed duplicate detections should be stored in unmatched_weak."""
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        raw = {
+            0: [
+                _make_raw(0, 100, 100, 300, 300, conf=0.82),
+                _make_raw(0, 120, 110, 320, 310, conf=0.77),
+            ],
+        }
+        tracks, unmatched = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
+        assert len(tracks) == 1
+        assert len(unmatched.get(0, [])) == 1
+
+    def test_duplicate_when_one_matches_existing_track(self):
+        """YOLO returns two near-identical detections: one matches an existing track,
+        the other must NOT create a new track.
+
+        Bug: greedy matching assigns det_A to Track 1. det_B is unassigned.
+        Input NMS only checks new candidates against each other, not against
+        assigned detections, so det_B creates a spurious Track 2.
+        """
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        raw = {
+            0: [_make_raw(0, 300, 300, 500, 500, conf=0.9)],
+            5: [
+                _make_raw(5, 305, 305, 505, 505, conf=0.85),  # matches Track 1
+                _make_raw(5, 310, 310, 510, 510, conf=0.80),  # YOLO duplicate
+            ],
+        }
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
+        assert len(tracks) == 1, f"Expected 1 track, got {len(tracks)} — duplicate from assigned overlap"
+
+    def test_output_nms_direct(self):
+        """Direct test of _nms_boxes: overlapping boxes suppressed, non-overlapping kept."""
+        from visualization import DetectionBox
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        boxes = [
+            DetectionBox(x1=100, y1=100, x2=300, y2=300, class_id=0, class_name="dog", confidence=0.9),
+            DetectionBox(x1=120, y1=110, x2=320, y2=310, class_id=0, class_name="dog", confidence=0.7),
+            DetectionBox(x1=600, y1=600, x2=800, y2=800, class_id=1, class_name="cat", confidence=0.8),
+        ]
+        result = stabilizer._nms_boxes(boxes)
+        assert len(result) == 2
+        assert result[0].confidence == 0.9  # dog (higher conf kept)
+        assert result[1].confidence == 0.8  # cat (no overlap, kept)
+
+    def test_small_box_inside_large_suppressed_input(self):
+        """Small box fully inside large box (head vs full body) — must not create 2 tracks.
+
+        Root cause: YOLO detects full body (large box) and head/torso (small box).
+        IoU is low because small_area/large_area < 0.3. But containment is ~1.0.
+        NMS must use containment ratio (intersection / min_area), not just IoU.
+        """
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        raw = {
+            0: [
+                # Full body — large box
+                _make_raw(0, 100, 100, 500, 500, class_id=0, class_name="dog", conf=0.84),
+                # Head only — small box fully inside the large one
+                _make_raw(0, 200, 150, 350, 300, class_id=0, class_name="dog", conf=0.66),
+            ],
+        }
+        tracks, _ = stabilizer._build_tracks(raw, conf_threshold=0.5, detect_every=5, fps=30.0)
+        assert len(tracks) == 1, f"Expected 1 track, got {len(tracks)} — small box inside large not suppressed"
+
+    def test_small_box_inside_large_suppressed_output(self):
+        """Output NMS must also catch containment (small box inside large)."""
+        from visualization import DetectionBox
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        boxes = [
+            # Full body
+            DetectionBox(x1=100, y1=100, x2=500, y2=500, class_id=0, class_name="dog", confidence=0.84),
+            # Head — inside the full body box. IoU ≈ 0.14, but containment = 1.0
+            DetectionBox(x1=200, y1=150, x2=350, y2=300, class_id=0, class_name="dog", confidence=0.66),
+        ]
+        result = stabilizer._nms_boxes(boxes)
+        assert len(result) == 1
+        assert result[0].confidence == 0.84
+
+    def test_side_by_side_boxes_not_suppressed(self):
+        """Two objects side by side with partial overlap — must NOT be suppressed."""
+        from visualization import DetectionBox
+        stabilizer = DetectionStabilizer(self._config(iou_threshold=0.3))
+        boxes = [
+            DetectionBox(x1=100, y1=100, x2=300, y2=300, class_id=0, class_name="dog", confidence=0.9),
+            # Partially overlapping but mostly separate — 50px overlap on x
+            DetectionBox(x1=250, y1=100, x2=450, y2=300, class_id=1, class_name="cat", confidence=0.8),
+        ]
+        result = stabilizer._nms_boxes(boxes)
+        assert len(result) == 2  # both kept — legitimate separate objects
+
+
 class TestClassVoting:
     def _config(self, **overrides):
         return StabilizerConfig(**overrides)
@@ -208,7 +362,8 @@ class TestGapFilling:
         stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
                               total_frames=200, detect_every=5, unmatched_weak={})
         assert track.last_frame == 60
-        assert track.first_frame == 40
+        # No backward grace — first_frame stays at first detection
+        assert track.first_frame == 50
 
     def test_forward_grace_period_edge(self):
         config = self._config(grace_center_sec=2.0, grace_edge_sec=0.5)
@@ -220,7 +375,8 @@ class TestGapFilling:
         stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
                               total_frames=200, detect_every=5, unmatched_weak={})
         assert track.last_frame == 55
-        assert track.first_frame == 45
+        # No backward grace — first_frame stays at first detection
+        assert track.first_frame == 50
 
     def test_grace_period_capped_at_total_frames(self):
         config = self._config(grace_center_sec=10.0)
@@ -233,7 +389,8 @@ class TestGapFilling:
                               total_frames=100, detect_every=5, unmatched_weak={})
         assert track.last_frame == 99
 
-    def test_grace_period_capped_at_zero(self):
+    def test_backward_grace_not_applied(self):
+        """Even with large grace settings, backward grace is not applied."""
         config = self._config(grace_center_sec=10.0)
         stabilizer = DetectionStabilizer(config)
         track = Track(track_id=0, detections={
@@ -242,7 +399,8 @@ class TestGapFilling:
         stabilizer._vote_class(track)
         stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
                               total_frames=200, detect_every=5, unmatched_weak={})
-        assert track.first_frame == 0
+        # No backward grace — first_frame stays at first detection
+        assert track.first_frame == 3
 
     def test_backward_extension_with_unmatched_weak(self):
         config = self._config(grace_center_sec=0.0, grace_edge_sec=0.0)
@@ -277,6 +435,27 @@ class TestGapFilling:
                               total_frames=100, detect_every=5, unmatched_weak=unmatched)
         assert 10 in track.detections
         assert 5 not in track.detections
+
+    def test_no_backward_grace_period(self):
+        """Backward grace period should NOT be applied — only forward grace.
+
+        Bug: for moving objects, backward grace holds the first detection's bbox
+        for frames before the first detection, showing the box in a position the
+        object hasn't reached yet.
+        """
+        config = self._config(grace_center_sec=2.0, grace_edge_sec=0.5)
+        stabilizer = DetectionStabilizer(config)
+        # Object in center of frame, first detected at frame 50
+        track = Track(track_id=0, detections={
+            50: _make_raw(50, 400, 400, 600, 600, conf=0.9),
+        })
+        stabilizer._vote_class(track)
+        stabilizer._fill_gaps(track, frame_width=1000, frame_height=1000, fps=10.0,
+                              total_frames=200, detect_every=5, unmatched_weak={})
+        # Forward grace should still work
+        assert track.last_frame == 70  # 50 + 2.0*10
+        # Backward grace should NOT extend before first detection
+        assert track.first_frame == 50
 
     def test_interpolation_between_detections(self):
         config = self._config(grace_center_sec=0.0, grace_edge_sec=0.0, iou_threshold=0.0)

@@ -84,6 +84,52 @@ def compute_iou(
     return intersection / union
 
 
+_NMS_CONTAINMENT_THRESHOLD = 0.6
+"""If intersection / min(area_a, area_b) >= this, boxes are considered duplicates.
+
+Catches cases where a small box (head detection) is inside a large box (full body)
+but IoU is low because the union is dominated by the larger box.
+"""
+
+
+def is_nms_duplicate(
+    box_a: tuple[int, int, int, int],
+    box_b: tuple[int, int, int, int],
+    iou_threshold: float,
+) -> bool:
+    """Check if two boxes are duplicates for NMS purposes.
+
+    Returns True if IoU >= iou_threshold OR containment >= 0.6.
+    Containment = intersection / min(area_a, area_b).
+    """
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+
+    inter_w = max(0, x2 - x1)
+    inter_h = max(0, y2 - y1)
+    intersection = inter_w * inter_h
+
+    if intersection == 0:
+        return False
+
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+
+    # IoU check
+    union = area_a + area_b - intersection
+    if union > 0 and intersection / union >= iou_threshold:
+        return True
+
+    # Containment check (small box inside large box)
+    min_area = min(area_a, area_b)
+    if min_area > 0 and intersection / min_area >= _NMS_CONTAINMENT_THRESHOLD:
+        return True
+
+    return False
+
+
 class DetectionStabilizer:
     """Post-processor that stabilizes YOLO detections across video frames."""
 
@@ -148,19 +194,49 @@ class DetectionStabilizer:
                 assigned_tracks.add(ti)
                 assigned_dets.add(di)
 
-            # Handle unassigned detections
+            # Handle unassigned detections — apply NMS to prevent duplicate tracks
+            new_candidates: list[RawDetection] = []
             for di, det in enumerate(detections):
                 if di in assigned_dets:
                     continue
                 if det.confidence >= conf_threshold:
+                    new_candidates.append(det)
+                else:
+                    unmatched_weak.setdefault(frame_num, []).append(det)
+
+            # Collect bboxes of detections already assigned to tracks on this frame
+            assigned_bboxes = [detections[di].bbox for di in assigned_dets]
+
+            # NMS: suppress candidates overlapping with assigned dets or each other
+            new_candidates.sort(key=lambda d: d.confidence, reverse=True)
+            suppressed: set[int] = set()
+            for i in range(len(new_candidates)):
+                if i in suppressed:
+                    continue
+                # Check against detections already assigned to existing tracks
+                for ab in assigned_bboxes:
+                    if is_nms_duplicate(new_candidates[i].bbox, ab, self.config.iou_threshold):
+                        suppressed.add(i)
+                        break
+                if i in suppressed:
+                    continue
+                # Check against other new candidates (higher-conf wins)
+                for j in range(i + 1, len(new_candidates)):
+                    if j in suppressed:
+                        continue
+                    if is_nms_duplicate(new_candidates[i].bbox, new_candidates[j].bbox, self.config.iou_threshold):
+                        suppressed.add(j)
+
+            for i, det in enumerate(new_candidates):
+                if i in suppressed:
+                    unmatched_weak.setdefault(frame_num, []).append(det)
+                else:
                     track = Track(
                         track_id=self._new_track_id(),
                         detections={frame_num: det},
                         last_det_frame=frame_num,
                     )
                     tracks.append(track)
-                else:
-                    unmatched_weak.setdefault(frame_num, []).append(det)
 
         return tracks, unmatched_weak
 
@@ -245,14 +321,13 @@ class DetectionStabilizer:
         first_det_frame = sorted_frames[0]
         last_det_frame = sorted_frames[-1]
 
-        # Grace periods
-        first_det = track.detections[first_det_frame]
+        # Forward grace period only — backward grace is not applied because
+        # it holds the first detection's bbox for earlier frames, which is
+        # incorrect for moving objects (shows box where object hasn't arrived yet).
         last_det = track.detections[last_det_frame]
-
-        backward_grace = self._grace_frames(first_det, frame_width, frame_height, fps)
         forward_grace = self._grace_frames(last_det, frame_width, frame_height, fps)
 
-        track.first_frame = max(0, first_det_frame - backward_grace)
+        track.first_frame = first_det_frame
         track.last_frame = min(total_frames - 1, last_det_frame + forward_grace)
 
     @staticmethod
@@ -376,6 +451,24 @@ class DetectionStabilizer:
                         confidence=track_confs[track.track_id],
                     ))
             if boxes:
+                boxes = self._nms_boxes(boxes)
                 result[frame_num] = StabilizedFrame(detections=boxes)
 
         return result
+
+    def _nms_boxes(self, boxes: list[DetectionBox]) -> list[DetectionBox]:
+        """Suppress overlapping boxes on the same frame (safety net for duplicate tracks)."""
+        if len(boxes) <= 1:
+            return boxes
+        boxes.sort(key=lambda b: b.confidence, reverse=True)
+        keep: list[DetectionBox] = []
+        for box in boxes:
+            bbox = (box.x1, box.y1, box.x2, box.y2)
+            is_dup = False
+            for kept in keep:
+                if is_nms_duplicate(bbox, (kept.x1, kept.y1, kept.x2, kept.y2), self.config.iou_threshold):
+                    is_dup = True
+                    break
+            if not is_dup:
+                keep.append(box)
+        return keep

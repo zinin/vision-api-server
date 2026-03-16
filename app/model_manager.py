@@ -139,10 +139,16 @@ class ModelManager:
             path.unlink()
         self._download_model(model_name, path)
 
+    @staticmethod
+    def _safe_model_path(models_dir: str, model_name: str) -> str:
+        """Resolve model path ensuring it stays within models_dir (path traversal protection)."""
+        resolved = Path(models_dir).resolve() / Path(model_name).name
+        return str(resolved)
+
     def _load_model_sync(self, model_name: str, device: str) -> ModelEntry:
         """Synchronously load a YOLO model on specified device (blocking)."""
         logger.info(f"Loading model: {model_name} on device: {device}")
-        model_path = os.path.join(self.models_dir, model_name) if self.models_dir else model_name
+        model_path = self._safe_model_path(self.models_dir, model_name) if self.models_dir else model_name
 
         if self.models_dir:
             self._ensure_model_file(model_name, model_path)

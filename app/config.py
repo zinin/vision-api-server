@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     models_dir: str = ""  # Directory for model files (e.g. /models for Docker volume)
     max_file_size: int = 10 * 1024 * 1024
     allowed_extensions: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp"})
+    port: int = 8000
     log_level: str = "INFO"
     inference_timeout: float = 30.0
     max_executor_workers: int = 4

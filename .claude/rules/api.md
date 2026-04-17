@@ -117,6 +117,14 @@ Cooperative cancellation: the running annotation stops at the next frame boundar
 | COMPLETED or FAILED | 409 Conflict |
 | Unknown / TTL-expired | 404 Not Found |
 
+**409 Conflict body:**
+
+```json
+{"detail": "Cannot cancel job in terminal status 'completed'"}
+```
+
+The `detail` string names the current terminal status (`completed` or `failed`).
+
 **Example:**
 
 ```bash
@@ -127,15 +135,17 @@ Response:
 ```json
 {
   "job_id": "abc123def456",
-  "status": "cancelled",
+  "status": "processing",
   "progress": 42,
   "created_at": "2026-04-17T12:00:00+00:00",
-  "completed_at": "2026-04-17T12:01:30+00:00",
+  "completed_at": null,
   "download_url": null,
   "error": null,
   "stats": null
 }
 ```
+
+Poll `GET /jobs/{job_id}` — after the worker observes the cancel, `status` becomes `"cancelled"` and `completed_at` is populated. For a job cancelled while still `QUEUED`, the immediate response already shows `status: "cancelled"`.
 
 ## Info Endpoints
 

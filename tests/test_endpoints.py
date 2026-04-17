@@ -245,6 +245,26 @@ class TestCancelJob:
         # Status NOT flipped by the endpoint — still PROCESSING.
         assert job_manager_for_tests.get_job(job.job_id).status == JobStatus.PROCESSING
 
+    def test_cancel_processing_idempotent(self, client, job_manager_for_tests):
+        """Repeated /cancel on PROCESSING job is idempotent: 200 + status unchanged."""
+        from job_manager import JobStatus
+        job = job_manager_for_tests.create_job(params={})
+        assert job_manager_for_tests.mark_processing(job.job_id) is True
+
+        # First cancel: sets event, status stays PROCESSING
+        resp1 = client.post(f"/jobs/{job.job_id}/cancel")
+        assert resp1.status_code == 200
+        assert resp1.json()["status"] == "processing"
+        assert job.cancel_event.is_set()
+
+        # Second cancel: still 200, still processing, event already set
+        resp2 = client.post(f"/jobs/{job.job_id}/cancel")
+        assert resp2.status_code == 200
+        assert resp2.json()["status"] == "processing"
+        assert job.cancel_event.is_set()
+        # Status stable — worker hasn't run in this test.
+        assert job_manager_for_tests.get_job(job.job_id).status == JobStatus.PROCESSING
+
     def test_cancel_unknown_returns_404(self, client):
         resp = client.post("/jobs/does-not-exist/cancel")
         assert resp.status_code == 404

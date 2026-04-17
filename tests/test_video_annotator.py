@@ -1179,8 +1179,14 @@ class TestAnnotateCancellation:
         # Pass 2 encoder must NOT have been constructed.
         assert mock_encoder_cls.call_count == 0
 
-    def test_cancel_between_passes_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
-        """Cancel arrives after pass 1 finishes — pass 2 must not spin up FFmpeg."""
+    def test_cancel_after_pass1_skips_pass2(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """Cancel fires from last pass-1 predict — pass 2 FFmpeg must not start.
+
+        Companion to ``test_cancel_after_pass1_skips_stabilize``: both exercise
+        the same trigger (cancel from the last pass-1 predict call), hitting
+        the pre-stabilize guard first, but assert different downstream effects
+        (this one: no pass-2 decoder/encoder construction).
+        """
         from video_annotator import JobCancelledError
 
         num_frames = 5

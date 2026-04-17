@@ -222,8 +222,11 @@ class VideoAnnotator:
                 if frame_num % params.detect_every != 0:
                     stats.tracked_frames += 1
 
-        # Guard between pass 1 and pass 2 — avoids unnecessary FFmpeg subprocess
-        # startup (especially GPU encoder init) when cancel arrived late in pass 1.
+        # Post-stabilize guard — defence in depth. Today this is reachable only
+        # if cancel arrives *during* stabilize() (which itself is not
+        # cancel-aware), not at the tail of pass 1 (the pre-stabilize guard
+        # above catches that case). The check is cheap and covers a future
+        # cancel-aware stabilizer without further changes to annotate().
         if cancel_event is not None and cancel_event.is_set():
             raise JobCancelledError()
 

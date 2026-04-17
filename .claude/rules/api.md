@@ -100,6 +100,60 @@ Extract key frames without detection.
 }
 ```
 
+## Job Endpoints
+
+### POST /jobs/{job_id}/cancel
+
+Cancel a queued or processing video annotation job.
+
+Cooperative cancellation. The immediate response to `/cancel` on a PROCESSING job returns `status: "processing"`; the worker flips it to `cancelled` after observing the event. Poll `GET /jobs/{job_id}` to see the terminal status.
+
+**Latency has two parts:**
+
+- **Checkpoint latency** — time from `/cancel` to the worker raising `JobCancelledError` inside `annotate`. Bounded by one frame's work (one YOLO inference in pass 1, or one decode+encode frame in pass 2). Typically sub-second on GPU; a few seconds on CPU / large models.
+- **Terminal-transition latency** — time from `JobCancelledError` until `status` flips to `cancelled`. The exception must propagate through the FFmpeg context managers, which wait for the subprocesses to exit (decoder up to ~10 s, encoder up to ~300 s — encoders normally need to flush buffers and rewrite the MP4 `moov` atom). GPU path is typically 1–2 s; CPU / 4K encode may take tens of seconds to a few minutes in the worst case. Hard-killing FFmpeg is a non-goal.
+
+**Completion race.** If `/cancel` arrives while the annotator is finalising the last frame, the job may have already transitioned to `completed` by the time the event would have been observed. In that case the follow-up `GET /jobs/{job_id}` returns `completed`, not `cancelled`. Clients must treat `completed` after a `/cancel` call as "work finished before cancellation took effect" and use `/jobs/{job_id}/download` as normal.
+
+**Response codes:**
+
+| Case | Code |
+|------|------|
+| QUEUED or PROCESSING | 200 + `JobStatusResponse` |
+| Already CANCELLED (idempotent) | 200 + `JobStatusResponse` |
+| COMPLETED or FAILED | 409 Conflict |
+| Unknown / TTL-expired | 404 Not Found |
+
+**409 Conflict body:**
+
+```json
+{"detail": "Cannot cancel job in terminal status 'completed'"}
+```
+
+The `detail` string names the current terminal status (`completed` or `failed`).
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:3001/jobs/abc123def456/cancel
+```
+
+Response:
+```json
+{
+  "job_id": "abc123def456",
+  "status": "processing",
+  "progress": 42,
+  "created_at": "2026-04-17T12:00:00+00:00",
+  "completed_at": null,
+  "download_url": null,
+  "error": null,
+  "stats": null
+}
+```
+
+Poll `GET /jobs/{job_id}` — after the worker observes the cancel, `status` becomes `"cancelled"` and `completed_at` is populated. For a job cancelled while still `QUEUED`, the immediate response already shows `status: "cancelled"`.
+
 ## Info Endpoints
 
 ### GET /models

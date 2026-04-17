@@ -1,6 +1,7 @@
 import json
 import logging
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +109,10 @@ def _parse_fps(avg_frame_rate: str | None, r_frame_rate: str | None) -> float:
     return 30.0
 
 
+class JobCancelledError(Exception):
+    """Raised inside annotate() when cancel_event is set."""
+
+
 class VideoAnnotator:
     """Annotate video with YOLO detections and hold mode."""
 
@@ -135,6 +140,7 @@ class VideoAnnotator:
         output_path: Path,
         params: AnnotationParams,
         progress_callback: Callable[[int], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AnnotationStats:
         """
         Annotate video with bounding boxes using two-pass decode pipeline.
@@ -151,6 +157,11 @@ class VideoAnnotator:
             params: Annotation parameters
             progress_callback: Called with progress 0-99 during processing
         """
+        # Early cancel check — closes the narrow window between the worker's
+        # pre-executor check and the start of ffprobe in this thread.
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelledError()
+
         metadata = self._get_video_metadata(input_path)
 
         # Resolve codec (unchanged logic)
@@ -173,8 +184,14 @@ class VideoAnnotator:
         raw_detections, actual_frames = self._pass1_collect(
             input_path, metadata, params, yolo_conf,
             progress_callback, stats,
+            cancel_event=cancel_event,
         )
         stats.total_frames = actual_frames
+
+        # Guard after pass 1, before stabilize — avoids CPU cost of track
+        # stabilization when cancel arrived at the tail of pass 1.
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelledError()
 
         # Stabilize
         stabilizer = DetectionStabilizer(self.stabilizer_config)
@@ -205,12 +222,21 @@ class VideoAnnotator:
                 if frame_num % params.detect_every != 0:
                     stats.tracked_frames += 1
 
+        # Post-stabilize guard — defence in depth. Today this is reachable only
+        # if cancel arrives *during* stabilize() (which itself is not
+        # cancel-aware), not at the tail of pass 1 (the pre-stabilize guard
+        # above catches that case). The check is cheap and covers a future
+        # cancel-aware stabilizer without further changes to annotate().
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelledError()
+
         # Pass 2: decode again + render
         font_scale = self.visualizer.calculate_adaptive_font_scale(metadata.height)
         self._pass2_render(
             input_path, output_path, metadata, params, stabilized,
             effective_codec, effective_crf, effective_bitrate,
             font_scale, actual_frames, progress_callback,
+            cancel_event=cancel_event,
         )
 
         stats.processing_time_ms = int((time.perf_counter() - start_time) * 1000)
@@ -247,6 +273,7 @@ class VideoAnnotator:
         yolo_conf: float,
         progress_callback: Callable[[int], None] | None,
         stats: AnnotationStats,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[dict[int, list[RawDetection]], int]:
         """Pass 1: decode frames, run YOLO, collect raw detections (no disk cache)."""
         raw_detections: dict[int, list[RawDetection]] = {}
@@ -254,6 +281,8 @@ class VideoAnnotator:
 
         with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise JobCancelledError()
                 frame = decoder.read_frame()
                 if frame is None:
                     break
@@ -398,6 +427,7 @@ class VideoAnnotator:
         font_scale: float,
         total_frames: int,
         progress_callback: Callable[[int], None] | None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Pass 2: decode video again, draw stabilized detections, encode."""
         frame_num = 0
@@ -408,6 +438,8 @@ class VideoAnnotator:
                            crf=effective_crf, bitrate=effective_bitrate) as encoder:
 
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise JobCancelledError()
                 frame = decoder.read_frame()
                 if frame is None:
                     break

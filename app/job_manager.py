@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import shutil
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(slots=True)
@@ -30,10 +32,30 @@ class Job:
     output_path: Path | None = None
     params: dict = field(default_factory=dict)
     stats: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 class JobManager:
-    """In-memory job manager with async queue and TTL cleanup."""
+    """In-memory job manager with async queue and TTL cleanup.
+
+    Thread-safety invariant:
+        All status-mutating methods (``mark_processing``, ``mark_completed``,
+        ``mark_failed``, ``mark_cancelled``, ``request_cancel``) must be
+        called from the asyncio event-loop thread only. ``_jobs`` and
+        ``_queue`` are not protected by a lock — the single-event-loop
+        assumption is what keeps them consistent.
+
+        ``cancel_event`` on each ``Job`` is the only sanctioned cross-thread
+        channel: set from the event-loop thread, read from the executor
+        thread inside ``VideoAnnotator.annotate``. ``threading.Event`` is
+        safe for this handoff.
+
+        ``update_progress`` is the one exception to the event-loop-only
+        rule — the annotator progress callback invokes it from the executor
+        thread. It writes a single int field (``job.progress``), which is
+        atomic under the GIL. Do not extend this method to touch ``status``
+        or any multi-field state without adding a lock.
+    """
 
     def __init__(self, jobs_dir: str, ttl_seconds: int = 3600, max_queued: int = 10):
         self.jobs_dir = Path(jobs_dir)
@@ -48,10 +70,13 @@ class JobManager:
         )
 
     def check_queue_capacity(self) -> None:
-        """Raise RuntimeError if queue is full. Call before expensive upload."""
-        queued_count = sum(
-            1 for j in self._jobs.values() if j.status == JobStatus.QUEUED
-        )
+        """Raise RuntimeError if queue is full. Call before expensive upload.
+
+        ``asyncio.Queue.qsize()`` is documented as approximate, but in this
+        single-event-loop design it is exact: put/get on ``self._queue`` only
+        happens from the event-loop thread, so the count cannot race.
+        """
+        queued_count = self._queue.qsize()
         if queued_count >= self.max_queued:
             raise RuntimeError(
                 f"Too many queued jobs ({queued_count}/{self.max_queued})"
@@ -84,13 +109,19 @@ class JobManager:
             job.progress = progress
             logger.debug(f"Job {job_id}: progress {progress}%")
 
-    def mark_processing(self, job_id: str) -> None:
+    def mark_processing(self, job_id: str) -> bool:
+        """CAS: flip QUEUED → PROCESSING atomically.
+
+        Returns True if the transition happened, False if the job is no longer
+        QUEUED (for example, /cancel arrived between the worker's guard check
+        and this call). Worker must treat False as a signal to skip.
+        """
         job = self._jobs.get(job_id)
-        if job:
-            if job.status != JobStatus.QUEUED:
-                logger.warning(f"Job {job_id} unexpected state for processing: {job.status}")
-            job.status = JobStatus.PROCESSING
-            logger.info(f"Job processing: {job_id}")
+        if job is None or job.status != JobStatus.QUEUED:
+            return False
+        job.status = JobStatus.PROCESSING
+        logger.info(f"Job processing: {job_id}")
+        return True
 
     def mark_completed(
         self, job_id: str, output_path: Path, stats: dict
@@ -112,6 +143,61 @@ class JobManager:
             job.error = error
             logger.error(f"Job failed: {job_id}: {error}")
 
+    def mark_cancelled(self, job_id: str) -> None:
+        """Called by the worker after JobCancelledError propagates out of annotate().
+
+        No-op if the job is unknown or already in a terminal status."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+            logger.warning(
+                f"Refusing to mark {job.status.value} job {job_id} as cancelled"
+            )
+            return
+        job.status = JobStatus.CANCELLED
+        job.completed_at = datetime.now(tz=timezone.utc)
+        logger.info(f"Job cancelled: {job_id}")
+
+    def request_cancel(self, job_id: str) -> Job:
+        """Idempotent cancellation request.
+
+        Raises:
+            KeyError: if job_id is unknown.
+            ValueError: if job is in a non-cancellable terminal status
+                (COMPLETED or FAILED).
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            raise ValueError(
+                f"Cannot cancel job in terminal status '{job.status.value}'"
+            )
+
+        prev_status = job.status
+        job.cancel_event.set()
+
+        if prev_status == JobStatus.QUEUED:
+            job.status = JobStatus.CANCELLED
+            job.completed_at = datetime.now(tz=timezone.utc)
+            # Delete the uploaded input file so it does not linger until TTL.
+            # The worker's finally block never runs for queued-skipped jobs.
+            if job.input_path is not None:
+                try:
+                    job.input_path.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.warning(
+                        f"Failed to delete input file for cancelled job {job_id}: {e}"
+                    )
+
+        if prev_status == JobStatus.CANCELLED:
+            logger.debug(f"Job {job_id}: idempotent cancel no-op")
+        else:
+            logger.info(f"Job {job_id}: cancel requested (was {prev_status.value})")
+        return job
+
     async def get_next_job_id(self) -> str:
         return await self._queue.get()
 
@@ -119,7 +205,7 @@ class JobManager:
         now = time.time()
         expired = []
         for job_id, job in self._jobs.items():
-            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
                 if job.completed_at:
                     elapsed = now - job.completed_at.timestamp()
                     if elapsed > self.ttl_seconds:

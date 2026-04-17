@@ -25,6 +25,7 @@ from image_utils import validate_and_decode_image
 from inference_utils import run_inference, build_detection_response, shutdown_executor
 from models import (
     DetectionResponse,
+    ErrorResponse,
     VideoDetectionResponse,
     FrameDetection,
     Detection,
@@ -37,7 +38,7 @@ from models import (
 )
 from visualization import encode_image_to_bytes
 from job_manager import JobManager, JobStatus
-from video_annotator import VideoAnnotator, AnnotationParams
+from video_annotator import VideoAnnotator, AnnotationParams, JobCancelledError
 from detection_stabilizer import StabilizerConfig
 from inference_utils import get_executor
 from video_utils import extract_frames_from_video, VideoFrameExtractor
@@ -187,9 +188,14 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
             job_id = await job_manager.get_next_job_id()
             job = job_manager.get_job(job_id)
             if job is None:
+                logger.warning(
+                    f"Job {job_id} disappeared from registry before dispatch, skipping"
+                )
+                continue
+            if not job_manager.mark_processing(job_id):
+                logger.info(f"Job {job_id} cancelled while queued, skipping")
                 continue
 
-            job_manager.mark_processing(job_id)
             logger.info(f"Worker picked up job {job_id}, params: {job.params}")
 
             try:
@@ -199,51 +205,80 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                 try:
                     model_entry = await model_manager.get_model(model_name)
                 except (RuntimeError, ValueError) as e:
-                    job_manager.mark_failed(job_id, f"Model error: {e}")
+                    if job.cancel_event.is_set():
+                        logger.info(
+                            f"Job {job_id} cancelled during model load "
+                            f"(suppressed {type(e).__name__})"
+                        )
+                        job_manager.mark_cancelled(job_id)
+                    else:
+                        job_manager.mark_failed(job_id, f"Model error: {e}")
                     continue
                 logger.debug(f"Job {job_id}: model loaded, device={model_entry.device}")
 
-                stabilizer_config = StabilizerConfig(
-                    conf_factor=settings.stabilizer_conf_factor,
-                    iou_threshold=settings.stabilizer_iou_threshold,
-                    min_vote_conf=settings.stabilizer_min_vote_conf,
-                    grace_center_sec=settings.stabilizer_grace_center,
-                    grace_edge_sec=settings.stabilizer_grace_edge,
-                    center_zone=settings.stabilizer_center_zone,
-                    max_staleness_sec=settings.stabilizer_max_staleness,
-                )
-                annotator = VideoAnnotator(
-                    model=model_entry.model,
-                    visualizer=model_entry.visualizer,
-                    class_names=model_entry.model.names,
-                    hw_config=app.state.hw_config,
-                    codec=settings.video_codec,
-                    crf=settings.video_crf,
-                    stabilizer_config=stabilizer_config,
-                )
+                if job.cancel_event.is_set():
+                    logger.info(
+                        f"Job {job_id} cancelled after successful model load, skipping annotate"
+                    )
+                    job_manager.mark_cancelled(job_id)
+                    continue
 
-                params = AnnotationParams(
-                    conf=job.params.get("conf", 0.5),
-                    imgsz=job.params.get("imgsz", 640),
-                    max_det=job.params.get("max_det", 100),
-                    detect_every=job.params.get(
-                        "detect_every", settings.default_detect_every
-                    ),
-                    classes=job.params.get("classes"),
-                    line_width=job.params.get("line_width", 2),
-                    show_labels=job.params.get("show_labels", True),
-                    show_conf=job.params.get("show_conf", True),
-                )
+                try:
+                    stabilizer_config = StabilizerConfig(
+                        conf_factor=settings.stabilizer_conf_factor,
+                        iou_threshold=settings.stabilizer_iou_threshold,
+                        min_vote_conf=settings.stabilizer_min_vote_conf,
+                        grace_center_sec=settings.stabilizer_grace_center,
+                        grace_edge_sec=settings.stabilizer_grace_edge,
+                        center_zone=settings.stabilizer_center_zone,
+                        max_staleness_sec=settings.stabilizer_max_staleness,
+                    )
+                    annotator = VideoAnnotator(
+                        model=model_entry.model,
+                        visualizer=model_entry.visualizer,
+                        class_names=model_entry.model.names,
+                        hw_config=app.state.hw_config,
+                        codec=settings.video_codec,
+                        crf=settings.video_crf,
+                        stabilizer_config=stabilizer_config,
+                    )
 
-                output_path = job.input_path.parent / "output.mp4"
+                    params = AnnotationParams(
+                        conf=job.params.get("conf", 0.5),
+                        imgsz=job.params.get("imgsz", 640),
+                        max_det=job.params.get("max_det", 100),
+                        detect_every=job.params.get(
+                            "detect_every", settings.default_detect_every
+                        ),
+                        classes=job.params.get("classes"),
+                        line_width=job.params.get("line_width", 2),
+                        show_labels=job.params.get("show_labels", True),
+                        show_conf=job.params.get("show_conf", True),
+                    )
 
-                def progress_cb(progress: int) -> None:
-                    job_manager.update_progress(job_id, progress)
+                    output_path = job.input_path.parent / "output.mp4"
 
-                # Run in executor (blocking I/O + YOLO inference)
-                logger.debug(f"Job {job_id}: submitting to executor")
-                loop = asyncio.get_running_loop()
-                executor = get_executor(settings.max_executor_workers).executor
+                    def progress_cb(progress: int) -> None:
+                        job_manager.update_progress(job_id, progress)
+
+                    logger.debug(f"Job {job_id}: submitting to executor")
+                    loop = asyncio.get_running_loop()
+                    executor = get_executor(settings.max_executor_workers).executor
+                except Exception as e:
+                    if job.cancel_event.is_set():
+                        logger.info(
+                            f"Job {job_id} cancelled during setup "
+                            f"(suppressed {type(e).__name__})"
+                        )
+                        job_manager.mark_cancelled(job_id)
+                    else:
+                        logger.error(
+                            f"Job {job_id} setup failed: {e}",
+                            exc_info=True,
+                        )
+                        job_manager.mark_failed(job_id, f"Setup error: {e}")
+                    continue
+
                 try:
                     stats = await loop.run_in_executor(
                         executor,
@@ -252,6 +287,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                             output_path=output_path,
                             params=params,
                             progress_callback=progress_cb,
+                            cancel_event=job.cancel_event,
                         ),
                     )
 
@@ -270,6 +306,14 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                             "processing_time_ms": stats.processing_time_ms,
                         },
                     )
+
+                except JobCancelledError:
+                    logger.info(f"Job {job_id} cancelled during processing")
+                    job_manager.mark_cancelled(job_id)
+                    try:
+                        output_path.unlink(missing_ok=True)
+                    except OSError as e:
+                        logger.warning(f"Failed to remove partial output for {job_id}: {e}")
 
                 except Exception as e:
                     logger.error(
@@ -853,6 +897,11 @@ ClassesQuery = Annotated[
     response_model=JobCreatedResponse,
     status_code=202,
     tags=["Video Annotation"],
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid video format or invalid model name"},
+        413: {"model": ErrorResponse, "description": "Video file too large"},
+        429: {"model": ErrorResponse, "description": "Job queue is full"},
+    },
 )
 async def annotate_video(
     file: UploadFile = File(..., description="Video file for annotation"),
@@ -974,7 +1023,14 @@ async def annotate_video(
     )
 
 
-@app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Jobs"])
+@app.get(
+    "/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    tags=["Jobs"],
+    responses={
+        404: {"model": ErrorResponse, "description": "Job not found"},
+    },
+)
 async def get_job_status(
     job_id: str,
     job_manager: JobManager = Depends(get_job_manager),
@@ -1006,7 +1062,14 @@ async def get_job_status(
     )
 
 
-@app.get("/jobs/{job_id}/download", tags=["Jobs"])
+@app.get(
+    "/jobs/{job_id}/download",
+    tags=["Jobs"],
+    responses={
+        400: {"model": ErrorResponse, "description": "Job not ready (not in COMPLETED status)"},
+        404: {"model": ErrorResponse, "description": "Job not found, or output file missing"},
+    },
+)
 async def download_job_result(
     job_id: str,
     job_manager: JobManager = Depends(get_job_manager),
@@ -1031,6 +1094,52 @@ async def download_job_result(
         path=str(job.output_path),
         media_type="video/mp4",
         filename=f"annotated_{job_id}.mp4",
+    )
+
+
+@app.post(
+    "/jobs/{job_id}/cancel",
+    response_model=JobStatusResponse,
+    tags=["Jobs"],
+    responses={
+        404: {"model": ErrorResponse, "description": "Job not found"},
+        409: {"model": ErrorResponse, "description": "Job already reached a terminal status (completed/failed); cancelled jobs return 200 idempotently"},
+    },
+)
+async def cancel_job(
+    job_id: str,
+    job_manager: JobManager = Depends(get_job_manager),
+):
+    """Cancel a queued or processing video annotation job.
+
+    Idempotent for already-cancelled jobs. Returns 409 when the job is in a
+    terminal non-cancellable status (completed/failed). A client cancelling
+    a PROCESSING job will see `status: "processing"` in the response; the
+    worker flips the job to `cancelled` shortly after, observable via
+    GET /jobs/{job_id}.
+    """
+    try:
+        job = job_manager.request_cancel(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found") from None
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    stats = None
+    if job.stats:
+        stats = JobStats(**job.stats)
+
+    return JobStatusResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        progress=job.progress,
+        created_at=job.created_at.isoformat(),
+        completed_at=(
+            job.completed_at.isoformat() if job.completed_at else None
+        ),
+        download_url=None,
+        error=job.error,
+        stats=stats,
     )
 
 

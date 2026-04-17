@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Annotated
+from typing import Annotated, Literal
 
 
 class BoundingBox(BaseModel):
@@ -159,6 +159,11 @@ class FrameExtractionResponse(BaseModel):
     processing_time_ms: int = Field(description="Processing time in milliseconds")
 
 
+class ErrorResponse(BaseModel):
+    """FastAPI ``HTTPException`` body shape — exposed for OpenAPI clients."""
+    detail: str = Field(description="Human-readable error message")
+
+
 class JobCreatedResponse(BaseModel):
     """Response when a video annotation job is created."""
     job_id: str = Field(description="Unique job identifier")
@@ -178,7 +183,9 @@ class JobStats(BaseModel):
 class JobStatusResponse(BaseModel):
     """Response for job status query."""
     job_id: str = Field(description="Unique job identifier")
-    status: str = Field(description="Job status: queued, processing, completed, failed")
+    status: Literal["queued", "processing", "completed", "failed", "cancelled"] = Field(
+        description="Job status"
+    )
     progress: int = Field(ge=0, le=100, description="Progress percentage")
     created_at: str = Field(description="Job creation timestamp ISO format")
     completed_at: str | None = Field(default=None, description="Completion timestamp")

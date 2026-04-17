@@ -896,6 +896,11 @@ ClassesQuery = Annotated[
     response_model=JobCreatedResponse,
     status_code=202,
     tags=["Video Annotation"],
+    responses={
+        400: {"description": "Invalid video format or invalid model name"},
+        413: {"description": "Video file too large"},
+        429: {"description": "Job queue is full"},
+    },
 )
 async def annotate_video(
     file: UploadFile = File(..., description="Video file for annotation"),
@@ -1017,7 +1022,14 @@ async def annotate_video(
     )
 
 
-@app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Jobs"])
+@app.get(
+    "/jobs/{job_id}",
+    response_model=JobStatusResponse,
+    tags=["Jobs"],
+    responses={
+        404: {"description": "Job not found"},
+    },
+)
 async def get_job_status(
     job_id: str,
     job_manager: JobManager = Depends(get_job_manager),
@@ -1049,7 +1061,14 @@ async def get_job_status(
     )
 
 
-@app.get("/jobs/{job_id}/download", tags=["Jobs"])
+@app.get(
+    "/jobs/{job_id}/download",
+    tags=["Jobs"],
+    responses={
+        400: {"description": "Job not ready (not in COMPLETED status)"},
+        404: {"description": "Job not found, or output file missing"},
+    },
+)
 async def download_job_result(
     job_id: str,
     job_manager: JobManager = Depends(get_job_manager),
@@ -1077,7 +1096,15 @@ async def download_job_result(
     )
 
 
-@app.post("/jobs/{job_id}/cancel", response_model=JobStatusResponse, tags=["Jobs"])
+@app.post(
+    "/jobs/{job_id}/cancel",
+    response_model=JobStatusResponse,
+    tags=["Jobs"],
+    responses={
+        404: {"description": "Job not found"},
+        409: {"description": "Job in non-cancellable terminal status (completed/failed)"},
+    },
+)
 async def cancel_job(
     job_id: str,
     job_manager: JobManager = Depends(get_job_manager),

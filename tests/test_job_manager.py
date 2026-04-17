@@ -302,6 +302,25 @@ def test_mark_cancelled_sets_status_and_completed_at(manager):
     assert result.completed_at is not None
 
 
+def test_mark_cancelled_refuses_to_overwrite_completed(manager, tmp_jobs_dir):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    output = Path(tmp_jobs_dir) / job.job_id / "output.mp4"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.touch()
+    manager.mark_completed(job.job_id, output_path=output, stats={})
+    manager.mark_cancelled(job.job_id)  # must be no-op
+    assert manager.get_job(job.job_id).status == JobStatus.COMPLETED
+
+
+def test_mark_cancelled_refuses_to_overwrite_failed(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    manager.mark_failed(job.job_id, error="boom")
+    manager.mark_cancelled(job.job_id)
+    assert manager.get_job(job.job_id).status == JobStatus.FAILED
+
+
 def test_cleanup_expired_includes_cancelled(manager, tmp_jobs_dir):
     from datetime import datetime, timedelta, timezone
     job = manager.create_job(params={})

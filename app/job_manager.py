@@ -120,9 +120,16 @@ class JobManager:
             logger.error(f"Job failed: {job_id}: {error}")
 
     def mark_cancelled(self, job_id: str) -> None:
-        """Called by the worker after JobCancelledError propagates out of annotate()."""
+        """Called by the worker after JobCancelledError propagates out of annotate().
+
+        No-op if the job is unknown or already in a terminal status."""
         job = self._jobs.get(job_id)
         if job is None:
+            return
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+            logger.warning(
+                f"Refusing to mark {job.status.value} job {job_id} as cancelled"
+            )
             return
         job.status = JobStatus.CANCELLED
         job.completed_at = datetime.now(tz=timezone.utc)

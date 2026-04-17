@@ -913,3 +913,226 @@ class TestAutoCodecResolve:
         encoder_call = mock_encoder_cls.call_args
         assert encoder_call.args[6] == "h264"
         assert encoder_call.kwargs.get("crf") == 23
+
+
+import threading
+
+
+class TestAnnotateCancellation:
+    def _make_frames(self, num_frames: int, width: int = 640, height: int = 480):
+        return [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
+
+    def _make_decoder_mock(self, frames: list[np.ndarray]):
+        mock_decoder = MagicMock()
+        mock_decoder.read_frame.side_effect = list(frames) + [None]
+        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
+        mock_decoder.__exit__ = MagicMock(return_value=False)
+        return mock_decoder
+
+    def _ffprobe_result(self, num_frames: int) -> MagicMock:
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": str(num_frames),
+        }
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = json.dumps({"streams": [stream]})
+        return r
+
+    def test_cancel_during_pass1_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        from video_annotator import JobCancelledError
+
+        num_frames = 20
+        frames = self._make_frames(num_frames)
+        decoder1 = self._make_decoder_mock(frames)
+        decoder2 = self._make_decoder_mock(frames)
+        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+        mock_encoder_cls = MagicMock(return_value=mock_encoder)
+
+        cancel_event = threading.Event()
+        call_count = {"n": 0}
+
+        def fake_predict(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] >= 2:
+                cancel_event.set()
+            return [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+
+        mock_model.predict.side_effect = fake_predict
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(JobCancelledError):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                    cancel_event=cancel_event,
+                )
+
+        # Pass 2 must never start (second decoder never used).
+        assert decoder2.read_frame.call_count == 0
+        # FFmpegDecoder __exit__ was invoked for pass 1.
+        assert decoder1.__exit__.called
+
+    def test_cancel_during_pass2_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        from video_annotator import JobCancelledError
+
+        num_frames = 10
+        frames = self._make_frames(num_frames)
+        decoder1 = self._make_decoder_mock(frames)
+        decoder2 = self._make_decoder_mock(frames)
+        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+        mock_encoder_cls = MagicMock(return_value=mock_encoder)
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        cancel_event = threading.Event()
+
+        # Set event after pass 1 by hooking into write_frame (pass 2 only).
+        write_calls = {"n": 0}
+
+        def fake_write(frame):
+            write_calls["n"] += 1
+            if write_calls["n"] >= 2:
+                cancel_event.set()
+
+        mock_encoder.write_frame.side_effect = fake_write
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(JobCancelledError):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                    cancel_event=cancel_event,
+                )
+
+        # Fewer than all frames written in pass 2.
+        assert mock_encoder.write_frame.call_count < num_frames
+
+    def test_cancel_between_passes_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """Cancel arrives after pass 1 finishes — pass 2 must not spin up FFmpeg."""
+        from video_annotator import JobCancelledError
+
+        num_frames = 5
+        frames = self._make_frames(num_frames)
+        decoder1 = self._make_decoder_mock(frames)
+        decoder2 = self._make_decoder_mock(frames)  # must never be used
+        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+        mock_encoder_cls = MagicMock(return_value=mock_encoder)
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        cancel_event = threading.Event()
+        # Fire cancel from the LAST pass-1 predict call, so pass 1 completes
+        # normally and the between-passes guard is what raises.
+        call_count = {"n": 0}
+
+        def fake_predict(*args, **kwargs):
+            call_count["n"] += 1
+            result = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+            if call_count["n"] == num_frames:
+                cancel_event.set()
+            return result
+
+        mock_model.predict.side_effect = fake_predict
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(JobCancelledError):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                    cancel_event=cancel_event,
+                )
+
+        # Pass 2 decoder / encoder must never be constructed.
+        # FFmpegDecoder was called exactly once (pass 1 only).
+        assert mock_decoder_cls.call_count == 1
+        assert mock_encoder_cls.call_count == 0
+
+    def test_cancel_event_none_runs_to_completion(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        num_frames = 3
+        frames = self._make_frames(num_frames)
+        decoder1 = self._make_decoder_mock(frames)
+        decoder2 = self._make_decoder_mock(frames)
+        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+        mock_encoder_cls = MagicMock(return_value=mock_encoder)
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            # cancel_event omitted — behaviour unchanged.
+            stats = annotator.annotate(
+                input_path, tmp_path / "out.mp4",
+                AnnotationParams(detect_every=1),
+            )
+
+        assert stats.total_frames == num_frames

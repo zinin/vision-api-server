@@ -310,8 +310,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     logger.info(f"Job {job_id} cancelled during processing")
                     job_manager.mark_cancelled(job_id)
                     try:
-                        if output_path.exists():
-                            output_path.unlink()
+                        output_path.unlink(missing_ok=True)
                     except OSError as e:
                         logger.warning(f"Failed to remove partial output for {job_id}: {e}")
 

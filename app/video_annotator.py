@@ -157,6 +157,11 @@ class VideoAnnotator:
             params: Annotation parameters
             progress_callback: Called with progress 0-99 during processing
         """
+        # Early cancel check — closes the narrow window between the worker's
+        # pre-executor check and the start of ffprobe in this thread.
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelledError()
+
         metadata = self._get_video_metadata(input_path)
 
         # Resolve codec (unchanged logic)
@@ -182,6 +187,11 @@ class VideoAnnotator:
             cancel_event=cancel_event,
         )
         stats.total_frames = actual_frames
+
+        # Guard after pass 1, before stabilize — avoids CPU cost of track
+        # stabilization when cancel arrived at the tail of pass 1.
+        if cancel_event is not None and cancel_event.is_set():
+            raise JobCancelledError()
 
         # Stabilize
         stabilizer = DetectionStabilizer(self.stabilizer_config)

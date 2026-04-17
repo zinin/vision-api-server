@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -915,9 +916,6 @@ class TestAutoCodecResolve:
         assert encoder_call.kwargs.get("crf") == 23
 
 
-import threading
-
-
 class TestAnnotateCancellation:
     def _make_frames(self, num_frames: int, width: int = 640, height: int = 480):
         return [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
@@ -989,6 +987,92 @@ class TestAnnotateCancellation:
         # FFmpegDecoder __exit__ was invoked for pass 1.
         assert decoder1.__exit__.called
 
+    def test_cancel_preset_before_ffprobe_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """Cancel set before annotate() — must raise before even probing metadata."""
+        from video_annotator import JobCancelledError
+
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        mock_decoder_cls = MagicMock()
+        mock_encoder_cls = MagicMock()
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run") as mock_run,
+        ):
+            with pytest.raises(JobCancelledError):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                    cancel_event=cancel_event,
+                )
+
+        # ffprobe must NOT have been called.
+        assert mock_run.call_count == 0
+        # FFmpeg pipelines must NOT have been constructed.
+        assert mock_decoder_cls.call_count == 0
+        assert mock_encoder_cls.call_count == 0
+        # YOLO must NOT have been invoked.
+        assert mock_model.predict.call_count == 0
+
+    def test_cancel_before_pass1_first_iteration_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """Cancel set after ffprobe but before first loop iter — pass1 guard catches it."""
+        from video_annotator import JobCancelledError
+
+        num_frames = 5
+        frames = self._make_frames(num_frames)
+        decoder1 = self._make_decoder_mock(frames)
+        mock_decoder_cls = MagicMock(side_effect=[decoder1])
+
+        mock_encoder_cls = MagicMock()
+
+        cancel_event = threading.Event()
+
+        # Fire cancel when the decoder context manager opens — this puts us
+        # past the early annotate() check and past ffprobe, so the pass1
+        # in-loop guard must be the one that raises.
+        original_enter = decoder1.__enter__
+        def enter_and_cancel(*args, **kwargs):
+            cancel_event.set()
+            return original_enter(*args, **kwargs)
+        decoder1.__enter__ = MagicMock(side_effect=enter_and_cancel)
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(JobCancelledError):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                    cancel_event=cancel_event,
+                )
+
+        # Pass 1 loop exits on the very first iteration: no predict call,
+        # no decode call, pass 2 decoder/encoder never constructed.
+        assert mock_model.predict.call_count == 0
+        assert decoder1.read_frame.call_count == 0
+        assert mock_encoder_cls.call_count == 0
+
     def test_cancel_during_pass2_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
         from video_annotator import JobCancelledError
 
@@ -1041,6 +1125,59 @@ class TestAnnotateCancellation:
 
         # Fewer than all frames written in pass 2.
         assert mock_encoder.write_frame.call_count < num_frames
+
+    def test_cancel_after_pass1_skips_stabilize(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """Cancel fired at end of pass 1 — DetectionStabilizer.stabilize() must not run."""
+        from video_annotator import JobCancelledError
+
+        num_frames = 5
+        frames = self._make_frames(num_frames)
+        decoder1 = self._make_decoder_mock(frames)
+        mock_decoder_cls = MagicMock(side_effect=[decoder1])
+        mock_encoder_cls = MagicMock()
+
+        cancel_event = threading.Event()
+        call_count = {"n": 0}
+
+        def fake_predict(*args, **kwargs):
+            call_count["n"] += 1
+            result = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+            if call_count["n"] == num_frames:
+                cancel_event.set()
+            return result
+
+        mock_model.predict.side_effect = fake_predict
+
+        # Mock DetectionStabilizer class so we can assert stabilize() wasn't called.
+        mock_stabilizer_instance = MagicMock()
+        mock_stabilizer_cls = MagicMock(return_value=mock_stabilizer_instance)
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.DetectionStabilizer", mock_stabilizer_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(JobCancelledError):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                    cancel_event=cancel_event,
+                )
+
+        # DetectionStabilizer must NOT have been constructed or called.
+        assert mock_stabilizer_cls.call_count == 0
+        assert mock_stabilizer_instance.stabilize.call_count == 0
+        # Pass 2 encoder must NOT have been constructed.
+        assert mock_encoder_cls.call_count == 0
 
     def test_cancel_between_passes_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """Cancel arrives after pass 1 finishes — pass 2 must not spin up FFmpeg."""

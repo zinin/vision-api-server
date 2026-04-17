@@ -54,6 +54,18 @@ def test_queue_overflow(manager):
         manager.create_job(params={})
 
 
+def test_queue_capacity_counts_cancelled_queued_jobs(manager):
+    """Cancelled jobs still in the asyncio.Queue must count against capacity."""
+    # Fill to capacity, cancel them all.
+    for _ in range(3):
+        j = manager.create_job(params={})
+        manager.request_cancel(j.job_id)
+    # All 3 jobs are CANCELLED but still in _queue (worker hasn't drained).
+    # Capacity must reject a new create.
+    with pytest.raises(RuntimeError, match="Too many queued jobs"):
+        manager.create_job(params={})
+
+
 def test_job_lifecycle(manager, tmp_jobs_dir):
     job = manager.create_job(params={})
     job_id = job.job_id

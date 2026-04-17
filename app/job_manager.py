@@ -52,9 +52,7 @@ class JobManager:
 
     def check_queue_capacity(self) -> None:
         """Raise RuntimeError if queue is full. Call before expensive upload."""
-        queued_count = sum(
-            1 for j in self._jobs.values() if j.status == JobStatus.QUEUED
-        )
+        queued_count = self._queue.qsize()
         if queued_count >= self.max_queued:
             raise RuntimeError(
                 f"Too many queued jobs ({queued_count}/{self.max_queued})"

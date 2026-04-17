@@ -341,7 +341,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
 app = FastAPI(
     title="YOLO Detection API",
     description="REST API for image and video analysis using Ultralytics YOLO",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc"

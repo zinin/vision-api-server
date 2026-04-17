@@ -216,7 +216,9 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                 logger.debug(f"Job {job_id}: model loaded, device={model_entry.device}")
 
                 if job.cancel_event.is_set():
-                    logger.info(f"Job {job_id} cancelled during model load")
+                    logger.info(
+                        f"Job {job_id} cancelled after successful model load, skipping annotate"
+                    )
                     job_manager.mark_cancelled(job_id)
                     continue
 

@@ -178,7 +178,7 @@ class JobStats(BaseModel):
 class JobStatusResponse(BaseModel):
     """Response for job status query."""
     job_id: str = Field(description="Unique job identifier")
-    status: str = Field(description="Job status: queued, processing, completed, failed")
+    status: str = Field(description="Job status: queued, processing, completed, failed, cancelled")
     progress: int = Field(ge=0, le=100, description="Progress percentage")
     created_at: str = Field(description="Job creation timestamp ISO format")
     completed_at: str | None = Field(default=None, description="Completion timestamp")

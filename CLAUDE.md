@@ -46,6 +46,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `/detect/video/visualize` | POST | Submit video for annotation (async, returns job_id) |
 | `/jobs/{job_id}` | GET | Job status and progress |
 | `/jobs/{job_id}/download` | GET | Download annotated video |
+| `/jobs/{job_id}/cancel` | POST | Cancel queued or running job |
 | `/models` | GET | List loaded/cached models |
 | `/health` | GET | Health check |
 

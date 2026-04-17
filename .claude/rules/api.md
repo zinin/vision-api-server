@@ -100,6 +100,43 @@ Extract key frames without detection.
 }
 ```
 
+## Job Endpoints
+
+### POST /jobs/{job_id}/cancel
+
+Cancel a queued or processing video annotation job.
+
+Cooperative cancellation: the running annotation stops at the next frame boundary (typically <1 second). A PROCESSING job will briefly show `status: "processing"` in the response; poll `GET /jobs/{job_id}` to observe the transition to `cancelled`.
+
+**Response codes:**
+
+| Case | Code |
+|------|------|
+| QUEUED or PROCESSING | 200 + `JobStatusResponse` |
+| Already CANCELLED (idempotent) | 200 + `JobStatusResponse` |
+| COMPLETED or FAILED | 409 Conflict |
+| Unknown / TTL-expired | 404 Not Found |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:3001/jobs/abc123def456/cancel
+```
+
+Response:
+```json
+{
+  "job_id": "abc123def456",
+  "status": "cancelled",
+  "progress": 42,
+  "created_at": "2026-04-17T12:00:00+00:00",
+  "completed_at": "2026-04-17T12:01:30+00:00",
+  "download_url": null,
+  "error": null,
+  "stats": null
+}
+```
+
 ## Info Endpoints
 
 ### GET /models

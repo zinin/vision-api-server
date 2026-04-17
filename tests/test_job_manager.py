@@ -66,6 +66,25 @@ def test_queue_capacity_counts_cancelled_queued_jobs(manager):
         manager.create_job(params={})
 
 
+def test_queue_capacity_recovers_after_worker_drains_cancelled(manager):
+    """After the worker drains cancelled-queued job ids, capacity must recover."""
+    # Fill to capacity with cancelled-while-queued jobs.
+    for _ in range(3):
+        j = manager.create_job(params={})
+        manager.request_cancel(j.job_id)
+    with pytest.raises(RuntimeError, match="Too many queued jobs"):
+        manager.create_job(params={})
+
+    # Simulate worker pulling + skipping all 3 cancelled ids.
+    for _ in range(3):
+        manager._queue.get_nowait()
+
+    # Capacity recovers — a fresh create_job must succeed.
+    manager.check_queue_capacity()
+    new_job = manager.create_job(params={})
+    assert new_job.status == JobStatus.QUEUED
+
+
 def test_job_lifecycle(manager, tmp_jobs_dir):
     job = manager.create_job(params={})
     job_id = job.job_id
@@ -290,6 +309,22 @@ def test_mark_processing_cas_cancelled_returns_false(manager):
     assert manager.mark_processing(job.job_id) is False
     # Must NOT overwrite CANCELLED with PROCESSING.
     assert manager.get_job(job.job_id).status == JobStatus.CANCELLED
+
+
+def test_mark_processing_cas_completed_returns_false(manager, tmp_path):
+    job = manager.create_job(params={})
+    manager.mark_processing(job.job_id)
+    manager.mark_completed(job.job_id, output_path=tmp_path / "out.mp4", stats={})
+    assert manager.mark_processing(job.job_id) is False
+    assert manager.get_job(job.job_id).status == JobStatus.COMPLETED
+
+
+def test_mark_processing_cas_failed_returns_false(manager):
+    job = manager.create_job(params={})
+    manager.mark_processing(job.job_id)
+    manager.mark_failed(job.job_id, error="boom")
+    assert manager.mark_processing(job.job_id) is False
+    assert manager.get_job(job.job_id).status == JobStatus.FAILED
 
 
 def test_mark_cancelled_sets_status_and_completed_at(manager):

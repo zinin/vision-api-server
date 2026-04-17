@@ -187,7 +187,10 @@ class JobManager:
                         f"Failed to delete input file for cancelled job {job_id}: {e}"
                     )
 
-        logger.info(f"Job {job_id}: cancel requested (was {prev_status.value})")
+        if prev_status == JobStatus.CANCELLED:
+            logger.debug(f"Job {job_id}: idempotent cancel no-op")
+        else:
+            logger.info(f"Job {job_id}: cancel requested (was {prev_status.value})")
         return job
 
     async def get_next_job_id(self) -> str:

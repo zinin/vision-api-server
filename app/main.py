@@ -186,7 +186,12 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
         try:
             job_id = await job_manager.get_next_job_id()
             job = job_manager.get_job(job_id)
-            if job is None or not job_manager.mark_processing(job_id):
+            if job is None:
+                logger.warning(
+                    f"Job {job_id} disappeared from registry before dispatch, skipping"
+                )
+                continue
+            if not job_manager.mark_processing(job_id):
                 logger.info(f"Job {job_id} cancelled while queued, skipping")
                 continue
 

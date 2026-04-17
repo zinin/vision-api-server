@@ -1102,10 +1102,6 @@ async def cancel_job(
     if job.stats:
         stats = JobStats(**job.stats)
 
-    download_url = None
-    if job.status == JobStatus.COMPLETED:
-        download_url = f"/jobs/{job.job_id}/download"
-
     return JobStatusResponse(
         job_id=job.job_id,
         status=job.status.value,
@@ -1114,7 +1110,7 @@ async def cancel_job(
         completed_at=(
             job.completed_at.isoformat() if job.completed_at else None
         ),
-        download_url=download_url,
+        download_url=None,
         error=job.error,
         stats=stats,
     )

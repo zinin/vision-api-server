@@ -220,47 +220,62 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     job_manager.mark_cancelled(job_id)
                     continue
 
-                stabilizer_config = StabilizerConfig(
-                    conf_factor=settings.stabilizer_conf_factor,
-                    iou_threshold=settings.stabilizer_iou_threshold,
-                    min_vote_conf=settings.stabilizer_min_vote_conf,
-                    grace_center_sec=settings.stabilizer_grace_center,
-                    grace_edge_sec=settings.stabilizer_grace_edge,
-                    center_zone=settings.stabilizer_center_zone,
-                    max_staleness_sec=settings.stabilizer_max_staleness,
-                )
-                annotator = VideoAnnotator(
-                    model=model_entry.model,
-                    visualizer=model_entry.visualizer,
-                    class_names=model_entry.model.names,
-                    hw_config=app.state.hw_config,
-                    codec=settings.video_codec,
-                    crf=settings.video_crf,
-                    stabilizer_config=stabilizer_config,
-                )
+                try:
+                    stabilizer_config = StabilizerConfig(
+                        conf_factor=settings.stabilizer_conf_factor,
+                        iou_threshold=settings.stabilizer_iou_threshold,
+                        min_vote_conf=settings.stabilizer_min_vote_conf,
+                        grace_center_sec=settings.stabilizer_grace_center,
+                        grace_edge_sec=settings.stabilizer_grace_edge,
+                        center_zone=settings.stabilizer_center_zone,
+                        max_staleness_sec=settings.stabilizer_max_staleness,
+                    )
+                    annotator = VideoAnnotator(
+                        model=model_entry.model,
+                        visualizer=model_entry.visualizer,
+                        class_names=model_entry.model.names,
+                        hw_config=app.state.hw_config,
+                        codec=settings.video_codec,
+                        crf=settings.video_crf,
+                        stabilizer_config=stabilizer_config,
+                    )
 
-                params = AnnotationParams(
-                    conf=job.params.get("conf", 0.5),
-                    imgsz=job.params.get("imgsz", 640),
-                    max_det=job.params.get("max_det", 100),
-                    detect_every=job.params.get(
-                        "detect_every", settings.default_detect_every
-                    ),
-                    classes=job.params.get("classes"),
-                    line_width=job.params.get("line_width", 2),
-                    show_labels=job.params.get("show_labels", True),
-                    show_conf=job.params.get("show_conf", True),
-                )
+                    params = AnnotationParams(
+                        conf=job.params.get("conf", 0.5),
+                        imgsz=job.params.get("imgsz", 640),
+                        max_det=job.params.get("max_det", 100),
+                        detect_every=job.params.get(
+                            "detect_every", settings.default_detect_every
+                        ),
+                        classes=job.params.get("classes"),
+                        line_width=job.params.get("line_width", 2),
+                        show_labels=job.params.get("show_labels", True),
+                        show_conf=job.params.get("show_conf", True),
+                    )
 
-                output_path = job.input_path.parent / "output.mp4"
+                    output_path = job.input_path.parent / "output.mp4"
 
-                def progress_cb(progress: int) -> None:
-                    job_manager.update_progress(job_id, progress)
+                    def progress_cb(progress: int) -> None:
+                        job_manager.update_progress(job_id, progress)
 
-                # Run in executor (blocking I/O + YOLO inference)
-                logger.debug(f"Job {job_id}: submitting to executor")
-                loop = asyncio.get_running_loop()
-                executor = get_executor(settings.max_executor_workers).executor
+                    logger.debug(f"Job {job_id}: submitting to executor")
+                    loop = asyncio.get_running_loop()
+                    executor = get_executor(settings.max_executor_workers).executor
+                except Exception as e:
+                    if job.cancel_event.is_set():
+                        logger.info(
+                            f"Job {job_id} cancelled during setup "
+                            f"(suppressed {type(e).__name__})"
+                        )
+                        job_manager.mark_cancelled(job_id)
+                    else:
+                        logger.error(
+                            f"Job {job_id} setup failed: {e}",
+                            exc_info=True,
+                        )
+                        job_manager.mark_failed(job_id, f"Setup error: {e}")
+                    continue
+
                 try:
                     stats = await loop.run_in_executor(
                         executor,

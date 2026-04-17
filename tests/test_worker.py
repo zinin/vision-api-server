@@ -362,3 +362,59 @@ class TestAnnotationWorkerCancellation:
         assert final.status == JobStatus.CANCELLED
         assert final.error is None
         mock_annotator_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_setup_failure_marks_failed(
+        self, worker_app, worker_settings, worker_job_manager, tmp_path
+    ):
+        """Setup-time exception (e.g. VideoAnnotator construction) must
+        terminalize the job as FAILED, not leave it stuck in PROCESSING."""
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        # VideoAnnotator constructor raises.
+        mock_annotator_cls = MagicMock(side_effect=RuntimeError("boom"))
+        mock_executor = MagicMock()
+        mock_executor.executor = None
+
+        with (
+            patch("main.VideoAnnotator", mock_annotator_cls),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            await _run_worker_until_job_done(
+                worker_app, worker_settings, worker_job_manager
+            )
+
+        final = worker_job_manager.get_job(job.job_id)
+        assert final.status == JobStatus.FAILED
+        assert "Setup error" in final.error
+
+    @pytest.mark.asyncio
+    async def test_cancel_precedence_over_setup_failure(
+        self, worker_app, worker_settings, worker_job_manager, tmp_path
+    ):
+        """If cancel is set and setup raises, status must be CANCELLED."""
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        def annotator_side_effect(*args, **kwargs):
+            worker_job_manager.request_cancel(job.job_id)
+            raise RuntimeError("boom during setup")
+
+        mock_annotator_cls = MagicMock(side_effect=annotator_side_effect)
+        mock_executor = MagicMock()
+        mock_executor.executor = None
+
+        with (
+            patch("main.VideoAnnotator", mock_annotator_cls),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            await _run_worker_until_job_done(
+                worker_app, worker_settings, worker_job_manager
+            )
+
+        final = worker_job_manager.get_job(job.job_id)
+        assert final.status == JobStatus.CANCELLED
+        assert final.error is None

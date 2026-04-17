@@ -183,3 +183,23 @@ async def test_cleanup_expired_removes_failed_jobs(manager, tmp_jobs_dir):
 
     assert manager.cleanup_expired() == 1
     assert manager.get_job(job_id) is None
+
+
+import threading
+
+
+def test_cancelled_is_a_status():
+    from job_manager import JobStatus
+    assert JobStatus.CANCELLED.value == "cancelled"
+
+
+def test_job_has_cancel_event(manager):
+    job = manager.create_job(params={})
+    assert isinstance(job.cancel_event, threading.Event)
+    assert not job.cancel_event.is_set()
+
+
+def test_each_job_gets_its_own_cancel_event(manager):
+    j1 = manager.create_job(params={})
+    j2 = manager.create_job(params={})
+    assert j1.cancel_event is not j2.cancel_event

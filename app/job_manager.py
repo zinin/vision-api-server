@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import shutil
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(slots=True)
@@ -30,6 +32,7 @@ class Job:
     output_path: Path | None = None
     params: dict = field(default_factory=dict)
     stats: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 class JobManager:

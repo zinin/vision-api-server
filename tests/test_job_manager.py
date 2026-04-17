@@ -59,7 +59,7 @@ def test_job_lifecycle(manager, tmp_jobs_dir):
     job_id = job.job_id
     output = Path(tmp_jobs_dir) / job_id / "output.mp4"
 
-    manager.mark_processing(job_id)
+    assert manager.mark_processing(job_id) is True
     assert manager.get_job(job_id).status == JobStatus.PROCESSING
 
     manager.update_progress(job_id, 50)
@@ -203,3 +203,78 @@ def test_each_job_gets_its_own_cancel_event(manager):
     j1 = manager.create_job(params={})
     j2 = manager.create_job(params={})
     assert j1.cancel_event is not j2.cancel_event
+
+
+def test_request_cancel_queued_marks_cancelled_and_deletes_input(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    # request_cancel on QUEUED must delete input file so it does not leak
+    # (worker's finally block never runs for skipped-queued jobs).
+    job.input_path.parent.mkdir(parents=True, exist_ok=True)
+    job.input_path.write_bytes(b"fake video")
+    assert job.input_path.exists()
+
+    result = manager.request_cancel(job.job_id)
+
+    assert result.status == JobStatus.CANCELLED
+    assert result.cancel_event.is_set()
+    assert result.completed_at is not None
+    assert not job.input_path.exists()
+
+
+def test_request_cancel_processing_sets_event_only(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    assert manager.mark_processing(job.job_id) is True
+    result = manager.request_cancel(job.job_id)
+    # Event set, but worker has not yet observed it.
+    assert result.cancel_event.is_set()
+    assert result.status == JobStatus.PROCESSING
+    assert result.completed_at is None
+
+
+def test_request_cancel_idempotent_on_cancelled(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    manager.request_cancel(job.job_id)
+    result = manager.request_cancel(job.job_id)
+    assert result.status == JobStatus.CANCELLED
+    assert result.cancel_event.is_set()
+
+
+def test_request_cancel_completed_raises_value_error(manager, tmp_jobs_dir):
+    job = manager.create_job(params={})
+    output = Path(tmp_jobs_dir) / job.job_id / "output.mp4"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.touch()
+    manager.mark_completed(job.job_id, output_path=output, stats={})
+    with pytest.raises(ValueError, match="terminal status"):
+        manager.request_cancel(job.job_id)
+
+
+def test_request_cancel_failed_raises_value_error(manager):
+    job = manager.create_job(params={})
+    manager.mark_failed(job.job_id, error="boom")
+    with pytest.raises(ValueError, match="terminal status"):
+        manager.request_cancel(job.job_id)
+
+
+def test_request_cancel_unknown_raises_key_error(manager):
+    with pytest.raises(KeyError):
+        manager.request_cancel("nonexistent")
+
+
+def test_mark_processing_cas_queued_returns_true(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    assert manager.mark_processing(job.job_id) is True
+    assert manager.get_job(job.job_id).status == JobStatus.PROCESSING
+
+
+def test_mark_processing_cas_cancelled_returns_false(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    manager.request_cancel(job.job_id)  # flips QUEUED → CANCELLED
+    assert manager.mark_processing(job.job_id) is False
+    # Must NOT overwrite CANCELLED with PROCESSING.
+    assert manager.get_job(job.job_id).status == JobStatus.CANCELLED

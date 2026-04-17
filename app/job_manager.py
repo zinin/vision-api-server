@@ -87,13 +87,19 @@ class JobManager:
             job.progress = progress
             logger.debug(f"Job {job_id}: progress {progress}%")
 
-    def mark_processing(self, job_id: str) -> None:
+    def mark_processing(self, job_id: str) -> bool:
+        """CAS: flip QUEUED → PROCESSING atomically.
+
+        Returns True if the transition happened, False if the job is no longer
+        QUEUED (for example, /cancel arrived between the worker's guard check
+        and this call). Worker must treat False as a signal to skip.
+        """
         job = self._jobs.get(job_id)
-        if job:
-            if job.status != JobStatus.QUEUED:
-                logger.warning(f"Job {job_id} unexpected state for processing: {job.status}")
-            job.status = JobStatus.PROCESSING
-            logger.info(f"Job processing: {job_id}")
+        if job is None or job.status != JobStatus.QUEUED:
+            return False
+        job.status = JobStatus.PROCESSING
+        logger.info(f"Job processing: {job_id}")
+        return True
 
     def mark_completed(
         self, job_id: str, output_path: Path, stats: dict
@@ -114,6 +120,42 @@ class JobManager:
             job.completed_at = datetime.now(tz=timezone.utc)
             job.error = error
             logger.error(f"Job failed: {job_id}: {error}")
+
+    def request_cancel(self, job_id: str) -> Job:
+        """Idempotent cancellation request.
+
+        Raises:
+            KeyError: if job_id is unknown.
+            ValueError: if job is in a non-cancellable terminal status
+                (COMPLETED or FAILED).
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            raise ValueError(
+                f"Cannot cancel job in terminal status '{job.status.value}'"
+            )
+
+        prev_status = job.status
+        job.cancel_event.set()
+
+        if job.status == JobStatus.QUEUED:
+            job.status = JobStatus.CANCELLED
+            job.completed_at = datetime.now(tz=timezone.utc)
+            # Delete the uploaded input file so it does not linger until TTL.
+            # The worker's finally block never runs for queued-skipped jobs.
+            if job.input_path is not None and job.input_path.exists():
+                try:
+                    job.input_path.unlink()
+                except OSError as e:
+                    logger.warning(
+                        f"Failed to delete input file for cancelled job {job_id}: {e}"
+                    )
+
+        logger.info(f"Job {job_id}: cancel requested (was {prev_status.value})")
+        return job
 
     async def get_next_job_id(self) -> str:
         return await self._queue.get()

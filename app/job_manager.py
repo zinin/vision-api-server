@@ -36,7 +36,26 @@ class Job:
 
 
 class JobManager:
-    """In-memory job manager with async queue and TTL cleanup."""
+    """In-memory job manager with async queue and TTL cleanup.
+
+    Thread-safety invariant:
+        All status-mutating methods (``mark_processing``, ``mark_completed``,
+        ``mark_failed``, ``mark_cancelled``, ``request_cancel``) must be
+        called from the asyncio event-loop thread only. ``_jobs`` and
+        ``_queue`` are not protected by a lock — the single-event-loop
+        assumption is what keeps them consistent.
+
+        ``cancel_event`` on each ``Job`` is the only sanctioned cross-thread
+        channel: set from the event-loop thread, read from the executor
+        thread inside ``VideoAnnotator.annotate``. ``threading.Event`` is
+        safe for this handoff.
+
+        ``update_progress`` is the one exception to the event-loop-only
+        rule — the annotator progress callback invokes it from the executor
+        thread. It writes a single int field (``job.progress``), which is
+        atomic under the GIL. Do not extend this method to touch ``status``
+        or any multi-field state without adding a lock.
+    """
 
     def __init__(self, jobs_dir: str, ttl_seconds: int = 3600, max_queued: int = 10):
         self.jobs_dir = Path(jobs_dir)

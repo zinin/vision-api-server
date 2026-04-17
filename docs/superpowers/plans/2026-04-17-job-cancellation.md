@@ -4,7 +4,7 @@
 
 **Goal:** Add `POST /jobs/{job_id}/cancel` to abort a queued or processing video annotation job; introduce a new terminal status `CANCELLED` with cooperative cancellation checked on every frame.
 
-**Architecture:** A `threading.Event` on each `Job` is set by the event-loop thread in `JobManager.request_cancel` and polled by the executor thread at the top of both decode loops in `VideoAnnotator.annotate`. A new `JobCancelledError` is raised on the worker, which then calls `mark_cancelled` and deletes any partial output. Queue-time cancellation skips the job in the worker dispatch loop.
+**Architecture:** A `threading.Event` on each `Job` is set by the event-loop thread in `JobManager.request_cancel` and polled by the executor thread at the top of both decode loops in `VideoAnnotator.annotate`, with one additional check in `annotate()` between pass 1 and pass 2. A new `JobCancelledError` is raised on the worker, which then calls `mark_cancelled` and deletes any partial output. Queue-time cancellation skips the job in the worker dispatch loop via a CAS `mark_processing`. Cancel takes precedence over pre-annotate failures — if the event is set, any pre-annotate exception routes to `CANCELLED` instead of `FAILED`.
 
 **Tech Stack:** Python 3.12, FastAPI, asyncio, `threading.Event`, pytest. Existing modules only — no new dependencies.
 
@@ -16,13 +16,14 @@
 
 | File | Role |
 |------|------|
-| `app/job_manager.py` | Add `CANCELLED` enum value, `cancel_event` field on `Job`, `request_cancel`, `mark_cancelled`. |
-| `app/video_annotator.py` | Add `JobCancelledError`; accept optional `cancel_event` in `annotate`, `_pass1_collect`, `_pass2_render`; check event at top of each per-frame loop. |
-| `app/main.py` | Add `POST /jobs/{job_id}/cancel` endpoint. Worker: skip queued-but-cancelled jobs, pass `cancel_event` into annotator, catch `JobCancelledError`, delete partial output. |
-| `tests/test_job_manager.py` | Tests for `request_cancel`, `mark_cancelled`, `CANCELLED` in TTL cleanup. |
-| `tests/test_video_annotator.py` | Tests that `annotate` respects `cancel_event` in pass 1 and pass 2; no-op when `None`. |
+| `app/job_manager.py` | Add `CANCELLED` enum value; `cancel_event` field on `Job`; `request_cancel` (deletes `input_path` for QUEUED); convert `mark_processing` to a CAS returning `bool`; `mark_cancelled`; include `CANCELLED` in `cleanup_expired`. |
+| `app/video_annotator.py` | Add `JobCancelledError`; accept optional `cancel_event` in `annotate`, `_pass1_collect`, `_pass2_render`; check event at top of each per-frame loop and once in `annotate` between pass 1 and pass 2. |
+| `app/main.py` | Add `POST /jobs/{job_id}/cancel` endpoint. Worker: CAS skip for queued-cancelled; post-`get_model()` cancel observation; pass `cancel_event`; catch `JobCancelledError`; pre-annotate exceptions route to `mark_cancelled` if event set; `_cleanup_partial_output` helper. |
+| `app/models.py` | Extend `JobStatusResponse.status` description to include `"cancelled"`. |
+| `tests/test_job_manager.py` | Tests for `request_cancel` (incl. input-file deletion), CAS `mark_processing`, `mark_cancelled`, `CANCELLED` in TTL cleanup. |
+| `tests/test_video_annotator.py` | Tests that `annotate` respects `cancel_event` in pass 1, between passes, in pass 2; no-op when `None`. |
 | `tests/test_endpoints.py` | HTTP-level tests for the new endpoint (200/404/409). |
-| `tests/test_worker.py` | Tests for worker's skip-queued-cancelled path and `JobCancelledError` handling. |
+| `tests/test_worker.py` | Tests for CAS-based skip, cancel-during-model-load, cancel-precedence over pre-annotate failure, `JobCancelledError` handling with kwargs assertion. |
 | `.claude/rules/api.md` | Document new endpoint. |
 | `CLAUDE.md` | Add endpoint row to table. |
 
@@ -121,7 +122,7 @@ git commit -m "feat(jobs): add CANCELLED status and per-job cancel_event"
 
 ---
 
-## Task 2: Implement `JobManager.request_cancel`
+## Task 2: Implement `JobManager.request_cancel` and CAS `mark_processing`
 
 **Files:**
 - Modify: `app/job_manager.py`
@@ -132,19 +133,27 @@ git commit -m "feat(jobs): add CANCELLED status and per-job cancel_event"
 Append to `tests/test_job_manager.py`:
 
 ```python
-def test_request_cancel_queued_marks_cancelled(manager):
+def test_request_cancel_queued_marks_cancelled_and_deletes_input(manager):
     from job_manager import JobStatus
     job = manager.create_job(params={})
+    # request_cancel on QUEUED must delete input file so it does not leak
+    # (worker's finally block never runs for skipped-queued jobs).
+    job.input_path.parent.mkdir(parents=True, exist_ok=True)
+    job.input_path.write_bytes(b"fake video")
+    assert job.input_path.exists()
+
     result = manager.request_cancel(job.job_id)
+
     assert result.status == JobStatus.CANCELLED
     assert result.cancel_event.is_set()
     assert result.completed_at is not None
+    assert not job.input_path.exists()
 
 
 def test_request_cancel_processing_sets_event_only(manager):
     from job_manager import JobStatus
     job = manager.create_job(params={})
-    manager.mark_processing(job.job_id)
+    assert manager.mark_processing(job.job_id) is True
     result = manager.request_cancel(job.job_id)
     # Event set, but worker has not yet observed it.
     assert result.cancel_event.is_set()
@@ -181,17 +190,60 @@ def test_request_cancel_failed_raises_value_error(manager):
 def test_request_cancel_unknown_raises_key_error(manager):
     with pytest.raises(KeyError):
         manager.request_cancel("nonexistent")
+
+
+def test_mark_processing_cas_queued_returns_true(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    assert manager.mark_processing(job.job_id) is True
+    assert manager.get_job(job.job_id).status == JobStatus.PROCESSING
+
+
+def test_mark_processing_cas_cancelled_returns_false(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    manager.request_cancel(job.job_id)  # flips QUEUED → CANCELLED
+    assert manager.mark_processing(job.job_id) is False
+    # Must NOT overwrite CANCELLED with PROCESSING.
+    assert manager.get_job(job.job_id).status == JobStatus.CANCELLED
+```
+
+The pre-existing `test_job_lifecycle` uses the signature `manager.mark_processing(job_id)` without checking its return. Update it to assert the `True` return:
+
+```python
+# in test_job_lifecycle, replace
+# manager.mark_processing(job_id)
+# with
+assert manager.mark_processing(job_id) is True
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_job_manager.py -k request_cancel -v`
+Run: `python -m pytest tests/test_job_manager.py -v`
 
-Expected: FAIL (`AttributeError: 'JobManager' object has no attribute 'request_cancel'`).
+Expected: FAIL — `request_cancel` does not exist; existing `mark_processing` returns `None`, not `True`.
 
-- [ ] **Step 3: Implement `request_cancel`**
+- [ ] **Step 3: Implement `request_cancel` and CAS `mark_processing`**
 
-In `app/job_manager.py`, add this method inside `JobManager` (for example, after `mark_failed`):
+In `app/job_manager.py`, **replace** the existing `mark_processing` with the CAS form:
+
+```python
+def mark_processing(self, job_id: str) -> bool:
+    """CAS: flip QUEUED → PROCESSING atomically.
+
+    Returns True if the transition happened, False if the job is no longer
+    QUEUED (for example, /cancel arrived between the worker's guard check
+    and this call). Worker must treat False as a signal to skip.
+    """
+    job = self._jobs.get(job_id)
+    if job is None or job.status != JobStatus.QUEUED:
+        return False
+    job.status = JobStatus.PROCESSING
+    logger.info(f"Job processing: {job_id}")
+    return True
+```
+
+Add `request_cancel` inside `JobManager` (for example, after `mark_failed`):
 
 ```python
 def request_cancel(self, job_id: str) -> Job:
@@ -199,7 +251,8 @@ def request_cancel(self, job_id: str) -> Job:
 
     Raises:
         KeyError: if job_id is unknown.
-        ValueError: if job is in a non-cancellable terminal status (COMPLETED or FAILED).
+        ValueError: if job is in a non-cancellable terminal status
+            (COMPLETED or FAILED).
     """
     job = self._jobs.get(job_id)
     if job is None:
@@ -216,6 +269,15 @@ def request_cancel(self, job_id: str) -> Job:
     if job.status == JobStatus.QUEUED:
         job.status = JobStatus.CANCELLED
         job.completed_at = datetime.now(tz=timezone.utc)
+        # Delete the uploaded input file so it does not linger until TTL.
+        # The worker's finally block never runs for queued-skipped jobs.
+        if job.input_path is not None and job.input_path.exists():
+            try:
+                job.input_path.unlink()
+            except OSError as e:
+                logger.warning(
+                    f"Failed to delete input file for cancelled job {job_id}: {e}"
+                )
 
     logger.info(f"Job {job_id}: cancel requested (was {prev_status.value})")
     return job
@@ -225,13 +287,13 @@ def request_cancel(self, job_id: str) -> Job:
 
 Run: `python -m pytest tests/test_job_manager.py -v`
 
-Expected: all tests pass.
+Expected: all tests pass, including the updated `test_job_lifecycle`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add app/job_manager.py tests/test_job_manager.py
-git commit -m "feat(jobs): add JobManager.request_cancel"
+git commit -m "feat(jobs): request_cancel + CAS mark_processing (no race, no input leak)"
 ```
 
 ---
@@ -473,6 +535,64 @@ class TestAnnotateCancellation:
         # Fewer than all frames written in pass 2.
         assert mock_encoder.write_frame.call_count < num_frames
 
+    def test_cancel_between_passes_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
+        """Cancel arrives after pass 1 finishes — pass 2 must not spin up FFmpeg."""
+        from video_annotator import JobCancelledError
+
+        num_frames = 5
+        frames = self._make_frames(num_frames)
+        decoder1 = self._make_decoder_mock(frames)
+        decoder2 = self._make_decoder_mock(frames)  # must never be used
+        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+
+        mock_encoder = MagicMock()
+        mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
+        mock_encoder.__exit__ = MagicMock(return_value=False)
+        mock_encoder_cls = MagicMock(return_value=mock_encoder)
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        cancel_event = threading.Event()
+        # Fire cancel from the LAST pass-1 predict call, so pass 1 completes
+        # normally and the between-passes guard is what raises.
+        call_count = {"n": 0}
+
+        def fake_predict(*args, **kwargs):
+            call_count["n"] += 1
+            result = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+            if call_count["n"] == num_frames:
+                cancel_event.set()
+            return result
+
+        mock_model.predict.side_effect = fake_predict
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, hw_config,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(JobCancelledError):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                    cancel_event=cancel_event,
+                )
+
+        # Pass 2 decoder / encoder must never be constructed.
+        # FFmpegDecoder was called exactly once (pass 1 only).
+        assert mock_decoder_cls.call_count == 1
+        assert mock_encoder_cls.call_count == 0
+
     def test_cancel_event_none_runs_to_completion(self, mock_model, mock_visualizer, hw_config, tmp_path):
         num_frames = 3
         frames = self._make_frames(num_frames)
@@ -547,7 +667,7 @@ def annotate(
 ) -> AnnotationStats:
 ```
 
-Inside `annotate`, propagate `cancel_event` to both passes:
+Inside `annotate`, propagate `cancel_event` to both passes AND add one explicit check between the two passes (so pass 2 does not spin up FFmpeg processes when the cancel has already been observed during stabilisation):
 
 ```python
 raw_detections, actual_frames = self._pass1_collect(
@@ -555,9 +675,14 @@ raw_detections, actual_frames = self._pass1_collect(
     progress_callback, stats,
     cancel_event=cancel_event,
 )
-```
 
-```python
+# ... stabilizer + stats code unchanged ...
+
+# Guard between pass 1 and pass 2 — avoids unnecessary FFmpeg subprocess
+# startup (especially GPU encoder init) when cancel arrived late in pass 1.
+if cancel_event is not None and cancel_event.is_set():
+    raise JobCancelledError()
+
 self._pass2_render(
     input_path, output_path, metadata, params, stabilized,
     effective_codec, effective_crf, effective_bitrate,
@@ -657,13 +782,15 @@ class TestAnnotationWorkerCancellation:
     async def test_skip_queued_but_cancelled(
         self, worker_app, worker_settings, worker_job_manager, tmp_path
     ):
-        """Job cancelled while queued is skipped — annotator is never called."""
+        """Job cancelled while queued is skipped — annotator never called,
+        queue is drained, input file removed (by request_cancel)."""
         job = worker_job_manager.create_job(params={})
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
-        job.input_path.touch()
+        job.input_path.write_bytes(b"fake")
 
-        # Cancel before worker picks it up.
+        # Cancel before worker picks it up. request_cancel also deletes input.
         worker_job_manager.request_cancel(job.job_id)
+        assert not job.input_path.exists()
 
         mock_annotator_cls = MagicMock()
         mock_executor = MagicMock()
@@ -679,12 +806,15 @@ class TestAnnotationWorkerCancellation:
 
         assert worker_job_manager.get_job(job.job_id).status == JobStatus.CANCELLED
         mock_annotator_cls.assert_not_called()
+        # Worker must have pulled the id out of the queue.
+        assert worker_job_manager._queue.empty()
 
     @pytest.mark.asyncio
     async def test_cancel_during_processing_marks_cancelled(
         self, worker_app, worker_settings, worker_job_manager, tmp_path
     ):
-        """JobCancelledError from annotator -> status CANCELLED, partial output deleted."""
+        """JobCancelledError from annotator → status CANCELLED,
+        partial output deleted, and cancel_event was really passed in."""
         from video_annotator import JobCancelledError
 
         job = worker_job_manager.create_job(params={})
@@ -713,6 +843,76 @@ class TestAnnotationWorkerCancellation:
         assert final.status == JobStatus.CANCELLED
         assert final.error is None
         assert not output_path.exists()
+        # Assert the worker passed the job's cancel_event into annotate().
+        call_kwargs = mock_annotator_cls.return_value.annotate.call_args.kwargs
+        assert call_kwargs["cancel_event"] is job.cancel_event
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_model_load(
+        self, worker_app, worker_settings, worker_job_manager, tmp_path
+    ):
+        """If cancel arrives while get_model() is in flight, worker must
+        observe the event right after and never construct the annotator."""
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        real_get_model = worker_app.state.model_manager.get_model
+
+        async def slow_get_model(name=None):
+            # Simulate /cancel arriving during model load.
+            worker_job_manager.request_cancel(job.job_id)
+            return await real_get_model(name)
+
+        worker_app.state.model_manager.get_model = AsyncMock(side_effect=slow_get_model)
+
+        mock_annotator_cls = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.executor = None
+
+        with (
+            patch("main.VideoAnnotator", mock_annotator_cls),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            await _run_worker_until_job_done(
+                worker_app, worker_settings, worker_job_manager
+            )
+
+        assert worker_job_manager.get_job(job.job_id).status == JobStatus.CANCELLED
+        mock_annotator_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_precedence_over_model_load_failure(
+        self, worker_app, worker_settings, worker_job_manager, tmp_path
+    ):
+        """If cancel is set and get_model() also fails, status must be
+        CANCELLED (cancel wins over pre-annotate failure)."""
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        async def cancel_then_fail(name=None):
+            worker_job_manager.request_cancel(job.job_id)
+            raise RuntimeError("model not found")
+
+        worker_app.state.model_manager.get_model = AsyncMock(side_effect=cancel_then_fail)
+
+        mock_annotator_cls = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.executor = None
+
+        with (
+            patch("main.VideoAnnotator", mock_annotator_cls),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            await _run_worker_until_job_done(
+                worker_app, worker_settings, worker_job_manager
+            )
+
+        final = worker_job_manager.get_job(job.job_id)
+        assert final.status == JobStatus.CANCELLED
+        assert final.error is None
+        mock_annotator_cls.assert_not_called()
 ```
 
 Also adjust `_run_worker_until_job_done` to recognise `CANCELLED` as done. Update the helper (replace the existing definition near the top of the file):
@@ -749,18 +949,14 @@ Expected: FAIL — `skip_queued_but_cancelled` hangs or fails because worker cur
 
 In `app/main.py`, update `_annotation_worker`:
 
-(a) After fetching the job, skip it if its queued status was flipped to `CANCELLED`. Replace the existing block immediately after `job = job_manager.get_job(job_id)`:
+(a) After fetching the job, use the new CAS `mark_processing` as the skip guard. This atomically closes the race where `/cancel` arrives between the guard check and the status write. Replace the existing `mark_processing` call and surrounding block:
 
 ```python
 job_id = await job_manager.get_next_job_id()
 job = job_manager.get_job(job_id)
-if job is None:
-    continue
-if job.status != JobStatus.QUEUED:
+if job is None or not job_manager.mark_processing(job_id):
     logger.info(f"Job {job_id} cancelled while queued, skipping")
     continue
-
-job_manager.mark_processing(job_id)
 ```
 
 (b) Import `JobCancelledError` at the top of `main.py` along with other `video_annotator` imports:
@@ -775,22 +971,43 @@ from video_annotator import (
 
 (If the existing import style differs, match it — just ensure `JobCancelledError` is imported.)
 
-(c) Pass `cancel_event=job.cancel_event` to `annotator.annotate(...)`:
+(c) In every pre-annotate `except` branch that currently calls `mark_failed` (e.g. model load), give cancel precedence. Replace the existing:
 
 ```python
-stats = await loop.run_in_executor(
-    executor,
-    lambda: annotator.annotate(
-        input_path=job.input_path,
-        output_path=output_path,
-        params=params,
-        progress_callback=progress_cb,
-        cancel_event=job.cancel_event,
-    ),
-)
+try:
+    model_entry = await model_manager.get_model(model_name)
+except (RuntimeError, ValueError) as e:
+    job_manager.mark_failed(job_id, f"Model error: {e}")
+    continue
 ```
 
-(d) Catch `JobCancelledError` separately, **before** the generic `Exception` branch. Replace the existing `try/except` block around the `run_in_executor` call:
+with:
+
+```python
+try:
+    model_entry = await model_manager.get_model(model_name)
+except (RuntimeError, ValueError) as e:
+    if job.cancel_event.is_set():
+        logger.info(
+            f"Job {job_id} cancelled during model load "
+            f"(suppressed {type(e).__name__})"
+        )
+        job_manager.mark_cancelled(job_id)
+    else:
+        job_manager.mark_failed(job_id, f"Model error: {e}")
+    continue
+```
+
+(d) After a successful `get_model()`, observe a possibly-arrived cancel BEFORE constructing the annotator. Insert immediately after the model-load `try/except` and before the `stabilizer_config = ...` line:
+
+```python
+if job.cancel_event.is_set():
+    logger.info(f"Job {job_id} cancelled during model load")
+    job_manager.mark_cancelled(job_id)
+    continue
+```
+
+(e) Pass `cancel_event=job.cancel_event` to `annotator.annotate(...)` and catch `JobCancelledError` separately, **before** the generic `Exception` branch. Replace the existing `try/except` block around the `run_in_executor` call:
 
 ```python
 try:
@@ -838,7 +1055,7 @@ except Exception as e:
     job_manager.mark_failed(job_id, str(e))
 ```
 
-The existing `finally` block that deletes `input.mp4` stays untouched.
+The existing `finally` block that deletes `input.mp4` stays untouched — it runs for every PROCESSING path. For queued-cancelled jobs the input was already deleted inside `request_cancel`, so the finally's `if job.input_path.exists()` guard correctly becomes a no-op.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -977,13 +1194,22 @@ git commit -m "feat(api): add POST /jobs/{job_id}/cancel"
 
 ---
 
-## Task 7: Documentation
+## Task 7: Documentation and OpenAPI schema
 
 **Files:**
+- Modify: `app/models.py`
 - Modify: `.claude/rules/api.md`
 - Modify: `CLAUDE.md`
 
-- [ ] **Step 1: Update `.claude/rules/api.md`**
+- [ ] **Step 1: Update `app/models.py`**
+
+`JobStatusResponse.status` field description currently enumerates only the four original statuses; the FastAPI-generated OpenAPI schema would be stale. Update the description on line ~181:
+
+```python
+status: str = Field(description="Job status: queued, processing, completed, failed, cancelled")
+```
+
+- [ ] **Step 2: Update `.claude/rules/api.md`**
 
 Add a new section after the existing Job-related documentation (or after `## Info Endpoints` if Job endpoints live there). Insert:
 
@@ -1024,7 +1250,7 @@ Response:
 ```
 ```
 
-- [ ] **Step 2: Update `CLAUDE.md`**
+- [ ] **Step 3: Update `CLAUDE.md`**
 
 In the Endpoints table, add a new row after the `/jobs/{job_id}/download` row:
 
@@ -1032,10 +1258,10 @@ In the Endpoints table, add a new row after the `/jobs/{job_id}/download` row:
 | `/jobs/{job_id}/cancel` | POST | Cancel queued or running job |
 ```
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add .claude/rules/api.md CLAUDE.md
+git add app/models.py .claude/rules/api.md CLAUDE.md
 git commit -m "docs: document POST /jobs/{job_id}/cancel"
 ```
 

@@ -1061,6 +1061,48 @@ async def download_job_result(
     )
 
 
+@app.post("/jobs/{job_id}/cancel", response_model=JobStatusResponse, tags=["Jobs"])
+async def cancel_job(
+    job_id: str,
+    job_manager: JobManager = Depends(get_job_manager),
+):
+    """Cancel a queued or processing video annotation job.
+
+    Idempotent for already-cancelled jobs. Returns 409 when the job is in a
+    terminal non-cancellable status (completed/failed). A client cancelling
+    a PROCESSING job will see `status: "processing"` in the response; the
+    worker flips the job to `cancelled` shortly after, observable via
+    GET /jobs/{job_id}.
+    """
+    try:
+        job = job_manager.request_cancel(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    stats = None
+    if job.stats:
+        stats = JobStats(**job.stats)
+
+    download_url = None
+    if job.status == JobStatus.COMPLETED:
+        download_url = f"/jobs/{job.job_id}/download"
+
+    return JobStatusResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        progress=job.progress,
+        created_at=job.created_at.isoformat(),
+        completed_at=(
+            job.completed_at.isoformat() if job.completed_at else None
+        ),
+        download_url=download_url,
+        error=job.error,
+        stats=stats,
+    )
+
+
 @app.get("/models", tags=["Models"])
 async def list_models(model_manager: ModelManager = Depends(get_model_manager)):
     """

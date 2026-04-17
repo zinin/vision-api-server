@@ -208,3 +208,44 @@ class TestJobDownload:
         resp = client.get(f"/jobs/{job.job_id}/download")
         assert resp.status_code == 404
         assert "not found" in resp.json()["detail"].lower()
+
+
+class TestCancelJob:
+    def test_cancel_queued(self, client, job_manager_for_tests):
+        from job_manager import JobStatus
+        job = job_manager_for_tests.create_job(params={})
+        resp = client.post(f"/jobs/{job.job_id}/cancel")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["job_id"] == job.job_id
+        assert body["status"] == "cancelled"
+        assert job_manager_for_tests.get_job(job.job_id).status == JobStatus.CANCELLED
+
+    def test_cancel_idempotent(self, client, job_manager_for_tests):
+        job = job_manager_for_tests.create_job(params={})
+        client.post(f"/jobs/{job.job_id}/cancel")
+        resp = client.post(f"/jobs/{job.job_id}/cancel")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "cancelled"
+
+    def test_cancel_unknown_returns_404(self, client):
+        resp = client.post("/jobs/does-not-exist/cancel")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Job not found"
+
+    def test_cancel_completed_returns_409(self, client, job_manager_for_tests, tmp_path):
+        from pathlib import Path
+        job = job_manager_for_tests.create_job(params={})
+        output = Path(job_manager_for_tests.jobs_dir) / job.job_id / "output.mp4"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.touch()
+        job_manager_for_tests.mark_completed(job.job_id, output_path=output, stats={})
+        resp = client.post(f"/jobs/{job.job_id}/cancel")
+        assert resp.status_code == 409
+        assert "terminal status" in resp.json()["detail"]
+
+    def test_cancel_failed_returns_409(self, client, job_manager_for_tests):
+        job = job_manager_for_tests.create_job(params={})
+        job_manager_for_tests.mark_failed(job.job_id, error="nope")
+        resp = client.post(f"/jobs/{job.job_id}/cancel")
+        assert resp.status_code == 409

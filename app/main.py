@@ -37,7 +37,7 @@ from models import (
 )
 from visualization import encode_image_to_bytes
 from job_manager import JobManager, JobStatus
-from video_annotator import VideoAnnotator, AnnotationParams
+from video_annotator import VideoAnnotator, AnnotationParams, JobCancelledError
 from detection_stabilizer import StabilizerConfig
 from inference_utils import get_executor
 from video_utils import extract_frames_from_video, VideoFrameExtractor
@@ -186,10 +186,10 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
         try:
             job_id = await job_manager.get_next_job_id()
             job = job_manager.get_job(job_id)
-            if job is None:
+            if job is None or not job_manager.mark_processing(job_id):
+                logger.info(f"Job {job_id} cancelled while queued, skipping")
                 continue
 
-            job_manager.mark_processing(job_id)
             logger.info(f"Worker picked up job {job_id}, params: {job.params}")
 
             try:
@@ -199,9 +199,21 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                 try:
                     model_entry = await model_manager.get_model(model_name)
                 except (RuntimeError, ValueError) as e:
-                    job_manager.mark_failed(job_id, f"Model error: {e}")
+                    if job.cancel_event.is_set():
+                        logger.info(
+                            f"Job {job_id} cancelled during model load "
+                            f"(suppressed {type(e).__name__})"
+                        )
+                        job_manager.mark_cancelled(job_id)
+                    else:
+                        job_manager.mark_failed(job_id, f"Model error: {e}")
                     continue
                 logger.debug(f"Job {job_id}: model loaded, device={model_entry.device}")
+
+                if job.cancel_event.is_set():
+                    logger.info(f"Job {job_id} cancelled during model load")
+                    job_manager.mark_cancelled(job_id)
+                    continue
 
                 stabilizer_config = StabilizerConfig(
                     conf_factor=settings.stabilizer_conf_factor,
@@ -252,6 +264,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                             output_path=output_path,
                             params=params,
                             progress_callback=progress_cb,
+                            cancel_event=job.cancel_event,
                         ),
                     )
 
@@ -270,6 +283,15 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                             "processing_time_ms": stats.processing_time_ms,
                         },
                     )
+
+                except JobCancelledError:
+                    logger.info(f"Job {job_id} cancelled during processing")
+                    job_manager.mark_cancelled(job_id)
+                    try:
+                        if output_path.exists():
+                            output_path.unlink()
+                    except OSError as e:
+                        logger.warning(f"Failed to remove partial output for {job_id}: {e}")
 
                 except Exception as e:
                     logger.error(

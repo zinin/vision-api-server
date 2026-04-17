@@ -25,6 +25,7 @@ from image_utils import validate_and_decode_image
 from inference_utils import run_inference, build_detection_response, shutdown_executor
 from models import (
     DetectionResponse,
+    ErrorResponse,
     VideoDetectionResponse,
     FrameDetection,
     Detection,
@@ -897,9 +898,9 @@ ClassesQuery = Annotated[
     status_code=202,
     tags=["Video Annotation"],
     responses={
-        400: {"description": "Invalid video format or invalid model name"},
-        413: {"description": "Video file too large"},
-        429: {"description": "Job queue is full"},
+        400: {"model": ErrorResponse, "description": "Invalid video format or invalid model name"},
+        413: {"model": ErrorResponse, "description": "Video file too large"},
+        429: {"model": ErrorResponse, "description": "Job queue is full"},
     },
 )
 async def annotate_video(
@@ -1027,7 +1028,7 @@ async def annotate_video(
     response_model=JobStatusResponse,
     tags=["Jobs"],
     responses={
-        404: {"description": "Job not found"},
+        404: {"model": ErrorResponse, "description": "Job not found"},
     },
 )
 async def get_job_status(
@@ -1065,8 +1066,8 @@ async def get_job_status(
     "/jobs/{job_id}/download",
     tags=["Jobs"],
     responses={
-        400: {"description": "Job not ready (not in COMPLETED status)"},
-        404: {"description": "Job not found, or output file missing"},
+        400: {"model": ErrorResponse, "description": "Job not ready (not in COMPLETED status)"},
+        404: {"model": ErrorResponse, "description": "Job not found, or output file missing"},
     },
 )
 async def download_job_result(
@@ -1101,8 +1102,8 @@ async def download_job_result(
     response_model=JobStatusResponse,
     tags=["Jobs"],
     responses={
-        404: {"description": "Job not found"},
-        409: {"description": "Job in non-cancellable terminal status (completed/failed)"},
+        404: {"model": ErrorResponse, "description": "Job not found"},
+        409: {"model": ErrorResponse, "description": "Job already reached a terminal status (completed/failed); cancelled jobs return 200 idempotently"},
     },
 )
 async def cancel_job(

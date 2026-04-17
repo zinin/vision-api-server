@@ -159,6 +159,11 @@ class FrameExtractionResponse(BaseModel):
     processing_time_ms: int = Field(description="Processing time in milliseconds")
 
 
+class ErrorResponse(BaseModel):
+    """FastAPI ``HTTPException`` body shape — exposed for OpenAPI clients."""
+    detail: str = Field(description="Human-readable error message")
+
+
 class JobCreatedResponse(BaseModel):
     """Response when a video annotation job is created."""
     job_id: str = Field(description="Unique job identifier")

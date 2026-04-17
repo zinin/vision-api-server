@@ -278,3 +278,31 @@ def test_mark_processing_cas_cancelled_returns_false(manager):
     assert manager.mark_processing(job.job_id) is False
     # Must NOT overwrite CANCELLED with PROCESSING.
     assert manager.get_job(job.job_id).status == JobStatus.CANCELLED
+
+
+def test_mark_cancelled_sets_status_and_completed_at(manager):
+    from job_manager import JobStatus
+    job = manager.create_job(params={})
+    manager.mark_processing(job.job_id)
+    manager.mark_cancelled(job.job_id)
+    result = manager.get_job(job.job_id)
+    assert result.status == JobStatus.CANCELLED
+    assert result.completed_at is not None
+
+
+def test_cleanup_expired_includes_cancelled(manager, tmp_jobs_dir):
+    from datetime import datetime, timedelta, timezone
+    job = manager.create_job(params={})
+    manager.mark_processing(job.job_id)
+    manager.mark_cancelled(job.job_id)
+
+    # Not yet expired
+    assert manager.cleanup_expired() == 0
+
+    # Backdate completed_at past TTL
+    manager.get_job(job.job_id).completed_at = (
+        datetime.now(tz=timezone.utc) - timedelta(seconds=20)
+    )
+    assert manager.cleanup_expired() == 1
+    assert manager.get_job(job.job_id) is None
+    assert not (Path(tmp_jobs_dir) / job.job_id).exists()

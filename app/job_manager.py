@@ -121,6 +121,15 @@ class JobManager:
             job.error = error
             logger.error(f"Job failed: {job_id}: {error}")
 
+    def mark_cancelled(self, job_id: str) -> None:
+        """Called by the worker after JobCancelledError propagates out of annotate()."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        job.status = JobStatus.CANCELLED
+        job.completed_at = datetime.now(tz=timezone.utc)
+        logger.info(f"Job cancelled: {job_id}")
+
     def request_cancel(self, job_id: str) -> Job:
         """Idempotent cancellation request.
 
@@ -164,7 +173,7 @@ class JobManager:
         now = time.time()
         expired = []
         for job_id, job in self._jobs.items():
-            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
                 if job.completed_at:
                     elapsed = now - job.completed_at.timestamp()
                     if elapsed > self.ttl_seconds:

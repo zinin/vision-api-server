@@ -70,7 +70,12 @@ class JobManager:
         )
 
     def check_queue_capacity(self) -> None:
-        """Raise RuntimeError if queue is full. Call before expensive upload."""
+        """Raise RuntimeError if queue is full. Call before expensive upload.
+
+        ``asyncio.Queue.qsize()`` is documented as approximate, but in this
+        single-event-loop design it is exact: put/get on ``self._queue`` only
+        happens from the event-loop thread, so the count cannot race.
+        """
         queued_count = self._queue.qsize()
         if queued_count >= self.max_queued:
             raise RuntimeError(
@@ -174,14 +179,14 @@ class JobManager:
         prev_status = job.status
         job.cancel_event.set()
 
-        if job.status == JobStatus.QUEUED:
+        if prev_status == JobStatus.QUEUED:
             job.status = JobStatus.CANCELLED
             job.completed_at = datetime.now(tz=timezone.utc)
             # Delete the uploaded input file so it does not linger until TTL.
             # The worker's finally block never runs for queued-skipped jobs.
-            if job.input_path is not None and job.input_path.exists():
+            if job.input_path is not None:
                 try:
-                    job.input_path.unlink()
+                    job.input_path.unlink(missing_ok=True)
                 except OSError as e:
                     logger.warning(
                         f"Failed to delete input file for cancelled job {job_id}: {e}"

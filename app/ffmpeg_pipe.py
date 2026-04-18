@@ -182,6 +182,9 @@ class FFmpegEncoder:
         if rc is not None:
             if rc == 0:
                 self._eof = True
+                logger.debug(
+                    "FFmpegEncoder: clean exit before write (rc=0) — EOF reached"
+                )
                 return False
             raise RuntimeError(
                 f"FFmpeg encoder crashed (rc={rc}): "
@@ -213,6 +216,10 @@ class FFmpegEncoder:
                 ) from e
             if rc == 0:
                 self._eof = True
+                logger.debug(
+                    "FFmpegEncoder: clean exit after BrokenPipe (rc=0) — "
+                    "-shortest finalised early"
+                )
                 return False
             raise RuntimeError(
                 f"FFmpeg encoder pipe broken (rc={rc}): {e}. "

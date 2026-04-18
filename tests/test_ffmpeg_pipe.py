@@ -427,6 +427,32 @@ class TestFFmpegEncoder:
 
         mock_proc.kill.assert_called_once()
 
+    def test_write_frame_after_clean_exit_is_silent(self):
+        """If poll() reports rc=0 before the write, treat as EOF (no raise)."""
+        mock_proc = self._make_mock_process(returncode=0)
+        mock_proc.poll.return_value = 0  # encoder already exited cleanly
+        mock_proc.returncode = 0
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+                crf=18,
+            ) as encoder:
+                encoder.write_frame(frame)  # no raise
+                encoder.write_frame(frame)  # no raise, silent no-op
+
+        # stdin.write was never called because poll() short-circuited first.
+        mock_proc.stdin.write.assert_not_called()
+
     def test_bitrate_mode_command(self):
         """When bitrate is passed, command uses -b:v instead of -crf."""
         mock_proc = self._make_mock_process()

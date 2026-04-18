@@ -427,6 +427,39 @@ class TestFFmpegEncoder:
 
         mock_proc.kill.assert_called_once()
 
+    def test_write_frame_pipe_broken_with_unkillable_process_still_raises(self):
+        """If even the post-kill wait() times out (ffmpeg stuck in D-state),
+        write_frame must still surface a RuntimeError — not leak TimeoutExpired."""
+        mock_proc = self._make_mock_process()
+        mock_proc.poll.return_value = None
+        mock_proc.stdin.write.side_effect = BrokenPipeError(32, "Broken pipe")
+        # Both wait() calls inside write_frame time out: first after BrokenPipe,
+        # second after kill(). Third wait() is for close() via __exit__.
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5),
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5),
+            -9,
+        ]
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with pytest.raises(RuntimeError, match="FFmpeg encoder hung after pipe break"):
+                with FFmpegEncoder(
+                    original_path="input.mp4",
+                    output_path="output.mp4",
+                    width=640,
+                    height=480,
+                    fps=30.0,
+                    hw_config=config,
+                    codec="h264",
+                    crf=18,
+                ) as encoder:
+                    encoder.write_frame(frame)
+
+        mock_proc.kill.assert_called_once()
+
     def test_write_frame_after_clean_exit_is_silent(self):
         """If poll() reports rc=0 before the write, treat as EOF (no raise)."""
         mock_proc = self._make_mock_process(returncode=0)

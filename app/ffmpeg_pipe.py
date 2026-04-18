@@ -127,7 +127,9 @@ class FFmpegEncoder:
         # True after the encoder cleanly exits (rc=0) while we still had
         # frames to write — e.g. FFmpeg's -shortest closes pipe:0 when the
         # audio stream ends before the piped raw video. Subsequent
-        # write_frame() calls become silent no-ops.
+        # write_frame() calls become silent no-ops. Single-writer invariant:
+        # callers must serialise write_frame() from one thread (the Pass 2
+        # loop in VideoAnnotator is single-threaded by design).
         self._eof = False
 
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
@@ -186,7 +188,15 @@ class FFmpegEncoder:
                 rc = self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._process.kill()
-                self._process.wait(timeout=5)
+                # SIGKILL is usually reaped within milliseconds, but in rare
+                # pathologies (D-state on hung NFS, GPU driver wedge) the
+                # process may linger. Swallow a second timeout so we still
+                # raise the intended RuntimeError instead of leaking
+                # TimeoutExpired up the stack.
+                try:
+                    self._process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
                 raise RuntimeError(
                     f"FFmpeg encoder hung after pipe break: {e}. "
                     f"stderr: {_format_stderr(self._stderr_lines)}"

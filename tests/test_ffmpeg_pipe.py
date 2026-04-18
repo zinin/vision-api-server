@@ -395,6 +395,38 @@ class TestFFmpegEncoder:
                 ) as encoder:
                     encoder.write_frame(frame)
 
+    def test_write_frame_pipe_broken_with_hang_kills_and_raises(self):
+        """BrokenPipe + wait() timeout must kill the process and raise."""
+        mock_proc = self._make_mock_process()
+        mock_proc.poll.return_value = None
+        mock_proc.stdin.write.side_effect = BrokenPipeError(32, "Broken pipe")
+        # Three values: (1) wait() inside BrokenPipe handler times out,
+        # (2) wait() after kill() returns, (3) wait() inside close() via __exit__.
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5),
+            -9,
+            -9,
+        ]
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with pytest.raises(RuntimeError, match="FFmpeg encoder hung after pipe break"):
+                with FFmpegEncoder(
+                    original_path="input.mp4",
+                    output_path="output.mp4",
+                    width=640,
+                    height=480,
+                    fps=30.0,
+                    hw_config=config,
+                    codec="h264",
+                    crf=18,
+                ) as encoder:
+                    encoder.write_frame(frame)
+
+        mock_proc.kill.assert_called_once()
+
     def test_bitrate_mode_command(self):
         """When bitrate is passed, command uses -b:v instead of -crf."""
         mock_proc = self._make_mock_process()

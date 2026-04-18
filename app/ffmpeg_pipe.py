@@ -233,7 +233,7 @@ class FFmpegEncoder:
                 )
                 return False
             raise RuntimeError(
-                f"FFmpeg encoder pipe broken ({_rc_to_str(rc)}): {e}. "
+                f"FFmpeg encoder crashed mid-write ({_rc_to_str(rc)}): {e}. "
                 f"stderr: {_format_stderr(self._stderr_lines)}"
             ) from e
         return True

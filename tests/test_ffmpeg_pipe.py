@@ -439,7 +439,7 @@ class TestFFmpegEncoder:
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
         with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
-            with pytest.raises(RuntimeError, match="FFmpeg encoder pipe broken"):
+            with pytest.raises(RuntimeError, match="FFmpeg encoder crashed mid-write"):
                 with FFmpegEncoder(
                     original_path="input.mp4",
                     output_path="output.mp4",

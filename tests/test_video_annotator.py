@@ -1101,6 +1101,7 @@ class TestAnnotateCancellation:
             write_calls["n"] += 1
             if write_calls["n"] >= 2:
                 cancel_event.set()
+            return True
 
         mock_encoder.write_frame.side_effect = fake_write
 

@@ -27,6 +27,17 @@ def _format_stderr(lines: deque[bytes], max_lines: int = 10) -> str:
     return b"".join(tail).decode("utf-8", errors="replace")[:2000]
 
 
+def _rc_to_str(rc: int | None) -> str:
+    """Render a subprocess return code. Negative rc means killed by signal
+    |rc| (POSIX convention). Distinguishes OOM-kills and external SIGKILL
+    from self-reported exit codes when these end up in error messages."""
+    if rc is None:
+        return "rc=?"
+    if rc < 0:
+        return f"killed by signal {-rc}"
+    return f"rc={rc}"
+
+
 class FFmpegDecoder:
     """Decode video frames via FFmpeg subprocess pipe.
 
@@ -70,7 +81,7 @@ class FFmpegDecoder:
             # Check if process crashed (vs normal EOF)
             if self._process.poll() is not None and self._process.returncode != 0:
                 raise RuntimeError(
-                    f"FFmpeg decoder crashed (rc={self._process.returncode}): "
+                    f"FFmpeg decoder crashed ({_rc_to_str(self._process.returncode)}): "
                     f"{_format_stderr(self._stderr_lines)}"
                 )
             return None
@@ -88,11 +99,22 @@ class FFmpegDecoder:
             self._process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self._process.kill()
-            self._process.wait(timeout=5)
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # SIGKILL ignored (D-state) — nothing more we can do
         stderr_output = _format_stderr(self._stderr_lines, max_lines=50)
         if stderr_output:
             logger.debug(f"FFmpeg decoder stderr:\n{stderr_output}")
-        if self._process.returncode and self._process.returncode != 0:
+        if self._process.returncode is None:
+            # SIGKILL did not reap the process (D-state / hung NFS / GPU
+            # driver wedge). Surface as a WARNING so operators know the
+            # teardown did not finish — otherwise a stuck decoder leaks
+            # silently in both pass 1 and pass 2 cleanup paths.
+            logger.warning(
+                "FFmpeg decoder did not exit after SIGKILL; process may be leaked"
+            )
+        elif self._process.returncode != 0:
             logger.warning(f"FFmpeg decoder exited with code {self._process.returncode}")
 
     def __enter__(self):
@@ -124,6 +146,13 @@ class FFmpegEncoder:
         bitrate: int | None = None,
     ):
         self._stderr_lines: deque[bytes] = deque(maxlen=100)
+        # True after the encoder cleanly exits (rc=0) while we still had
+        # frames to write — e.g. FFmpeg's -shortest closes pipe:0 when the
+        # audio stream ends before the piped raw video. Subsequent
+        # write_frame() calls become silent no-ops. Single-writer invariant:
+        # callers must serialise write_frame() from one thread (the Pass 2
+        # loop in VideoAnnotator is single-threaded by design).
+        self._eof = False
 
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
         cmd += hw_config.global_encode_args  # e.g. [-vaapi_device, ...] — MUST be before -i
@@ -139,8 +168,15 @@ class FFmpegEncoder:
         cmd += ["-c:a", "aac", "-shortest", str(output_path)]
 
         logger.debug(f"FFmpegEncoder command: {' '.join(cmd)}")
+        # Keep the default buffered stdin (bufsize=-1) so write() honours
+        # the BufferedWriter "write all bytes" contract — raw unbuffered
+        # mode can short-write under EINTR / backpressure and misalign
+        # the rawvideo stream. write_frame() calls flush() after each
+        # frame, which keeps the buffer empty so close()'s implicit
+        # flush cannot push residual bytes into a pipe that ffmpeg has
+        # already closed (e.g. after -shortest).
         self._process = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False,
         )
         # Start daemon thread to drain stderr and prevent deadlock
         self._stderr_thread = threading.Thread(
@@ -148,21 +184,77 @@ class FFmpegEncoder:
         )
         self._stderr_thread.start()
 
-    def write_frame(self, frame: np.ndarray) -> None:
-        """Write one BGR24 frame to the encoder. Raises RuntimeError if process crashed."""
+    def write_frame(self, frame: np.ndarray) -> bool:
+        """Write one BGR24 frame to the encoder.
+
+        Returns True when the frame was written and the caller should keep
+        going, False once the encoder has finalised (rc == 0) — callers
+        should break their loop in that case to avoid wasting CPU on
+        frames ffmpeg will never consume.
+
+        Raises RuntimeError if the process crashed (rc != 0). A clean
+        early exit (rc == 0) is treated as EOF: the frame is silently
+        dropped and further calls short-circuit to False. This covers
+        FFmpeg's -shortest behaviour: when the audio stream ends before
+        the piped raw video, ffmpeg closes pipe:0 from its side, the
+        output file is already fully written, and there's nothing left
+        for Python to do.
+        """
+        if self._eof:
+            return False
         rc = self._process.poll()
         if rc is not None:
+            if rc == 0:
+                self._eof = True
+                logger.debug(
+                    "FFmpegEncoder: clean exit before write (rc=0) — EOF reached"
+                )
+                return False
             raise RuntimeError(
-                f"FFmpeg encoder crashed (rc={rc}): "
+                f"FFmpeg encoder crashed ({_rc_to_str(rc)}): "
                 f"{_format_stderr(self._stderr_lines)}"
             )
         try:
             self._process.stdin.write(frame.tobytes())
-        except (BrokenPipeError, OSError) as e:
+            # Flush after every frame so the Python-side buffer never holds
+            # residual bytes: close()'s implicit flush would otherwise push
+            # them into a pipe ffmpeg already closed (e.g. after -shortest)
+            # and raise a spurious BrokenPipeError despite a clean rc=0.
+            self._process.stdin.flush()
+        except OSError as e:  # BrokenPipeError is a subclass of OSError.
+            # The pipe closed mid-write. Most often this means the
+            # encoder just finalised the output (e.g. -shortest on an
+            # audio stream shorter than the video pipe). Give it a
+            # moment to reap, then distinguish clean exit vs crash.
+            try:
+                rc = self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                # SIGKILL is usually reaped within milliseconds, but in rare
+                # pathologies (D-state on hung NFS, GPU driver wedge) the
+                # process may linger. Swallow a second timeout so we still
+                # raise the intended RuntimeError instead of leaking
+                # TimeoutExpired up the stack.
+                try:
+                    self._process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise RuntimeError(
+                    f"FFmpeg encoder hung after pipe break: {e}. "
+                    f"stderr: {_format_stderr(self._stderr_lines)}"
+                ) from e
+            if rc == 0:
+                self._eof = True
+                logger.debug(
+                    "FFmpegEncoder: clean exit after BrokenPipe (rc=0) — "
+                    "-shortest finalised early"
+                )
+                return False
             raise RuntimeError(
-                f"FFmpeg encoder pipe broken: {e}. "
+                f"FFmpeg encoder crashed mid-write ({_rc_to_str(rc)}): {e}. "
                 f"stderr: {_format_stderr(self._stderr_lines)}"
             ) from e
+        return True
 
     def close(self) -> None:
         """Close stdin, wait for FFmpeg to finish, check return code."""
@@ -175,13 +267,25 @@ class FFmpegEncoder:
             self._process.wait(timeout=300)
         except subprocess.TimeoutExpired:
             self._process.kill()
-            self._process.wait(timeout=10)
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # SIGKILL ignored (D-state) — nothing more we can do
         stderr_output = _format_stderr(self._stderr_lines, max_lines=50)
         if stderr_output:
             logger.debug(f"FFmpeg encoder stderr:\n{stderr_output}")
-        if self._process.returncode and self._process.returncode != 0:
+        if self._process.returncode is None:
+            # SIGKILL did not reap the process. Fail loudly so _pass2_render
+            # cannot report success while the output is unfinished and a
+            # stuck encoder leaks. __exit__ suppresses this RuntimeError
+            # when another exception is already propagating.
             raise RuntimeError(
-                f"FFmpeg encoder failed (rc={self._process.returncode}): "
+                f"FFmpeg encoder did not exit after SIGKILL; process may be leaked. "
+                f"stderr: {stderr_output}"
+            )
+        if self._process.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg encoder failed ({_rc_to_str(self._process.returncode)}): "
                 f"{stderr_output}"
             )
 

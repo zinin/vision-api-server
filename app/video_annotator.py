@@ -520,7 +520,11 @@ class VideoAnnotator:
                     self._draw_detections(frame, stabilized[frame_num].detections,
                                           params, font_scale)
 
-                encoder.write_frame(frame)
+                if not encoder.write_frame(frame):
+                    # Encoder finished early (e.g. -shortest finalised the
+                    # output); further frames would be decoded and drawn in
+                    # vain. Break out instead of feeding dead iterations.
+                    break
                 frame_num += 1
 
                 if progress_callback and total_frames > 0 and frame_num % 10 == 0:

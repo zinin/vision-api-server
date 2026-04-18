@@ -16,7 +16,7 @@ from detection_stabilizer import (
     StabilizerConfig,
 )
 from ffmpeg_pipe import FFmpegDecoder, FFmpegEncoder
-from hw_accel import HWAccelConfig
+from hw_accel import HWAccelConfig, HWAccelType
 from visualization import DetectionVisualizer, DetectionBox
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,22 @@ _CODEC_NAME_MAP: dict[str, str] = {
 _MIN_BITRATE = 100_000
 _MAX_BITRATE = 200_000_000
 _MAX_REASONABLE_FPS = 240.0
+
+# Markers used to recognise an NVENC VRAM-initialisation failure in an
+# FFmpegEncoder RuntimeError message. Any of these, combined with a
+# "_nvenc" substring, means the encoder subprocess died before it could
+# accept a single frame — almost always because the GPU could not allocate
+# NVENC input buffers (YOLO model + NVDEC buffers squeeze it out).
+_NVENC_OOM_MARKERS: tuple[str, ...] = (
+    "out of memory",
+    "Cannot allocate memory",
+    "EncodeAPI Internal Error",
+)
+
+
+def _is_nvenc_oom_error(message: str) -> bool:
+    """True iff the FFmpeg stderr tail points to an NVENC allocation failure."""
+    return "_nvenc" in message and any(m in message for m in _NVENC_OOM_MARKERS)
 
 
 def _parse_frame_rate(raw: str | None) -> float | None:
@@ -230,14 +246,39 @@ class VideoAnnotator:
         if cancel_event is not None and cancel_event.is_set():
             raise JobCancelledError()
 
-        # Pass 2: decode again + render
+        # Pass 2: decode again + render.
+        # If NVENC fails to initialise (common when VRAM is tight because the
+        # YOLO model stays resident between passes), retry the whole Pass 2
+        # on CPU with the same codec via libx264/libx265/libsvtav1 and CRF
+        # mode. Non-NVENC RuntimeErrors propagate untouched.
         font_scale = self.visualizer.calculate_adaptive_font_scale(metadata.height)
-        self._pass2_render(
-            input_path, output_path, metadata, params, stabilized,
-            effective_codec, effective_crf, effective_bitrate,
-            font_scale, actual_frames, progress_callback,
-            cancel_event=cancel_event,
-        )
+        try:
+            self._pass2_render(
+                input_path, output_path, metadata, params, stabilized,
+                effective_codec, effective_crf, effective_bitrate,
+                font_scale, actual_frames, progress_callback,
+                cancel_event=cancel_event,
+            )
+        except RuntimeError as e:
+            if not _is_nvenc_oom_error(str(e)):
+                raise
+            logger.warning(
+                f"NVENC Pass 2 failed for {input_path.name} (likely VRAM "
+                f"exhausted by resident YOLO model). Retrying on CPU encoder. "
+                f"Original error: {e}"
+            )
+            output_path.unlink(missing_ok=True)
+            cpu_hw_config = HWAccelConfig(
+                accel_type=HWAccelType.CPU,
+                vaapi_device=self.hw_config.vaapi_device,
+            )
+            self._pass2_render(
+                input_path, output_path, metadata, params, stabilized,
+                effective_codec, self.crf, None,
+                font_scale, actual_frames, progress_callback,
+                cancel_event=cancel_event,
+                hw_config=cpu_hw_config,
+            )
 
         stats.processing_time_ms = int((time.perf_counter() - start_time) * 1000)
         fps_actual = actual_frames / max(stats.processing_time_ms / 1000, 0.001)
@@ -428,13 +469,19 @@ class VideoAnnotator:
         total_frames: int,
         progress_callback: Callable[[int], None] | None,
         cancel_event: threading.Event | None = None,
+        hw_config: HWAccelConfig | None = None,
     ) -> None:
-        """Pass 2: decode video again, draw stabilized detections, encode."""
-        frame_num = 0
+        """Pass 2: decode video again, draw stabilized detections, encode.
 
-        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder, \
+        ``hw_config`` defaults to ``self.hw_config``; it's overridable so
+        ``annotate()`` can retry this pass on CPU when NVENC init fails.
+        """
+        frame_num = 0
+        config = hw_config if hw_config is not None else self.hw_config
+
+        with FFmpegDecoder(input_path, metadata.width, metadata.height, config) as decoder, \
              FFmpegEncoder(input_path, output_path, metadata.width, metadata.height,
-                           metadata.fps, self.hw_config, effective_codec,
+                           metadata.fps, config, effective_codec,
                            crf=effective_crf, bitrate=effective_bitrate) as encoder:
 
             while True:

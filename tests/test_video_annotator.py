@@ -12,6 +12,7 @@ from video_annotator import (
     VideoAnnotator,
     VideoMetadata,
     AnnotationParams,
+    _is_nvenc_oom_error,
     _parse_fps,
 )
 from visualization import DetectionBox, DetectionVisualizer
@@ -1279,3 +1280,246 @@ class TestAnnotateCancellation:
             )
 
         assert stats.total_frames == num_frames
+
+
+class TestIsNvencOomError:
+    """Classifier helper for NVENC VRAM-initialisation failure signatures."""
+
+    def test_init_encoder_out_of_memory(self):
+        msg = (
+            "FFmpeg encoder pipe broken: [Errno 32] Broken pipe. stderr: "
+            "[hevc_nvenc @ 0x1234] InitializeEncoder failed: out of memory (10)"
+        )
+        assert _is_nvenc_oom_error(msg) is True
+
+    def test_create_input_buffer_out_of_memory(self):
+        msg = (
+            "FFmpeg encoder pipe broken: [Errno 32] Broken pipe. stderr: "
+            "[hevc_nvenc @ 0x1234] CreateInputBuffer failed: out of memory (10)"
+        )
+        assert _is_nvenc_oom_error(msg) is True
+
+    def test_cannot_allocate_memory_marker(self):
+        msg = "[hevc_nvenc] encoder setup failed: Cannot allocate memory"
+        assert _is_nvenc_oom_error(msg) is True
+
+    def test_encode_api_internal_error_marker(self):
+        msg = "[h264_nvenc @ 0x...] EncodeAPI Internal Error."
+        assert _is_nvenc_oom_error(msg) is True
+
+    def test_non_nvenc_message_rejected(self):
+        assert _is_nvenc_oom_error("FFmpeg decoder crashed (rc=1)") is False
+
+    def test_nvenc_without_oom_marker_rejected(self):
+        assert _is_nvenc_oom_error("hevc_nvenc: some other failure") is False
+
+    def test_empty_message(self):
+        assert _is_nvenc_oom_error("") is False
+
+
+class TestNvencFallback:
+    """Pass 2 CPU fallback when NVENC initialisation fails (VRAM pressure).
+
+    Triggered when FFmpegEncoder.write_frame raises a RuntimeError matching
+    the _is_nvenc_oom_error signature. annotate() must then re-run Pass 2
+    with a CPU-only HWAccelConfig, CRF mode, and no bitrate forwarding.
+    """
+
+    def _make_frames(self, num_frames: int, width: int = 640, height: int = 480):
+        return [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
+
+    def _make_decoder_mock(self, frames: list[np.ndarray]):
+        mock_decoder = MagicMock()
+        mock_decoder.read_frame.side_effect = list(frames) + [None]
+        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
+        mock_decoder.__exit__ = MagicMock(return_value=False)
+        return mock_decoder
+
+    def _ffprobe_result(self, num_frames: int) -> MagicMock:
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": str(num_frames),
+        }
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = json.dumps({"streams": [stream]})
+        return r
+
+    def test_nvenc_oom_triggers_cpu_fallback(self, mock_model, mock_visualizer, tmp_path):
+        """First NVENC-OOM in Pass 2 is caught; Pass 2 re-runs on CPU with CRF."""
+        nvidia_hw_config = HWAccelConfig(accel_type=HWAccelType.NVIDIA)
+
+        num_frames = 3
+        dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_cpu = self._make_decoder_mock(self._make_frames(num_frames))
+        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu])
+
+        failing_encoder = MagicMock()
+        failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
+        failing_encoder.__exit__ = MagicMock(return_value=False)
+        failing_encoder.write_frame.side_effect = RuntimeError(
+            "FFmpeg encoder pipe broken: [Errno 32] Broken pipe. stderr: "
+            "[hevc_nvenc @ 0x1234] InitializeEncoder failed: "
+            "out of memory (10): EncodeAPI Internal Error."
+        )
+
+        ok_encoder = MagicMock()
+        ok_encoder.__enter__ = MagicMock(return_value=ok_encoder)
+        ok_encoder.__exit__ = MagicMock(return_value=False)
+
+        mock_encoder_cls = MagicMock(side_effect=[failing_encoder, ok_encoder])
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        output_path = tmp_path / "output.mp4"
+        # The failing NVENC run may have created a zero-byte output file.
+        # Fallback must remove it before retrying.
+        output_path.touch()
+        assert output_path.exists()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, nvidia_hw_config,
+            codec="h265", crf=18,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            stats = annotator.annotate(
+                input_path, output_path, AnnotationParams(detect_every=1),
+            )
+
+        assert stats.total_frames == num_frames
+
+        # Two encoder constructions: NVENC attempt then CPU retry.
+        assert mock_encoder_cls.call_count == 2
+        first_call, second_call = mock_encoder_cls.call_args_list
+
+        # args[5] is hw_config, args[6] is codec.
+        assert first_call.args[5].accel_type == HWAccelType.NVIDIA
+        assert first_call.args[6] == "h265"
+        assert second_call.args[5].accel_type == HWAccelType.CPU
+        # Same codec on retry — only hw accel changes.
+        assert second_call.args[6] == "h265"
+        # CPU retry forces CRF, clears bitrate.
+        assert second_call.kwargs.get("bitrate") is None
+        assert second_call.kwargs.get("crf") == 18
+
+        # Pass 2 decoder also rebuilt for the CPU retry.
+        assert mock_decoder_cls.call_count == 3
+        pass1_call, pass2_nvenc_call, pass2_cpu_call = mock_decoder_cls.call_args_list
+        assert pass1_call.args[3].accel_type == HWAccelType.NVIDIA
+        assert pass2_nvenc_call.args[3].accel_type == HWAccelType.NVIDIA
+        assert pass2_cpu_call.args[3].accel_type == HWAccelType.CPU
+
+        # The CPU encoder consumed all Pass 2 frames.
+        assert ok_encoder.write_frame.call_count == num_frames
+
+    def test_non_nvenc_runtimeerror_propagates_without_retry(
+        self, mock_model, mock_visualizer, tmp_path
+    ):
+        """RuntimeError without NVENC signature is re-raised; no CPU retry."""
+        nvidia_hw_config = HWAccelConfig(accel_type=HWAccelType.NVIDIA)
+
+        num_frames = 3
+        dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2 = self._make_decoder_mock(self._make_frames(num_frames))
+        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2])
+
+        failing_encoder = MagicMock()
+        failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
+        failing_encoder.__exit__ = MagicMock(return_value=False)
+        failing_encoder.write_frame.side_effect = RuntimeError(
+            "FFmpeg encoder crashed (rc=1): ffmpeg binary not found"
+        )
+        mock_encoder_cls = MagicMock(return_value=failing_encoder)
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, nvidia_hw_config,
+            codec="h265", crf=18,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(RuntimeError, match="ffmpeg binary not found"):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                )
+
+        # Encoder constructed only once — no retry attempt.
+        assert mock_encoder_cls.call_count == 1
+
+    def test_cpu_fallback_retry_failure_propagates(
+        self, mock_model, mock_visualizer, tmp_path
+    ):
+        """If the CPU retry itself fails, the error propagates to the caller."""
+        nvidia_hw_config = HWAccelConfig(accel_type=HWAccelType.NVIDIA)
+
+        num_frames = 3
+        dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_cpu = self._make_decoder_mock(self._make_frames(num_frames))
+        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu])
+
+        def _make_failing_encoder(msg: str) -> MagicMock:
+            enc = MagicMock()
+            enc.__enter__ = MagicMock(return_value=enc)
+            enc.__exit__ = MagicMock(return_value=False)
+            enc.write_frame.side_effect = RuntimeError(msg)
+            return enc
+
+        nvenc_fail = _make_failing_encoder(
+            "FFmpeg encoder pipe broken: stderr: [hevc_nvenc] "
+            "InitializeEncoder failed: out of memory (10)"
+        )
+        cpu_fail = _make_failing_encoder(
+            "FFmpeg encoder crashed (rc=1): libx265 not available"
+        )
+        mock_encoder_cls = MagicMock(side_effect=[nvenc_fail, cpu_fail])
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, nvidia_hw_config,
+            codec="h265", crf=18,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(RuntimeError, match="libx265 not available"):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                )
+
+        # Two encoder attempts, no third.
+        assert mock_encoder_cls.call_count == 2

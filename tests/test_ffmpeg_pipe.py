@@ -86,6 +86,27 @@ class TestFFmpegDecoder:
         mock_stdout.close.assert_called()
         mock_proc.wait.assert_called()
 
+    def test_close_with_unkillable_process_suppresses_timeout(self):
+        """FFmpegDecoder.close() must not leak TimeoutExpired when both
+        the primary wait() and the post-kill wait() time out (D-state,
+        hung NFS, GPU driver wedge). Symmetric to FFmpegEncoder's
+        write_frame hardening."""
+        mock_proc = self._make_mock_process([])
+        mock_stdout = MagicMock()
+        mock_stdout.read.return_value = b""
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5),
+        ]
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegDecoder("input.mp4", 640, 480, config):
+                pass  # exit triggers close(), which hits both timeouts
+
+        mock_proc.kill.assert_called_once()
+
     def test_frames_are_writable(self):
         """Returned numpy arrays must be writable (for OpenCV drawing)."""
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -299,6 +320,34 @@ class TestFFmpegEncoder:
         assert "-map" in cmd
         assert "1:a:0?" in cmd
         assert "aac" in cmd
+
+    def test_close_with_unkillable_process_suppresses_timeout(self):
+        """FFmpegEncoder.close() must not leak TimeoutExpired when both
+        the primary wait() and the post-kill wait() time out (D-state,
+        hung NFS, GPU driver wedge). Symmetric to the write_frame hang
+        path: SIGKILL is usually reaped in ms but edge cases should not
+        bubble up as TimeoutExpired on the caller."""
+        mock_proc = self._make_mock_process()
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=300),
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+        ]
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+                crf=18,
+            ):
+                pass  # exit triggers close(), which hits both timeouts
+
+        mock_proc.kill.assert_called_once()
 
     def test_cleanup_on_exit(self):
         """Verify stdin is closed and process is waited on exit."""

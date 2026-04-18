@@ -99,7 +99,10 @@ class FFmpegDecoder:
             self._process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self._process.kill()
-            self._process.wait(timeout=5)
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # SIGKILL ignored (D-state) — nothing more we can do
         stderr_output = _format_stderr(self._stderr_lines, max_lines=50)
         if stderr_output:
             logger.debug(f"FFmpeg decoder stderr:\n{stderr_output}")
@@ -249,7 +252,10 @@ class FFmpegEncoder:
             self._process.wait(timeout=300)
         except subprocess.TimeoutExpired:
             self._process.kill()
-            self._process.wait(timeout=10)
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # SIGKILL ignored (D-state) — nothing more we can do
         stderr_output = _format_stderr(self._stderr_lines, max_lines=50)
         if stderr_output:
             logger.debug(f"FFmpeg encoder stderr:\n{stderr_output}")

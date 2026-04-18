@@ -286,18 +286,23 @@ class VideoAnnotator:
                 vaapi_device=self.hw_config.vaapi_device,
             )
             # CPU retry: force CRF mode and drop the source-matched bitrate.
-            # libx264/libx265 single-pass with a 50–100 Mbps target is slow
-            # and brings no visible quality gain over CRF at self.crf.
+            # libx264/libx265 single-pass at a 50–100 Mbps target is slow and
+            # brings no visible quality gain over CRF. Reuse effective_crf so
+            # _resolve_codec's policy survives the fallback (auto-mode keeps
+            # CRF 18; explicit codecs keep self.crf). When auto-mode picked
+            # bitrate, effective_crf is None — default to 18 to match the
+            # auto-without-bitrate branch of _resolve_codec.
+            retry_crf = effective_crf if effective_crf is not None else 18
             self._pass2_render(
                 input_path, output_path, metadata, params, stabilized,
-                effective_codec, self.crf, None,
+                effective_codec, retry_crf, None,
                 font_scale, actual_frames, progress_callback,
                 cancel_event=cancel_event,
                 hw_config=cpu_hw_config,
             )
             logger.info(
                 f"CPU Pass 2 retry succeeded for {input_path.name} "
-                f"(codec={effective_codec}, crf={self.crf})"
+                f"(codec={effective_codec}, crf={retry_crf})"
             )
 
         stats.processing_time_ms = int((time.perf_counter() - start_time) * 1000)

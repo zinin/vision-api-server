@@ -1550,6 +1550,138 @@ class TestNvencFallback:
         # Two encoder attempts, no third.
         assert mock_encoder_cls.call_count == 2
 
+    def test_auto_mode_bitrate_fallback_uses_crf_18_not_self_crf(
+        self, mock_model, mock_visualizer, tmp_path
+    ):
+        """In VIDEO_CODEC=auto with source bitrate, the NVENC attempt uses
+        -b:v (effective_crf=None). CPU retry must drop the bitrate AND pick
+        CRF 18 (the auto-mode policy from _resolve_codec), NOT self.crf.
+        Regression guard for the Codex P2 finding.
+        """
+        nvidia_hw_config = HWAccelConfig(accel_type=HWAccelType.NVIDIA)
+
+        num_frames = 3
+        dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_cpu = self._make_decoder_mock(self._make_frames(num_frames))
+        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu])
+
+        failing_encoder = MagicMock()
+        failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
+        failing_encoder.__exit__ = MagicMock(return_value=False)
+        failing_encoder.write_frame.side_effect = RuntimeError(
+            "FFmpeg encoder pipe broken: stderr: [hevc_nvenc] "
+            "InitializeEncoder failed: out of memory (10)"
+        )
+
+        ok_encoder = MagicMock()
+        ok_encoder.__enter__ = MagicMock(return_value=ok_encoder)
+        ok_encoder.__exit__ = MagicMock(return_value=False)
+
+        mock_encoder_cls = MagicMock(side_effect=[failing_encoder, ok_encoder])
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        # HEVC source with bitrate — auto-mode resolves to (h265, None, 8 Mbps).
+        stream = {
+            "r_frame_rate": "30/1", "width": 640, "height": 480,
+            "nb_frames": str(num_frames),
+            "codec_name": "hevc", "bit_rate": "8000000",
+        }
+        ffprobe_result = MagicMock()
+        ffprobe_result.returncode = 0
+        ffprobe_result.stdout = json.dumps({"streams": [stream]})
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        # Configured crf=23 on purpose — must NOT leak into the retry,
+        # because _resolve_codec's auto-mode policy is CRF 18.
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, nvidia_hw_config,
+            codec="auto", crf=23,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe_result),
+        ):
+            annotator.annotate(
+                input_path, tmp_path / "out.mp4",
+                AnnotationParams(detect_every=1),
+            )
+
+        # NVENC attempt: bitrate mode (effective_crf=None, effective_bitrate=8M).
+        first_call, second_call = mock_encoder_cls.call_args_list
+        assert first_call.kwargs.get("crf") is None
+        assert first_call.kwargs.get("bitrate") == 8_000_000
+
+        # CPU retry: bitrate dropped, CRF from auto-mode policy (18), not self.crf=23.
+        assert second_call.kwargs.get("bitrate") is None
+        assert second_call.kwargs.get("crf") == 18
+
+    def test_explicit_codec_fallback_preserves_self_crf(
+        self, mock_model, mock_visualizer, tmp_path
+    ):
+        """Explicit VIDEO_CODEC=h265 with CRF=23: _resolve_codec returns
+        effective_crf=23, so the CPU retry must also use crf=23.
+        Complements the auto-mode case above.
+        """
+        nvidia_hw_config = HWAccelConfig(accel_type=HWAccelType.NVIDIA)
+
+        num_frames = 3
+        dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_cpu = self._make_decoder_mock(self._make_frames(num_frames))
+        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu])
+
+        failing_encoder = MagicMock()
+        failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
+        failing_encoder.__exit__ = MagicMock(return_value=False)
+        failing_encoder.write_frame.side_effect = RuntimeError(
+            "FFmpeg encoder pipe broken: stderr: [hevc_nvenc] "
+            "InitializeEncoder failed: out of memory (10)"
+        )
+
+        ok_encoder = MagicMock()
+        ok_encoder.__enter__ = MagicMock(return_value=ok_encoder)
+        ok_encoder.__exit__ = MagicMock(return_value=False)
+
+        mock_encoder_cls = MagicMock(side_effect=[failing_encoder, ok_encoder])
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, nvidia_hw_config,
+            codec="h265", crf=23,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            annotator.annotate(
+                input_path, tmp_path / "out.mp4",
+                AnnotationParams(detect_every=1),
+            )
+
+        # Both attempts use crf=23; retry drops any bitrate (there wasn't one).
+        first_call, second_call = mock_encoder_cls.call_args_list
+        assert first_call.kwargs.get("crf") == 23
+        assert second_call.kwargs.get("crf") == 23
+        assert second_call.kwargs.get("bitrate") is None
+
     def test_cancel_between_nvenc_failure_and_cpu_retry(
         self, mock_model, mock_visualizer, tmp_path
     ):

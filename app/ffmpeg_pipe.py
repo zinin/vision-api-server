@@ -168,13 +168,15 @@ class FFmpegEncoder:
         cmd += ["-c:a", "aac", "-shortest", str(output_path)]
 
         logger.debug(f"FFmpegEncoder command: {' '.join(cmd)}")
-        # bufsize=0 — every write goes straight to the OS pipe. This avoids a
-        # spurious BrokenPipeError from close() when ffmpeg finalised early
-        # (e.g. -shortest) and residual bytes in a Python-side buffer would
-        # otherwise be flushed into a pipe the peer has already closed.
+        # Keep the default buffered stdin (bufsize=-1) so write() honours
+        # the BufferedWriter "write all bytes" contract — raw unbuffered
+        # mode can short-write under EINTR / backpressure and misalign
+        # the rawvideo stream. write_frame() calls flush() after each
+        # frame, which keeps the buffer empty so close()'s implicit
+        # flush cannot push residual bytes into a pipe that ffmpeg has
+        # already closed (e.g. after -shortest).
         self._process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False,
-            bufsize=0,
         )
         # Start daemon thread to drain stderr and prevent deadlock
         self._stderr_thread = threading.Thread(
@@ -214,6 +216,11 @@ class FFmpegEncoder:
             )
         try:
             self._process.stdin.write(frame.tobytes())
+            # Flush after every frame so the Python-side buffer never holds
+            # residual bytes: close()'s implicit flush would otherwise push
+            # them into a pipe ffmpeg already closed (e.g. after -shortest)
+            # and raise a spurious BrokenPipeError despite a clean rc=0.
+            self._process.stdin.flush()
         except OSError as e:  # BrokenPipeError is a subclass of OSError.
             # The pipe closed mid-write. Most often this means the
             # encoder just finalised the output (e.g. -shortest on an

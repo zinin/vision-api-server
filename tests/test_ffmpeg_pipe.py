@@ -180,15 +180,19 @@ class TestFFmpegEncoder:
         mock_proc.returncode = returncode
         return mock_proc
 
-    def test_stdin_opened_unbuffered(self):
-        """Popen must be called with bufsize=0 so write_frame never leaves
-        data in a Python-side buffer that a later flush would push into a
-        pipe already closed by ffmpeg (e.g. after -shortest). Without this,
-        close() can raise a spurious BrokenPipeError despite a clean rc=0."""
+    def test_write_frame_flushes_stdin(self):
+        """write_frame must flush stdin after each frame so the Python-side
+        buffer never holds residual bytes that close()'s implicit flush
+        could push into a pipe ffmpeg has already closed (e.g. after
+        -shortest). This is the buffered-stdin counterpart to the
+        BufferedWriter's write-all-bytes contract — we keep buffered
+        writes (so partial writes cannot corrupt the rawvideo stream)
+        while making sure the pipe is drained on every frame."""
         mock_proc = self._make_mock_process()
         config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc) as mock_popen:
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
             with FFmpegEncoder(
                 original_path="input.mp4",
                 output_path="output.mp4",
@@ -198,12 +202,11 @@ class TestFFmpegEncoder:
                 hw_config=config,
                 codec="h264",
                 crf=18,
-            ):
-                pass
+            ) as encoder:
+                encoder.write_frame(frame)
+                encoder.write_frame(frame)
 
-        assert mock_popen.call_args.kwargs.get("bufsize") == 0, (
-            "FFmpegEncoder must open stdin unbuffered (bufsize=0)"
-        )
+        assert mock_proc.stdin.flush.call_count == 2
 
     def test_write_frame(self):
         """write_frame writes correct raw bytes to stdin and returns True."""

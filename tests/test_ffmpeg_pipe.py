@@ -330,6 +330,46 @@ class TestFFmpegEncoder:
                 ) as encoder:
                     encoder.write_frame(frame)
 
+    def test_write_frame_graceful_eof_on_shortest(self):
+        """write_frame MUST NOT raise when encoder exits cleanly (rc=0) via -shortest.
+
+        Reproduces the real-world scenario where ffmpeg closes pipe:0 after
+        audio EOF (shorter than video), Python gets BrokenPipeError, but the
+        encoder process finishes normally. The output file is valid — we just
+        need to stop writing further frames.
+        """
+        mock_proc = self._make_mock_process(returncode=0)
+        # poll() returns None at the moment of the write (process still alive).
+        mock_proc.poll.return_value = None
+        # stdin.write raises BrokenPipeError (ffmpeg closed its stdin fd).
+        mock_proc.stdin.write.side_effect = BrokenPipeError(32, "Broken pipe")
+        # wait() inside the BrokenPipe handler returns 0 — clean exit.
+        mock_proc.wait.return_value = 0
+        mock_proc.returncode = 0
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+                crf=18,
+            ) as encoder:
+                # First write triggers the graceful-eof path, must not raise.
+                encoder.write_frame(frame)
+                # Subsequent writes are silent no-ops (no additional stdin writes).
+                encoder.write_frame(frame)
+                encoder.write_frame(frame)
+
+        # stdin.write called exactly once (the one that raised BrokenPipe).
+        assert mock_proc.stdin.write.call_count == 1
+
     def test_bitrate_mode_command(self):
         """When bitrate is passed, command uses -b:v instead of -crf."""
         mock_proc = self._make_mock_process()

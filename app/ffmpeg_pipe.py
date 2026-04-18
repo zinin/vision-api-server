@@ -160,24 +160,29 @@ class FFmpegEncoder:
         )
         self._stderr_thread.start()
 
-    def write_frame(self, frame: np.ndarray) -> None:
+    def write_frame(self, frame: np.ndarray) -> bool:
         """Write one BGR24 frame to the encoder.
 
+        Returns True when the frame was written and the caller should keep
+        going, False once the encoder has finalised (rc == 0) — callers
+        should break their loop in that case to avoid wasting CPU on
+        frames ffmpeg will never consume.
+
         Raises RuntimeError if the process crashed (rc != 0). A clean
-        early exit (rc == 0) is treated as EOF — the frame is silently
-        dropped and further calls are no-ops. This covers FFmpeg's
-        -shortest behaviour: when the audio stream ends before the
-        piped raw video, ffmpeg closes pipe:0 from its side, the
-        output file is already fully written, and there's nothing
-        left for Python to do.
+        early exit (rc == 0) is treated as EOF: the frame is silently
+        dropped and further calls short-circuit to False. This covers
+        FFmpeg's -shortest behaviour: when the audio stream ends before
+        the piped raw video, ffmpeg closes pipe:0 from its side, the
+        output file is already fully written, and there's nothing left
+        for Python to do.
         """
         if self._eof:
-            return
+            return False
         rc = self._process.poll()
         if rc is not None:
             if rc == 0:
                 self._eof = True
-                return
+                return False
             raise RuntimeError(
                 f"FFmpeg encoder crashed (rc={rc}): "
                 f"{_format_stderr(self._stderr_lines)}"
@@ -208,11 +213,12 @@ class FFmpegEncoder:
                 ) from e
             if rc == 0:
                 self._eof = True
-                return
+                return False
             raise RuntimeError(
                 f"FFmpeg encoder pipe broken (rc={rc}): {e}. "
                 f"stderr: {_format_stderr(self._stderr_lines)}"
             ) from e
+        return True
 
     def close(self) -> None:
         """Close stdin, wait for FFmpeg to finish, check return code."""

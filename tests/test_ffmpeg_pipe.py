@@ -176,7 +176,7 @@ class TestFFmpegEncoder:
         )
 
     def test_write_frame(self):
-        """write_frame writes correct raw bytes to stdin."""
+        """write_frame writes correct raw bytes to stdin and returns True."""
         mock_proc = self._make_mock_process()
         config = HWAccelConfig(accel_type=HWAccelType.CPU)
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -192,9 +192,41 @@ class TestFFmpegEncoder:
                 codec="h264",
                 crf=18,
             ) as encoder:
-                encoder.write_frame(frame)
+                result = encoder.write_frame(frame)
 
+        assert result is True
         mock_proc.stdin.write.assert_called_once_with(frame.tobytes())
+
+    def test_write_frame_returns_false_after_eof(self):
+        """After encoder finalises (e.g. -shortest), write_frame returns False
+        so callers can break their loop instead of wasting CPU decoding
+        frames that will never reach ffmpeg."""
+        mock_proc = self._make_mock_process(returncode=0)
+        mock_proc.poll.return_value = None
+        mock_proc.stdin.write.side_effect = BrokenPipeError(32, "Broken pipe")
+        mock_proc.wait.return_value = 0
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+                crf=18,
+            ) as encoder:
+                # First write triggers graceful EOF → False.
+                first = encoder.write_frame(frame)
+                # Subsequent writes short-circuit via _eof → False.
+                second = encoder.write_frame(frame)
+
+        assert first is False
+        assert second is False
 
     def test_cpu_encode_command(self):
         """CPU encode command includes libx264 and pipe:0."""

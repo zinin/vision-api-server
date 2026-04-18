@@ -203,7 +203,7 @@ class FFmpegEncoder:
             )
         try:
             self._process.stdin.write(frame.tobytes())
-        except (BrokenPipeError, OSError) as e:
+        except OSError as e:  # BrokenPipeError is a subclass of OSError.
             # The pipe closed mid-write. Most often this means the
             # encoder just finalised the output (e.g. -shortest on an
             # audio stream shorter than the video pipe). Give it a

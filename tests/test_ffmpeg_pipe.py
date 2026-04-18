@@ -517,6 +517,34 @@ class TestFFmpegEncoder:
 
         mock_proc.kill.assert_called_once()
 
+    def test_write_frame_generic_oserror_with_rc_zero_is_silent(self):
+        """Any OSError during stdin.write (EBADF, EINTR, etc.) — not just
+        BrokenPipeError — goes through the same graceful-EOF path: check
+        the encoder exit code, and if rc=0 treat it as clean finalisation."""
+        mock_proc = self._make_mock_process(returncode=0)
+        mock_proc.poll.return_value = None
+        # errno 9 = EBADF, a plausible non-BrokenPipe OSError.
+        mock_proc.stdin.write.side_effect = OSError(9, "Bad file descriptor")
+        mock_proc.wait.return_value = 0
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+                crf=18,
+            ) as encoder:
+                result = encoder.write_frame(frame)
+
+        assert result is False
+
     def test_write_frame_after_clean_exit_is_silent(self):
         """If poll() reports rc=0 before the write, treat as EOF (no raise)."""
         mock_proc = self._make_mock_process(returncode=0)

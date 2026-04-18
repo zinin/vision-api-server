@@ -106,7 +106,15 @@ class FFmpegDecoder:
         stderr_output = _format_stderr(self._stderr_lines, max_lines=50)
         if stderr_output:
             logger.debug(f"FFmpeg decoder stderr:\n{stderr_output}")
-        if self._process.returncode and self._process.returncode != 0:
+        if self._process.returncode is None:
+            # SIGKILL did not reap the process (D-state / hung NFS / GPU
+            # driver wedge). Surface as a WARNING so operators know the
+            # teardown did not finish — otherwise a stuck decoder leaks
+            # silently in both pass 1 and pass 2 cleanup paths.
+            logger.warning(
+                "FFmpeg decoder did not exit after SIGKILL; process may be leaked"
+            )
+        elif self._process.returncode != 0:
             logger.warning(f"FFmpeg decoder exited with code {self._process.returncode}")
 
     def __enter__(self):
@@ -259,7 +267,16 @@ class FFmpegEncoder:
         stderr_output = _format_stderr(self._stderr_lines, max_lines=50)
         if stderr_output:
             logger.debug(f"FFmpeg encoder stderr:\n{stderr_output}")
-        if self._process.returncode and self._process.returncode != 0:
+        if self._process.returncode is None:
+            # SIGKILL did not reap the process. Fail loudly so _pass2_render
+            # cannot report success while the output is unfinished and a
+            # stuck encoder leaks. __exit__ suppresses this RuntimeError
+            # when another exception is already propagating.
+            raise RuntimeError(
+                f"FFmpeg encoder did not exit after SIGKILL; process may be leaked. "
+                f"stderr: {stderr_output}"
+            )
+        if self._process.returncode != 0:
             raise RuntimeError(
                 f"FFmpeg encoder failed ({_rc_to_str(self._process.returncode)}): "
                 f"{stderr_output}"

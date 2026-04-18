@@ -86,11 +86,14 @@ class TestFFmpegDecoder:
         mock_stdout.close.assert_called()
         mock_proc.wait.assert_called()
 
-    def test_close_with_unkillable_process_suppresses_timeout(self):
+    def test_close_with_unkillable_process_warns_and_does_not_leak_timeout(self, caplog):
         """FFmpegDecoder.close() must not leak TimeoutExpired when both
         the primary wait() and the post-kill wait() time out (D-state,
-        hung NFS, GPU driver wedge). Symmetric to FFmpegEncoder's
-        write_frame hardening."""
+        hung NFS, GPU driver wedge). When the process survives SIGKILL
+        (returncode stays None), close() must emit a WARNING so callers
+        know teardown did not complete — otherwise a hung decoder
+        process leaks silently."""
+        import logging
         mock_proc = self._make_mock_process([])
         mock_stdout = MagicMock()
         mock_stdout.read.return_value = b""
@@ -99,13 +102,19 @@ class TestFFmpegDecoder:
             subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
             subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5),
         ]
+        mock_proc.returncode = None  # process survives SIGKILL
         config = HWAccelConfig(accel_type=HWAccelType.CPU)
 
         with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
-            with FFmpegDecoder("input.mp4", 640, 480, config):
-                pass  # exit triggers close(), which hits both timeouts
+            with caplog.at_level(logging.WARNING, logger="ffmpeg_pipe"):
+                with FFmpegDecoder("input.mp4", 640, 480, config):
+                    pass  # exit triggers close(), which hits both timeouts
 
         mock_proc.kill.assert_called_once()
+        assert any(
+            "did not exit after SIGKILL" in r.message and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), f"expected SIGKILL-survival WARNING, got records: {caplog.records}"
 
     def test_frames_are_writable(self):
         """Returned numpy arrays must be writable (for OpenCV drawing)."""
@@ -321,31 +330,34 @@ class TestFFmpegEncoder:
         assert "1:a:0?" in cmd
         assert "aac" in cmd
 
-    def test_close_with_unkillable_process_suppresses_timeout(self):
-        """FFmpegEncoder.close() must not leak TimeoutExpired when both
-        the primary wait() and the post-kill wait() time out (D-state,
-        hung NFS, GPU driver wedge). Symmetric to the write_frame hang
-        path: SIGKILL is usually reaped in ms but edge cases should not
-        bubble up as TimeoutExpired on the caller."""
+    def test_close_with_unkillable_process_raises(self):
+        """FFmpegEncoder.close() must not leak TimeoutExpired when both the
+        primary wait() and the post-kill wait() time out (D-state, hung
+        NFS, GPU driver wedge). When the encoder survives SIGKILL
+        (returncode stays None), close() must raise RuntimeError so
+        _pass2_render cannot report success with an unfinished output
+        while a stuck encoder process leaks."""
         mock_proc = self._make_mock_process()
         mock_proc.wait.side_effect = [
             subprocess.TimeoutExpired(cmd="ffmpeg", timeout=300),
-            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=5),
         ]
+        mock_proc.returncode = None  # process survives SIGKILL
         config = HWAccelConfig(accel_type=HWAccelType.CPU)
 
         with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
-            with FFmpegEncoder(
-                original_path="input.mp4",
-                output_path="output.mp4",
-                width=640,
-                height=480,
-                fps=30.0,
-                hw_config=config,
-                codec="h264",
-                crf=18,
-            ):
-                pass  # exit triggers close(), which hits both timeouts
+            with pytest.raises(RuntimeError, match="did not exit after SIGKILL"):
+                with FFmpegEncoder(
+                    original_path="input.mp4",
+                    output_path="output.mp4",
+                    width=640,
+                    height=480,
+                    fps=30.0,
+                    hw_config=config,
+                    codec="h264",
+                    crf=18,
+                ):
+                    pass  # exit triggers close(), which hits both timeouts
 
         mock_proc.kill.assert_called_once()
 

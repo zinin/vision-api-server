@@ -1316,6 +1316,14 @@ class TestIsNvencOomError:
     def test_empty_message(self):
         assert _is_nvenc_oom_error("") is False
 
+    def test_case_insensitive_out_of_memory(self):
+        msg = "[HEVC_NVENC] InitializeEncoder failed: Out Of Memory"
+        assert _is_nvenc_oom_error(msg) is True
+
+    def test_case_insensitive_all_caps(self):
+        msg = "[HEVC_NVENC] OUT OF MEMORY (10)"
+        assert _is_nvenc_oom_error(msg) is True
+
 
 class TestNvencFallback:
     """Pass 2 CPU fallback when NVENC initialisation fails (VRAM pressure).
@@ -1368,7 +1376,21 @@ class TestNvencFallback:
         ok_encoder.__enter__ = MagicMock(return_value=ok_encoder)
         ok_encoder.__exit__ = MagicMock(return_value=False)
 
-        mock_encoder_cls = MagicMock(side_effect=[failing_encoder, ok_encoder])
+        # Observed state of output_path at the moment the second (CPU) encoder
+        # constructor is invoked — the retry must have unlinked the partial
+        # output file from the failed NVENC run by then.
+        output_exists_at_cpu_retry: list[bool] = []
+        encoder_call_count = {"n": 0}
+
+        def _encoder_factory(*args, **kwargs):
+            encoder_call_count["n"] += 1
+            if encoder_call_count["n"] == 1:
+                return failing_encoder
+            # Second call = CPU retry — capture output_path state right now.
+            output_exists_at_cpu_retry.append(args[1].exists())
+            return ok_encoder
+
+        mock_encoder_cls = MagicMock(side_effect=_encoder_factory)
 
         mock_model.predict.return_value = [
             _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
@@ -1422,6 +1444,10 @@ class TestNvencFallback:
 
         # The CPU encoder consumed all Pass 2 frames.
         assert ok_encoder.write_frame.call_count == num_frames
+
+        # Partial output from the failed NVENC run was cleaned up before the
+        # CPU retry started (D: explicit unlink contract test).
+        assert output_exists_at_cpu_retry == [False]
 
     def test_non_nvenc_runtimeerror_propagates_without_retry(
         self, mock_model, mock_visualizer, tmp_path
@@ -1523,3 +1549,74 @@ class TestNvencFallback:
 
         # Two encoder attempts, no third.
         assert mock_encoder_cls.call_count == 2
+
+    def test_cancel_between_nvenc_failure_and_cpu_retry(
+        self, mock_model, mock_visualizer, tmp_path
+    ):
+        """If /cancel fires in the window between NVENC failure and CPU retry,
+        the retry must NOT start — the job aborts with JobCancelledError."""
+        from video_annotator import JobCancelledError
+
+        nvidia_hw_config = HWAccelConfig(accel_type=HWAccelType.NVIDIA)
+        cancel_event = threading.Event()
+
+        num_frames = 3
+        dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
+        dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
+        # Third decoder must never be constructed — cancel should preempt
+        # the CPU retry entirely.
+        dec_p2_cpu_unused = self._make_decoder_mock(self._make_frames(num_frames))
+        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu_unused])
+
+        # NVENC write_frame fails AND sets the cancel event. This simulates a
+        # user-issued /cancel arriving while the annotator was blocked on the
+        # failing FFmpeg subprocess cleanup.
+        failing_encoder = MagicMock()
+        failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
+        failing_encoder.__exit__ = MagicMock(return_value=False)
+
+        def _fail_and_cancel(_frame):
+            cancel_event.set()
+            raise RuntimeError(
+                "FFmpeg encoder pipe broken: stderr: [hevc_nvenc] "
+                "InitializeEncoder failed: out of memory (10)"
+            )
+
+        failing_encoder.write_frame.side_effect = _fail_and_cancel
+
+        # Second encoder should never be constructed — if it is, the test
+        # fails because the retry proceeded past the cancel check.
+        unused_encoder = MagicMock()
+        unused_encoder.__enter__ = MagicMock(return_value=unused_encoder)
+        unused_encoder.__exit__ = MagicMock(return_value=False)
+        mock_encoder_cls = MagicMock(side_effect=[failing_encoder, unused_encoder])
+
+        mock_model.predict.return_value = [
+            _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
+        ]
+
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, nvidia_hw_config,
+            codec="h265", crf=18,
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+        )
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=self._ffprobe_result(num_frames)),
+        ):
+            with pytest.raises(JobCancelledError):
+                annotator.annotate(
+                    input_path, tmp_path / "out.mp4",
+                    AnnotationParams(detect_every=1),
+                    cancel_event=cancel_event,
+                )
+
+        # Only the NVENC encoder was constructed. CPU retry never started.
+        assert mock_encoder_cls.call_count == 1
+        # Third decoder (the would-be CPU retry) was never requested.
+        assert dec_p2_cpu_unused.read_frame.call_count == 0

@@ -85,8 +85,15 @@ _NVENC_OOM_MARKERS: tuple[str, ...] = (
 
 
 def _is_nvenc_oom_error(message: str) -> bool:
-    """True iff the FFmpeg stderr tail points to an NVENC allocation failure."""
-    return "_nvenc" in message and any(m in message for m in _NVENC_OOM_MARKERS)
+    """True when the FFmpeg stderr tail points to an NVENC allocation failure.
+
+    Case-insensitive so locale/style variations like ``Out of memory`` or
+    ``OUT OF MEMORY`` still classify correctly. Note that this classifier
+    only targets the NVENC encoder path — NVDEC / CUDA decode failures are
+    out of scope and will surface as ordinary RuntimeErrors.
+    """
+    lowered = message.lower()
+    return "_nvenc" in lowered and any(m.lower() in lowered for m in _NVENC_OOM_MARKERS)
 
 
 def _parse_frame_rate(raw: str | None) -> float | None:
@@ -263,21 +270,34 @@ class VideoAnnotator:
             if not _is_nvenc_oom_error(str(e)):
                 raise
             logger.warning(
-                f"NVENC Pass 2 failed for {input_path.name} (likely VRAM "
-                f"exhausted by resident YOLO model). Retrying on CPU encoder. "
-                f"Original error: {e}"
+                f"NVENC Pass 2 failed for {input_path.name} "
+                f"(codec={effective_codec}, device={self.hw_config.accel_type.value}, "
+                f"likely VRAM exhausted by resident YOLO model). "
+                f"Retrying on CPU encoder. Original error: {e}"
             )
             output_path.unlink(missing_ok=True)
+            # Recheck cancellation: the NVENC attempt can block for a while on
+            # subprocess cleanup, and a /cancel arriving in that window should
+            # abort the job before we launch a second full Pass 2.
+            if cancel_event is not None and cancel_event.is_set():
+                raise JobCancelledError()
             cpu_hw_config = HWAccelConfig(
                 accel_type=HWAccelType.CPU,
                 vaapi_device=self.hw_config.vaapi_device,
             )
+            # CPU retry: force CRF mode and drop the source-matched bitrate.
+            # libx264/libx265 single-pass with a 50–100 Mbps target is slow
+            # and brings no visible quality gain over CRF at self.crf.
             self._pass2_render(
                 input_path, output_path, metadata, params, stabilized,
                 effective_codec, self.crf, None,
                 font_scale, actual_frames, progress_callback,
                 cancel_event=cancel_event,
                 hw_config=cpu_hw_config,
+            )
+            logger.info(
+                f"CPU Pass 2 retry succeeded for {input_path.name} "
+                f"(codec={effective_codec}, crf={self.crf})"
             )
 
         stats.processing_time_ms = int((time.perf_counter() - start_time) * 1000)

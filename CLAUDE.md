@@ -105,7 +105,7 @@ Tests cover config, Pydantic models, JobManager, and VideoAnnotator (mocked YOLO
 
 **Detection Stabilizer**: Two-pass decode pipeline. Pass 1 decodes video + collects YOLO detections with lowered conf (no disk cache). DetectionStabilizer links detections into tracks via IoU, votes on stable class, fills gaps bidirectionally with position-aware grace periods. Pass 2 decodes video again + renders stabilized boxes. Class filtering applied after stabilization.
 
-**NVENC CPU fallback**: Pass 2 automatically retries on the CPU encoder (`libx265`/`libx264`/`libsvtav1`, CRF mode) when `hevc_nvenc`/`h264_nvenc` fails to initialise — typically VRAM exhaustion from the resident YOLO model. Pass 1 and stabilization are not re-run (the `stabilized` dict is reused). Every job tries NVENC first; no sticky disable.
+**NVENC CPU fallback**: Pass 2 automatically retries on the CPU encoder (`libx265`/`libx264`/`libsvtav1`, CRF mode — source bitrate is dropped because CPU single-pass at 50–100 Mbps adds no visual gain) when `hevc_nvenc`/`h264_nvenc`/`av1_nvenc` fails to initialise. Classifier is encoder-side only: NVDEC / CUDA decode OOM will still surface as a hard failure. Pass 1 and stabilization are not re-run (the `stabilized` dict is reused). Every job tries NVENC first; no sticky disable. Operator note: the retry doubles Pass 2 wall-clock (one failed decode + one full CPU decode+encode), and CPU encoding runs ≈3–10× slower than NVENC — expect noticeable latency on affected jobs.
 
 ## Limits
 

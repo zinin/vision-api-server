@@ -27,6 +27,17 @@ def _format_stderr(lines: deque[bytes], max_lines: int = 10) -> str:
     return b"".join(tail).decode("utf-8", errors="replace")[:2000]
 
 
+def _rc_to_str(rc: int | None) -> str:
+    """Render a subprocess return code. Negative rc means killed by signal
+    |rc| (POSIX convention). Distinguishes OOM-kills and external SIGKILL
+    from self-reported exit codes when these end up in error messages."""
+    if rc is None:
+        return "rc=?"
+    if rc < 0:
+        return f"killed by signal {-rc}"
+    return f"rc={rc}"
+
+
 class FFmpegDecoder:
     """Decode video frames via FFmpeg subprocess pipe.
 
@@ -70,7 +81,7 @@ class FFmpegDecoder:
             # Check if process crashed (vs normal EOF)
             if self._process.poll() is not None and self._process.returncode != 0:
                 raise RuntimeError(
-                    f"FFmpeg decoder crashed (rc={self._process.returncode}): "
+                    f"FFmpeg decoder crashed ({_rc_to_str(self._process.returncode)}): "
                     f"{_format_stderr(self._stderr_lines)}"
                 )
             return None
@@ -187,7 +198,7 @@ class FFmpegEncoder:
                 )
                 return False
             raise RuntimeError(
-                f"FFmpeg encoder crashed (rc={rc}): "
+                f"FFmpeg encoder crashed ({_rc_to_str(rc)}): "
                 f"{_format_stderr(self._stderr_lines)}"
             )
         try:
@@ -222,7 +233,7 @@ class FFmpegEncoder:
                 )
                 return False
             raise RuntimeError(
-                f"FFmpeg encoder pipe broken (rc={rc}): {e}. "
+                f"FFmpeg encoder pipe broken ({_rc_to_str(rc)}): {e}. "
                 f"stderr: {_format_stderr(self._stderr_lines)}"
             ) from e
         return True
@@ -244,7 +255,7 @@ class FFmpegEncoder:
             logger.debug(f"FFmpeg encoder stderr:\n{stderr_output}")
         if self._process.returncode and self._process.returncode != 0:
             raise RuntimeError(
-                f"FFmpeg encoder failed (rc={self._process.returncode}): "
+                f"FFmpeg encoder failed ({_rc_to_str(self._process.returncode)}): "
                 f"{stderr_output}"
             )
 

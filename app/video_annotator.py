@@ -16,7 +16,7 @@ from detection_stabilizer import (
     StabilizerConfig,
 )
 from ffmpeg_pipe import FFmpegDecoder, FFmpegEncoder
-from hw_accel import HWAccelConfig
+from hw_accel import HWAccelConfig, HWAccelType
 from visualization import DetectionVisualizer, DetectionBox
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,29 @@ _CODEC_NAME_MAP: dict[str, str] = {
 _MIN_BITRATE = 100_000
 _MAX_BITRATE = 200_000_000
 _MAX_REASONABLE_FPS = 240.0
+
+# Markers used to recognise an NVENC VRAM-initialisation failure in an
+# FFmpegEncoder RuntimeError message. Any of these, combined with a
+# "_nvenc" substring, means the encoder subprocess died before it could
+# accept a single frame — almost always because the GPU could not allocate
+# NVENC input buffers (YOLO model + NVDEC buffers squeeze it out).
+_NVENC_OOM_MARKERS: tuple[str, ...] = (
+    "out of memory",
+    "Cannot allocate memory",
+    "EncodeAPI Internal Error",
+)
+
+
+def _is_nvenc_oom_error(message: str) -> bool:
+    """True when the FFmpeg stderr tail points to an NVENC allocation failure.
+
+    Case-insensitive so locale/style variations like ``Out of memory`` or
+    ``OUT OF MEMORY`` still classify correctly. Note that this classifier
+    only targets the NVENC encoder path — NVDEC / CUDA decode failures are
+    out of scope and will surface as ordinary RuntimeErrors.
+    """
+    lowered = message.lower()
+    return "_nvenc" in lowered and any(m.lower() in lowered for m in _NVENC_OOM_MARKERS)
 
 
 def _parse_frame_rate(raw: str | None) -> float | None:
@@ -230,14 +253,57 @@ class VideoAnnotator:
         if cancel_event is not None and cancel_event.is_set():
             raise JobCancelledError()
 
-        # Pass 2: decode again + render
+        # Pass 2: decode again + render.
+        # If NVENC fails to initialise (common when VRAM is tight because the
+        # YOLO model stays resident between passes), retry the whole Pass 2
+        # on CPU with the same codec via libx264/libx265/libsvtav1 and CRF
+        # mode. Non-NVENC RuntimeErrors propagate untouched.
         font_scale = self.visualizer.calculate_adaptive_font_scale(metadata.height)
-        self._pass2_render(
-            input_path, output_path, metadata, params, stabilized,
-            effective_codec, effective_crf, effective_bitrate,
-            font_scale, actual_frames, progress_callback,
-            cancel_event=cancel_event,
-        )
+        try:
+            self._pass2_render(
+                input_path, output_path, metadata, params, stabilized,
+                effective_codec, effective_crf, effective_bitrate,
+                font_scale, actual_frames, progress_callback,
+                cancel_event=cancel_event,
+            )
+        except RuntimeError as e:
+            if not _is_nvenc_oom_error(str(e)):
+                raise
+            logger.warning(
+                f"NVENC Pass 2 failed for {input_path.name} "
+                f"(codec={effective_codec}, device={self.hw_config.accel_type.value}, "
+                f"likely VRAM exhausted by resident YOLO model). "
+                f"Retrying on CPU encoder. Original error: {e}"
+            )
+            output_path.unlink(missing_ok=True)
+            # Recheck cancellation: the NVENC attempt can block for a while on
+            # subprocess cleanup, and a /cancel arriving in that window should
+            # abort the job before we launch a second full Pass 2.
+            if cancel_event is not None and cancel_event.is_set():
+                raise JobCancelledError()
+            cpu_hw_config = HWAccelConfig(
+                accel_type=HWAccelType.CPU,
+                vaapi_device=self.hw_config.vaapi_device,
+            )
+            # CPU retry: force CRF mode and drop the source-matched bitrate.
+            # libx264/libx265 single-pass at a 50–100 Mbps target is slow and
+            # brings no visible quality gain over CRF. Reuse effective_crf so
+            # _resolve_codec's policy survives the fallback (auto-mode keeps
+            # CRF 18; explicit codecs keep self.crf). When auto-mode picked
+            # bitrate, effective_crf is None — default to 18 to match the
+            # auto-without-bitrate branch of _resolve_codec.
+            retry_crf = effective_crf if effective_crf is not None else 18
+            self._pass2_render(
+                input_path, output_path, metadata, params, stabilized,
+                effective_codec, retry_crf, None,
+                font_scale, actual_frames, progress_callback,
+                cancel_event=cancel_event,
+                hw_config=cpu_hw_config,
+            )
+            logger.info(
+                f"CPU Pass 2 retry succeeded for {input_path.name} "
+                f"(codec={effective_codec}, crf={retry_crf})"
+            )
 
         stats.processing_time_ms = int((time.perf_counter() - start_time) * 1000)
         fps_actual = actual_frames / max(stats.processing_time_ms / 1000, 0.001)
@@ -428,13 +494,19 @@ class VideoAnnotator:
         total_frames: int,
         progress_callback: Callable[[int], None] | None,
         cancel_event: threading.Event | None = None,
+        hw_config: HWAccelConfig | None = None,
     ) -> None:
-        """Pass 2: decode video again, draw stabilized detections, encode."""
-        frame_num = 0
+        """Pass 2: decode video again, draw stabilized detections, encode.
 
-        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder, \
+        ``hw_config`` defaults to ``self.hw_config``; it's overridable so
+        ``annotate()`` can retry this pass on CPU when NVENC init fails.
+        """
+        frame_num = 0
+        config = hw_config if hw_config is not None else self.hw_config
+
+        with FFmpegDecoder(input_path, metadata.width, metadata.height, config) as decoder, \
              FFmpegEncoder(input_path, output_path, metadata.width, metadata.height,
-                           metadata.fps, self.hw_config, effective_codec,
+                           metadata.fps, config, effective_codec,
                            crf=effective_crf, bitrate=effective_bitrate) as encoder:
 
             while True:

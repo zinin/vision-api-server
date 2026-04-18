@@ -150,6 +150,31 @@ class TestFFmpegEncoder:
         mock_proc.returncode = returncode
         return mock_proc
 
+    def test_stdin_opened_unbuffered(self):
+        """Popen must be called with bufsize=0 so write_frame never leaves
+        data in a Python-side buffer that a later flush would push into a
+        pipe already closed by ffmpeg (e.g. after -shortest). Without this,
+        close() can raise a spurious BrokenPipeError despite a clean rc=0."""
+        mock_proc = self._make_mock_process()
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+                crf=18,
+            ):
+                pass
+
+        assert mock_popen.call_args.kwargs.get("bufsize") == 0, (
+            "FFmpegEncoder must open stdin unbuffered (bufsize=0)"
+        )
+
     def test_write_frame(self):
         """write_frame writes correct raw bytes to stdin."""
         mock_proc = self._make_mock_process()

@@ -146,8 +146,13 @@ class FFmpegEncoder:
         cmd += ["-c:a", "aac", "-shortest", str(output_path)]
 
         logger.debug(f"FFmpegEncoder command: {' '.join(cmd)}")
+        # bufsize=0 — every write goes straight to the OS pipe. This avoids a
+        # spurious BrokenPipeError from close() when ffmpeg finalised early
+        # (e.g. -shortest) and residual bytes in a Python-side buffer would
+        # otherwise be flushed into a pipe the peer has already closed.
         self._process = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False,
+            bufsize=0,
         )
         # Start daemon thread to drain stderr and prevent deadlock
         self._stderr_thread = threading.Thread(

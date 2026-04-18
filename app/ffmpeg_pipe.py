@@ -124,6 +124,11 @@ class FFmpegEncoder:
         bitrate: int | None = None,
     ):
         self._stderr_lines: deque[bytes] = deque(maxlen=100)
+        # True after the encoder cleanly exits (rc=0) while we still had
+        # frames to write — e.g. FFmpeg's -shortest closes pipe:0 when the
+        # audio stream ends before the piped raw video. Subsequent
+        # write_frame() calls become silent no-ops.
+        self._eof = False
 
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
         cmd += hw_config.global_encode_args  # e.g. [-vaapi_device, ...] — MUST be before -i
@@ -149,9 +154,23 @@ class FFmpegEncoder:
         self._stderr_thread.start()
 
     def write_frame(self, frame: np.ndarray) -> None:
-        """Write one BGR24 frame to the encoder. Raises RuntimeError if process crashed."""
+        """Write one BGR24 frame to the encoder.
+
+        Raises RuntimeError if the process crashed (rc != 0). A clean
+        early exit (rc == 0) is treated as EOF — the frame is silently
+        dropped and further calls are no-ops. This covers FFmpeg's
+        -shortest behaviour: when the audio stream ends before the
+        piped raw video, ffmpeg closes pipe:0 from its side, the
+        output file is already fully written, and there's nothing
+        left for Python to do.
+        """
+        if self._eof:
+            return
         rc = self._process.poll()
         if rc is not None:
+            if rc == 0:
+                self._eof = True
+                return
             raise RuntimeError(
                 f"FFmpeg encoder crashed (rc={rc}): "
                 f"{_format_stderr(self._stderr_lines)}"
@@ -159,8 +178,24 @@ class FFmpegEncoder:
         try:
             self._process.stdin.write(frame.tobytes())
         except (BrokenPipeError, OSError) as e:
+            # The pipe closed mid-write. Most often this means the
+            # encoder just finalised the output (e.g. -shortest on an
+            # audio stream shorter than the video pipe). Give it a
+            # moment to reap, then distinguish clean exit vs crash.
+            try:
+                rc = self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5)
+                raise RuntimeError(
+                    f"FFmpeg encoder hung after pipe break: {e}. "
+                    f"stderr: {_format_stderr(self._stderr_lines)}"
+                ) from e
+            if rc == 0:
+                self._eof = True
+                return
             raise RuntimeError(
-                f"FFmpeg encoder pipe broken: {e}. "
+                f"FFmpeg encoder pipe broken (rc={rc}): {e}. "
                 f"stderr: {_format_stderr(self._stderr_lines)}"
             ) from e
 

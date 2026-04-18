@@ -370,6 +370,31 @@ class TestFFmpegEncoder:
         # stdin.write called exactly once (the one that raised BrokenPipe).
         assert mock_proc.stdin.write.call_count == 1
 
+    def test_write_frame_pipe_broken_with_nonzero_rc_raises(self):
+        """BrokenPipe with encoder exiting rc != 0 must still raise."""
+        mock_proc = self._make_mock_process(returncode=1)
+        mock_proc.poll.return_value = None
+        mock_proc.stdin.write.side_effect = BrokenPipeError(32, "Broken pipe")
+        mock_proc.wait.return_value = 1
+        mock_proc.returncode = 1
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with pytest.raises(RuntimeError, match="FFmpeg encoder pipe broken"):
+                with FFmpegEncoder(
+                    original_path="input.mp4",
+                    output_path="output.mp4",
+                    width=640,
+                    height=480,
+                    fps=30.0,
+                    hw_config=config,
+                    codec="h264",
+                    crf=18,
+                ) as encoder:
+                    encoder.write_frame(frame)
+
     def test_bitrate_mode_command(self):
         """When bitrate is passed, command uses -b:v instead of -crf."""
         mock_proc = self._make_mock_process()

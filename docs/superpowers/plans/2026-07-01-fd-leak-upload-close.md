@@ -1,5 +1,12 @@
 # Upload File-Descriptor Leak Fix — Implementation Plan
 
+> **SUPERSEDED (2026-07-01).** This plan's premise (unclosed `UploadFile` leaking FDs) was
+> **refuted** during diagnosis — the framework closes upload spools automatically, and the leak
+> test in Task 1 cannot reproduce (Task 1 was never committed). The real leak is ROCm/MIOpen
+> kernel compiles. Do **not** execute this plan. See
+> `docs/superpowers/specs/2026-07-01-fd-leak-miopen-containment-design.md`; its plan carries over
+> the only surviving piece (Task 2, the `nofile` ulimit).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stop the file-descriptor leak by closing every uploaded `UploadFile`, proven by a regression test, and raise the `nofile` ceiling as defense-in-depth.

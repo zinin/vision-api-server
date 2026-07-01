@@ -1,7 +1,14 @@
 # Design: Fix file-descriptor leak in upload endpoints
 
+> **SUPERSEDED (2026-07-01).** The premise of this design was **refuted** during root-cause
+> diagnosis: FastAPI/Starlette closes upload spools automatically (verified live and across
+> fastapi 0.128–0.139), so unclosed `UploadFile`s are not the leak. The real source is a
+> ROCm/MIOpen kernel-compile FD leak. Do **not** implement this design; see
+> `2026-07-01-fd-leak-miopen-containment-design.md`. Only the `nofile` ulimit idea survives and
+> is carried into the new design.
+
 - **Date:** 2026-07-01
-- **Status:** Approved (ready for implementation plan)
+- **Status:** Superseded (premise refuted; do not implement)
 - **Topic:** Reliably close `UploadFile` handles; regression test; `nofile` defense-in-depth
 
 ## Problem / Root cause

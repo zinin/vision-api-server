@@ -1,5 +1,9 @@
 import os
 import shutil
+try:
+    import resource
+except ImportError:  # resource is Unix-only (absent on Windows)
+    resource = None
 import time
 import logging
 import base64
@@ -402,15 +406,51 @@ async def root(
     }
 
 
+_last_fd_warning_ts: float | None = None
+
+
+def _fd_stats() -> tuple[int | None, int | None, int]:
+    """Return (open_fds, fd_deleted, soft_limit); counts are None where /proc is unavailable."""
+    if resource is None:
+        return None, None, 0
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        fd_names = os.listdir("/proc/self/fd")
+    except OSError:
+        return None, None, soft_limit
+    deleted = 0
+    for name in fd_names:
+        try:
+            if os.readlink(f"/proc/self/fd/{name}").endswith(" (deleted)"):
+                deleted += 1
+        except OSError:
+            continue  # fd closed between listdir and readlink
+    return len(fd_names), deleted, soft_limit
+
+
 @app.get("/health", tags=["Health"])
 async def health(model_manager: ModelManager = Depends(get_model_manager)):
     """Service health check endpoint."""
+    global _last_fd_warning_ts
 
-    # Check ffmpeg availability
+    # FD stats before anything that spawns subprocesses: at EMFILE the ffmpeg
+    # probe below fails, and these numbers must still make it into the response.
+    open_fds, fd_deleted, fd_soft_limit = _fd_stats()
+    if open_fds is not None and fd_soft_limit > 0 and open_fds >= 0.8 * fd_soft_limit:
+        now = time.monotonic()
+        if _last_fd_warning_ts is None or now - _last_fd_warning_ts >= 3600.0:
+            _last_fd_warning_ts = now
+            logger.warning(
+                "High fd usage: %d open fds >= 80%% of soft limit %d — possible fd leak",
+                open_fds,
+                fd_soft_limit,
+            )
+
+    # Check ffmpeg availability (spawns ffmpeg/ffprobe → OSError covers EMFILE)
     ffmpeg_available = True
     try:
         VideoFrameExtractor()
-    except RuntimeError:
+    except (RuntimeError, OSError):
         ffmpeg_available = False
 
     return {
@@ -419,7 +459,10 @@ async def health(model_manager: ModelManager = Depends(get_model_manager)):
         "preloaded_count": len(model_manager._preloaded),
         "cached_count": len(model_manager._cached),
         "default_device": model_manager.default_device,
-        "video_processing": ffmpeg_available
+        "video_processing": ffmpeg_available,
+        "open_fds": open_fds,
+        "fd_deleted": fd_deleted,
+        "fd_soft_limit": fd_soft_limit
     }
 
 

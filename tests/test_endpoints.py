@@ -1,4 +1,6 @@
 import io
+import logging
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -286,3 +288,76 @@ class TestCancelJob:
         job_manager_for_tests.mark_failed(job.job_id, error="nope")
         resp = client.post(f"/jobs/{job.job_id}/cancel")
         assert resp.status_code == 409
+
+
+# --- GET /health fd observability ---
+
+MAIN_LOGGER = "main"
+
+
+class TestHealthFdStats:
+    @pytest.fixture(autouse=True)
+    def _reset_fd_warning_state(self):
+        import main
+        main._last_fd_warning_ts = None
+        yield
+
+    def test_health_reports_fd_stats(self, client):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert data["fd_soft_limit"] > 0
+        if sys.platform.startswith("linux"):
+            assert data["open_fds"] > 0
+            assert data["fd_deleted"] >= 0
+
+    def test_health_passes_deleted_count_through(self, client):
+        with patch("main._fd_stats", return_value=(150, 42, 1000)):
+            resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["fd_deleted"] == 42
+
+    def test_health_warns_when_fd_usage_high(self, client, caplog):
+        with patch("main._fd_stats", return_value=(900, 0, 1000)):
+            with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
+                resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["open_fds"] == 900
+        assert resp.json()["fd_soft_limit"] == 1000
+        assert "fd usage" in caplog.text.lower()
+
+    def test_health_warning_rate_limited(self, client, caplog):
+        with patch("main._fd_stats", return_value=(900, 0, 1000)):
+            with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
+                client.get("/health")          # first hit over the threshold logs
+                caplog.clear()
+                client.get("/health")          # second hit within the hour must NOT
+        assert "fd usage" not in caplog.text.lower()
+
+    def test_health_no_warning_at_normal_usage(self, client, caplog):
+        with patch("main._fd_stats", return_value=(100, 0, 1000)):
+            with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
+                resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["open_fds"] == 100
+        assert "fd usage" not in caplog.text.lower()
+
+    def test_health_handles_missing_procfs(self, client, caplog):
+        with patch("main._fd_stats", return_value=(None, None, 1000)):
+            with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
+                resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["open_fds"] is None
+        assert resp.json()["fd_deleted"] is None
+        assert "fd usage" not in caplog.text.lower()
+
+    def test_health_survives_emfile_in_ffmpeg_check(self, client):
+        with patch("main._fd_stats", return_value=(100, 0, 1000)):
+            with patch("main.VideoFrameExtractor", side_effect=OSError(24, "Too many open files")):
+                resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["video_processing"] is False
+        assert data["open_fds"] == 100
+        assert data["fd_soft_limit"] == 1000

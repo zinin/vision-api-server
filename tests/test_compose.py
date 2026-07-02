@@ -1,14 +1,15 @@
 """Deployment-config invariants for the MIOpen FD-leak containment.
 
 Guards docker-compose files against refactors that would silently drop the
-`nofile` ulimits or the AMD MIOpen cache volumes (see
-docs/superpowers/specs/2026-07-01-fd-leak-miopen-containment-design.md).
+`nofile` ulimits or the AMD MIOpen cache volumes. The design doc
+(docs/superpowers/specs/2026-07-01-fd-leak-miopen-containment-design.md) was
+removed from the tree before the PR; it lives in the fix/upload-fd-leak
+branch history.
 """
 from pathlib import Path
 
 import pytest
-
-yaml = pytest.importorskip("yaml")  # PyYAML arrives transitively via ultralytics
+import yaml  # explicit dev dependency: these guards must fail loudly, never skip
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_FILES = sorted((REPO_ROOT / "docker").glob("docker-compose-*.yml")) + sorted(

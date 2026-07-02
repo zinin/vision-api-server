@@ -301,13 +301,18 @@ class TestHealthFdStats:
         import main
         main._last_fd_warning_ts = None
         yield
+        main._last_fd_warning_ts = None
 
     def test_health_reports_fd_stats(self, client):
+        import main
         resp = client.get("/health")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "healthy"
-        assert data["fd_soft_limit"] > 0
+        if main.resource is not None:
+            assert data["fd_soft_limit"] > 0
+        else:  # Windows: resource module absent -> sentinel 0
+            assert data["fd_soft_limit"] == 0
         if sys.platform.startswith("linux"):
             assert data["open_fds"] > 0
             assert data["fd_deleted"] >= 0
@@ -331,9 +336,20 @@ class TestHealthFdStats:
         with patch("main._fd_stats", return_value=(900, 0, 1000)):
             with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
                 client.get("/health")          # first hit over the threshold logs
+                assert "fd usage" in caplog.text.lower()
                 caplog.clear()
                 client.get("/health")          # second hit within the hour must NOT
         assert "fd usage" not in caplog.text.lower()
+
+    def test_health_warning_fires_again_after_expiry(self, client, caplog):
+        import main
+        with patch("main._fd_stats", return_value=(900, 0, 1000)):
+            with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
+                client.get("/health")               # arms the rate limiter
+                caplog.clear()
+                main._last_fd_warning_ts -= 3601.0  # pretend the hour has passed
+                client.get("/health")
+        assert "fd usage" in caplog.text.lower()
 
     def test_health_no_warning_at_normal_usage(self, client, caplog):
         with patch("main._fd_stats", return_value=(100, 0, 1000)):
@@ -361,3 +377,33 @@ class TestHealthFdStats:
         assert data["video_processing"] is False
         assert data["open_fds"] == 100
         assert data["fd_soft_limit"] == 1000
+
+
+class TestFdStatsHelper:
+    """Direct unit tests for the _fd_stats() degradation branches."""
+
+    def test_no_resource_module(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "resource", None)
+        assert main._fd_stats() == (None, None, 0)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="requires the resource module")
+    def test_procfs_unavailable(self):
+        import main
+        soft_limit = main.resource.getrlimit(main.resource.RLIMIT_NOFILE)[0]
+        with patch("main.os.listdir", side_effect=OSError(24, "Too many open files")):
+            assert main._fd_stats() == (None, None, soft_limit)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires /proc")
+    def test_counts_deleted_fd(self, tmp_path):
+        import main
+        victim = tmp_path / "leaked.tmp"
+        victim.write_text("x")
+        handle = victim.open("r")
+        try:
+            victim.unlink()
+            open_fds, fd_deleted, _ = main._fd_stats()
+        finally:
+            handle.close()
+        assert open_fds is not None and open_fds > 0
+        assert fd_deleted >= 1

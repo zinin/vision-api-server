@@ -16,7 +16,13 @@ services:
       VIDEO_CRF: ${VIDEO_CRF:-18}
       VIDEO_HW_ACCEL: ${VIDEO_HW_ACCEL:-amd}
       HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
+      # Emergency lever against the MIOpen fd leak: fewer kernel compiles, at inference-perf cost.
+      # MIOPEN_FIND_MODE: FAST
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -36,6 +42,10 @@ services:
     shm_size: 8G
     volumes:
       - models:/models
+      - miopen-cache:/root/.cache/miopen    # compiled GPU kernels (MIOpen fd-leak containment)
+      - miopen-config:/root/.config/miopen  # MIOpen find-db + lock files
 
 volumes:
   models:
+  miopen-cache:
+  miopen-config:

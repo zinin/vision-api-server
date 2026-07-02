@@ -182,9 +182,20 @@ Health check.
   "preloaded_count": 1,
   "cached_count": 1,
   "default_device": "cuda:0",
-  "video_processing": true
+  "video_processing": true,
+  "open_fds": 123,
+  "fd_deleted": 0,
+  "fd_soft_limit": 65536
 }
 ```
+
+`open_fds` counts `/proc/self/fd` entries; `fd_deleted` counts those pointing at deleted files —
+the exact signature of the ROCm/MIOpen leak (`fd_deleted` growing = compile-path leak;
+`open_fds` growing while `fd_deleted` stays ≈ 0 = load-path leak). Both are `null` where `/proc`
+is unavailable (e.g. non-Linux dev); `fd_soft_limit` is `0` where the `resource` module is absent.
+Values are a point-in-time snapshot and reflect the process's `RLIMIT_NOFILE` (in Docker —
+whatever `ulimits` grants; on a bare host — the shell default). A WARNING is logged (at most once
+per hour) when `open_fds` reaches 80% of `fd_soft_limit` — early signal of an FD leak.
 
 ### GET /
 

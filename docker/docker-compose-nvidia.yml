@@ -23,6 +23,10 @@ services:
             - driver: nvidia
               capabilities: [gpu]
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - models:/models
     healthcheck:

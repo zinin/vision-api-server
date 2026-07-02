@@ -78,6 +78,11 @@ STABILIZER_GRACE_CENTER=2.0     # Grace period seconds, object in center
 STABILIZER_GRACE_EDGE=0.5       # Grace period seconds, object at edge
 STABILIZER_CENTER_ZONE=0.6      # Frame fraction considered "center" (0-1]
 STABILIZER_MAX_STALENESS=5.0    # Max seconds before track becomes stale
+# MIOPEN_FIND_MODE=FAST         # AMD emergency lever: fewer MIOpen kernel compiles (the ROCm
+                                # fd-leak trigger) at inference-perf cost (generic fallback
+                                # kernels). NOT read from .env — enable by uncommenting the line
+                                # in docker-compose-amd.yml. Keep off unless the fd-leak rate
+                                # does not drop after the cache-volume fix.
 ```
 
 ## Testing

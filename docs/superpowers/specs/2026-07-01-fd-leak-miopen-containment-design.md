@@ -123,6 +123,18 @@ warm-up (~1000 FDs ≈ 1.5% of the new limit, matching the historical full-explo
 no longer restarted by container recreation. Bonus: warm restarts skip re-tuning, so
 first-inference latency after a deploy improves.
 
+Open assumption (not falsifiable from prod data — the prod cache was always empty): the FD leak is
+tied to the **compile** path (O_TMPFILE), not to `hipModuleLoad` itself. The upstream thread
+(MIOpen #2223) implicates `hipModuleLoad`/`hipModuleUnload`, and module loads also happen on warm
+cache hits — if the load path leaks too, every process lifetime still leaks ~1–2k FDs even with a
+warm cache (pointing at live cache files instead of `(deleted)` ones), and the volumes only remove
+the compile cost, not the leak itself. Containment holds either way (~1–2k ≈ 3% of the 65536
+ceiling), but the rollout watch deliberately tracks **total** FD growth, not just `(deleted)`, to
+catch this case instead of declaring false success. Related known-unknown: the upstream thread
+also mentions `hipModuleLoad` failures ("shared object initialization failed") *before* the ulimit
+is reached — if HIP has an internal ceiling on loaded modules, `nofile` does not move it; the
+signature would be that error appearing at an FD count far below the limit.
+
 Volume lifecycle / limitations:
 
 - `docker compose down -v` deletes named volumes — including the warmed kernel cache. Avoid `-v`
@@ -140,6 +152,11 @@ Extend the existing `/health` response (plain dict, `app/main.py:405`) with:
 
 - `open_fds` — `len(os.listdir("/proc/self/fd"))`; `None` where `/proc` is unavailable
   (e.g. macOS dev machines).
+- `fd_deleted` — how many of those FDs point at deleted files (`os.readlink` target ends with
+  ` (deleted)`) — the exact signature of the MIOpen compile-path leak; `None` where `/proc` is
+  unavailable. Together with `open_fds` it separates the two §2 scenarios remotely: `fd_deleted`
+  growing = compile-path leak (cache not working / not mounted); `open_fds` growing while
+  `fd_deleted` ≈ 0 = load-path leak (the open assumption in §2).
 - `fd_soft_limit` — `resource.getrlimit(resource.RLIMIT_NOFILE)[0]`; `0` where the `resource`
   module itself is absent (Windows — the import is guarded so `main.py` still imports there).
 
@@ -165,16 +182,23 @@ except ImportError:  # resource is Unix-only (absent on Windows)
     resource = None
 
 
-def _fd_stats() -> tuple[int | None, int]:
-    """Return (open_fds, soft_limit); open_fds is None where /proc is unavailable."""
+def _fd_stats() -> tuple[int | None, int | None, int]:
+    """Return (open_fds, fd_deleted, soft_limit); counts are None where /proc is unavailable."""
     if resource is None:
-        return None, 0
+        return None, None, 0
     soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     try:
-        open_fds = len(os.listdir("/proc/self/fd"))
+        fd_names = os.listdir("/proc/self/fd")
     except OSError:
-        return None, soft_limit
-    return open_fds, soft_limit
+        return None, None, soft_limit
+    deleted = 0
+    for name in fd_names:
+        try:
+            if os.readlink(f"/proc/self/fd/{name}").endswith(" (deleted)"):
+                deleted += 1
+        except OSError:
+            continue  # fd closed between listdir and readlink
+    return len(fd_names), deleted, soft_limit
 ```
 
 `/health` adds the two fields; the endpoint's behaviour is otherwise unchanged (still returns 200
@@ -211,11 +235,13 @@ say this explicitly so a future "improvement" does not convert the lever into a 
 ## Testing
 
 - `/health` tests in `tests/test_endpoints.py` (existing `client` fixture): new fields present;
-  on Linux `open_fds > 0` and `fd_soft_limit > 0`; warning path unit-tested by patching `_fd_stats`
-  to return a value at/above 80% of the limit and asserting the log record (`caplog`); rate-limit
-  covered (second hit within the hour logs nothing); `open_fds=None` branch covered (no procfs →
-  `null` in JSON, no warning); EMFILE resilience covered by patching `main.VideoFrameExtractor`
-  with `side_effect=OSError(24, ...)` and asserting 200 + FD fields + `video_processing: false`.
+  on Linux `open_fds > 0`, `fd_deleted >= 0` and `fd_soft_limit > 0`; `fd_deleted` passthrough
+  covered by patching the triple and asserting the JSON field; warning path unit-tested by patching
+  `_fd_stats` to return a value at/above 80% of the limit and asserting the log record (`caplog`);
+  rate-limit covered (second hit within the hour logs nothing); `open_fds=None` branch covered (no
+  procfs → `null` in JSON, no warning); EMFILE resilience covered by patching
+  `main.VideoFrameExtractor` with `side_effect=OSError(24, ...)` and asserting 200 + FD fields +
+  `video_processing: false`.
 - Full suite (`python -m pytest tests/ -v`) inside `.venv`.
 - Compose invariants as a **permanent test** `tests/test_compose.py` (PyYAML arrives transitively
   via ultralytics; guard with `pytest.importorskip("yaml")`): all 6 files have `ulimits.nofile`
@@ -228,14 +254,19 @@ say this explicitly so a future "improvement" does not convert the lever into a 
 1. Merge to `master`; rebuild images; redeploy with the updated compose files. Avoid
    `docker compose down -v` on routine redeploys — `-v` deletes the warmed cache volumes.
 2. Immediately verify: `ulimit -n` inside the container = 65536; `miopen-cache`/`miopen-config`
-   volumes mounted; `/health` returns `open_fds`/`fd_soft_limit`
-   (`curl -s localhost:3001/health | jq '.open_fds, .fd_soft_limit'` — also handy as a periodic
-   manual probe, since nothing consumes the WARNING automatically).
+   volumes mounted; `/health` returns `open_fds`/`fd_deleted`/`fd_soft_limit`
+   (`curl -s localhost:3001/health | jq '.open_fds, .fd_deleted, .fd_soft_limit'` — also handy as
+   a periodic manual probe, since nothing consumes the WARNING automatically).
 3. Expected first-start pattern: the volumes start **empty**, so the leak initially continues at
    the organic ~52 FDs/day while the cache warms across the active shape space — this is not a
    failure of the fix. Only subsequent restarts (warm cache) should show ~0/day from the start.
-4. Watch for 2–3 days (read-only): `(deleted)` count in `/proc/1/fd` should fall from ~52/day to
-   ~0 once the cache warms; the cache volume grows then stabilizes (MB scale).
+4. Watch for 2–3 days (read-only), tracking BOTH counters: the `(deleted)` count in `/proc/1/fd`
+   (should fall from ~52/day to ~0 once the cache warms) AND the total FD count plus FDs pointing
+   into `~/.cache/miopen` (should go flat after warm-up — sustained growth there with
+   `(deleted)` ≈ 0 means the leak lives in the load path, not the compile path; see the open
+   assumption in §2). Both axes are visible remotely via `/health` (`fd_deleted` vs `open_fds`);
+   `docker exec` + `/proc/1/fd` remains the host-side alternative. The cache volume grows then
+   stabilizes (MB scale).
 5. Optional: once the cache volume stops growing, one deliberate container restart clears the
    FDs leaked during warm-up while keeping the warmed cache (a single reset, not an autoheal loop).
 6. If the rate does **not** drop, the MIOpen attribution is wrong → resume diagnosis; prod is
@@ -250,9 +281,9 @@ say this explicitly so a future "improvement" does not convert the lever into a 
   volumes and the commented `MIOPEN_FIND_MODE` line.
 - `docker/deploy/docker-compose-{amd,cpu,nvidia}.yml` — same.
 - `docker/deploy/.env.example` — `MIOPEN_FIND_MODE` doc entry.
-- `app/main.py` — guarded `import resource`; `_fd_stats` helper + two `/health` fields +
-  hourly-rate-limited threshold warning, collected before the ffmpeg probe (probe also catches
-  `OSError`).
+- `app/main.py` — guarded `import resource`; `_fd_stats` helper + three `/health` fields
+  (`open_fds`, `fd_deleted`, `fd_soft_limit`) + hourly-rate-limited threshold warning, collected
+  before the ffmpeg probe (probe also catches `OSError`).
 - `.claude/rules/api.md` — `/health` response example.
 - `CLAUDE.md` — one config line for the `MIOPEN_FIND_MODE` knob.
 - `tests/test_endpoints.py` — verify clean (stub already discarded); add `/health` field, warning,

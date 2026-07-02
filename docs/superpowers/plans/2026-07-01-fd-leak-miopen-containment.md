@@ -43,7 +43,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 
 - **Modify** `tests/test_endpoints.py` — verify the tree is clean (the superseded FD-leak stub was already discarded), then add `/health` FD-stats tests (imports at top; new test class at end).
 - **Create** `tests/test_compose.py` — permanent compose-invariant test (Task 2).
-- **Modify** `app/main.py` — guarded `import resource`; `_fd_stats()` helper + module-level warning timestamp above the `/health` endpoint; two new fields + rate-limited WARNING collected before the ffmpeg probe in `health()`.
+- **Modify** `app/main.py` — guarded `import resource`; `_fd_stats()` helper + module-level warning timestamp above the `/health` endpoint; three new fields (`open_fds`, `fd_deleted`, `fd_soft_limit`) + rate-limited WARNING collected before the ffmpeg probe in `health()`.
 - **Modify** `docker/docker-compose-{amd,cpu,nvidia}.yml` (service `yolo-api`) and `docker/deploy/docker-compose-{amd,cpu,nvidia}.yml` (service `vision-api`) — `ulimits.nofile` in all six; the two AMD files also get `miopen-cache`/`miopen-config` volumes and a commented `MIOPEN_FIND_MODE` line.
 - **Modify** `docker/deploy/.env.example`, `CLAUDE.md`, `.claude/rules/api.md` — documentation.
 
@@ -56,7 +56,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 - Modify: `app/main.py` (imports at top; helper + endpoint changes around line 405)
 
 **Interfaces:**
-- Produces: `_fd_stats() -> tuple[int | None, int]` in `app/main.py` — returns `(open_fds, soft_limit)`; `open_fds` is `None` where `/proc/self/fd` is unavailable; `(None, 0)` where the `resource` module is absent (Windows). `/health` response gains `"open_fds": int | None` and `"fd_soft_limit": int`. Tests patch it as `patch("main._fd_stats", return_value=(900, 1000))`. The WARNING is rate-limited via module-level `_last_fd_warning_ts: float | None` (tests reset it to `None` in an autouse fixture).
+- Produces: `_fd_stats() -> tuple[int | None, int | None, int]` in `app/main.py` — returns `(open_fds, fd_deleted, soft_limit)`; both counts are `None` where `/proc/self/fd` is unavailable; `(None, None, 0)` where the `resource` module is absent (Windows). `/health` response gains `"open_fds": int | None`, `"fd_deleted": int | None` and `"fd_soft_limit": int`. Tests patch it as `patch("main._fd_stats", return_value=(900, 0, 1000))`. The WARNING is rate-limited via module-level `_last_fd_warning_ts: float | None` (tests reset it to `None` in an autouse fixture).
 - Consumes: existing `client` fixture in `tests/test_endpoints.py`; module logger `logger = logging.getLogger(__name__)` in `app/main.py` — logger name is `main` because `tests/conftest.py` puts `app/` on `sys.path` and the module imports as `main`. `time` is ALREADY imported in `app/main.py` (do not duplicate). `VideoFrameExtractor` is already imported into `main`'s namespace (`from video_utils import ...`), so `patch("main.VideoFrameExtractor", ...)` works.
 
 - [ ] **Step 1: Verify `tests/test_endpoints.py` is clean**
@@ -117,9 +117,16 @@ class TestHealthFdStats:
         assert data["fd_soft_limit"] > 0
         if sys.platform.startswith("linux"):
             assert data["open_fds"] > 0
+            assert data["fd_deleted"] >= 0
+
+    def test_health_passes_deleted_count_through(self, client):
+        with patch("main._fd_stats", return_value=(150, 42, 1000)):
+            resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["fd_deleted"] == 42
 
     def test_health_warns_when_fd_usage_high(self, client, caplog):
-        with patch("main._fd_stats", return_value=(900, 1000)):
+        with patch("main._fd_stats", return_value=(900, 0, 1000)):
             with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
                 resp = client.get("/health")
         assert resp.status_code == 200
@@ -128,7 +135,7 @@ class TestHealthFdStats:
         assert "fd usage" in caplog.text.lower()
 
     def test_health_warning_rate_limited(self, client, caplog):
-        with patch("main._fd_stats", return_value=(900, 1000)):
+        with patch("main._fd_stats", return_value=(900, 0, 1000)):
             with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
                 client.get("/health")          # first hit over the threshold logs
                 caplog.clear()
@@ -136,7 +143,7 @@ class TestHealthFdStats:
         assert "fd usage" not in caplog.text.lower()
 
     def test_health_no_warning_at_normal_usage(self, client, caplog):
-        with patch("main._fd_stats", return_value=(100, 1000)):
+        with patch("main._fd_stats", return_value=(100, 0, 1000)):
             with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
                 resp = client.get("/health")
         assert resp.status_code == 200
@@ -144,15 +151,16 @@ class TestHealthFdStats:
         assert "fd usage" not in caplog.text.lower()
 
     def test_health_handles_missing_procfs(self, client, caplog):
-        with patch("main._fd_stats", return_value=(None, 1000)):
+        with patch("main._fd_stats", return_value=(None, None, 1000)):
             with caplog.at_level(logging.WARNING, logger=MAIN_LOGGER):
                 resp = client.get("/health")
         assert resp.status_code == 200
         assert resp.json()["open_fds"] is None
+        assert resp.json()["fd_deleted"] is None
         assert "fd usage" not in caplog.text.lower()
 
     def test_health_survives_emfile_in_ffmpeg_check(self, client):
-        with patch("main._fd_stats", return_value=(100, 1000)):
+        with patch("main._fd_stats", return_value=(100, 0, 1000)):
             with patch("main.VideoFrameExtractor", side_effect=OSError(24, "Too many open files")):
                 resp = client.get("/health")
         assert resp.status_code == 200
@@ -166,10 +174,10 @@ class TestHealthFdStats:
 
 Run: `python -m pytest tests/test_endpoints.py::TestHealthFdStats -v`
 
-Expected: 6 FAILED (red) — `test_health_reports_fd_stats` with `KeyError: 'fd_soft_limit'`;
+Expected: 7 FAILED (red) — `test_health_reports_fd_stats` with `KeyError: 'fd_soft_limit'`;
 `test_health_survives_emfile_in_ffmpeg_check` fails because today's `/health` catches only
 `RuntimeError` (the patched `OSError` escapes → 500, or the fields are missing → `KeyError`);
-the four `patch("main._fd_stats", ...)` tests with `AttributeError: <module 'main' ...> does not
+the five `patch("main._fd_stats", ...)` tests with `AttributeError: <module 'main' ...> does not
 have the attribute '_fd_stats'`. The exact failure shape may vary — the point of red is that every
 test fails BEFORE the implementation exists.
 
@@ -201,16 +209,23 @@ Still in `app/main.py`, directly above the `/health` endpoint (currently `@app.g
 _last_fd_warning_ts: float | None = None
 
 
-def _fd_stats() -> tuple[int | None, int]:
-    """Return (open_fds, soft_limit); open_fds is None where /proc is unavailable."""
+def _fd_stats() -> tuple[int | None, int | None, int]:
+    """Return (open_fds, fd_deleted, soft_limit); counts are None where /proc is unavailable."""
     if resource is None:
-        return None, 0
+        return None, None, 0
     soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     try:
-        open_fds = len(os.listdir("/proc/self/fd"))
+        fd_names = os.listdir("/proc/self/fd")
     except OSError:
-        return None, soft_limit
-    return open_fds, soft_limit
+        return None, None, soft_limit
+    deleted = 0
+    for name in fd_names:
+        try:
+            if os.readlink(f"/proc/self/fd/{name}").endswith(" (deleted)"):
+                deleted += 1
+        except OSError:
+            continue  # fd closed between listdir and readlink
+    return len(fd_names), deleted, soft_limit
 
 
 ```
@@ -253,7 +268,7 @@ async def health(model_manager: ModelManager = Depends(get_model_manager)):
 
     # FD stats before anything that spawns subprocesses: at EMFILE the ffmpeg
     # probe below fails, and these numbers must still make it into the response.
-    open_fds, fd_soft_limit = _fd_stats()
+    open_fds, fd_deleted, fd_soft_limit = _fd_stats()
     if open_fds is not None and fd_soft_limit > 0 and open_fds >= 0.8 * fd_soft_limit:
         now = time.monotonic()
         if _last_fd_warning_ts is None or now - _last_fd_warning_ts >= 3600.0:
@@ -279,6 +294,7 @@ async def health(model_manager: ModelManager = Depends(get_model_manager)):
         "default_device": model_manager.default_device,
         "video_processing": ffmpeg_available,
         "open_fds": open_fds,
+        "fd_deleted": fd_deleted,
         "fd_soft_limit": fd_soft_limit
     }
 ```
@@ -286,7 +302,7 @@ async def health(model_manager: ModelManager = Depends(get_model_manager)):
 - [ ] **Step 5: Run the tests and verify they PASS (green)**
 
 Run: `python -m pytest tests/test_endpoints.py::TestHealthFdStats -v`
-Expected: 6 PASSED.
+Expected: 7 PASSED.
 
 - [ ] **Step 6: Run the full suite**
 
@@ -557,15 +573,18 @@ Health check.
   "default_device": "cuda:0",
   "video_processing": true,
   "open_fds": 123,
+  "fd_deleted": 0,
   "fd_soft_limit": 65536
 }
 ```
 
-`open_fds` counts `/proc/self/fd` entries (`null` where `/proc` is unavailable, e.g. non-Linux dev;
-`fd_soft_limit` is `0` where the `resource` module is absent). Values are a point-in-time snapshot
-and reflect the process's `RLIMIT_NOFILE` (in Docker — whatever `ulimits` grants; on a bare host —
-the shell default). A WARNING is logged (at most once per hour) when `open_fds` reaches 80% of
-`fd_soft_limit` — early signal of an FD leak.
+`open_fds` counts `/proc/self/fd` entries; `fd_deleted` counts those pointing at deleted files —
+the exact signature of the ROCm/MIOpen leak (`fd_deleted` growing = compile-path leak;
+`open_fds` growing while `fd_deleted` stays ≈ 0 = load-path leak). Both are `null` where `/proc`
+is unavailable (e.g. non-Linux dev); `fd_soft_limit` is `0` where the `resource` module is absent.
+Values are a point-in-time snapshot and reflect the process's `RLIMIT_NOFILE` (in Docker —
+whatever `ulimits` grants; on a bare host — the shell default). A WARNING is logged (at most once
+per hour) when `open_fds` reaches 80% of `fd_soft_limit` — early signal of an FD leak.
 ```
 
 - [ ] **Step 2: Add the `MIOPEN_FIND_MODE` line to `CLAUDE.md`**
@@ -612,9 +631,9 @@ git commit -m "docs: document /health fd fields and MIOPEN_FIND_MODE lever"
 ## Post-merge (user-side, informational — not plan tasks)
 
 1. Rebuild images (`:latest` base pulls ROCm 7.2.4 — accepted) and redeploy with the updated compose files. Do NOT use `docker compose down -v` on routine redeploys — `-v` deletes the warmed MIOpen cache volumes.
-2. Verify: `docker exec deploy-vision-api-1 sh -c 'ulimit -n'` → 65536; `miopen-cache`/`miopen-config` volumes mounted; `/health` returns `open_fds`/`fd_soft_limit` (`curl -s localhost:3001/health | jq '.open_fds, .fd_soft_limit'` — also handy as a periodic manual probe; nothing consumes the WARNING automatically).
+2. Verify: `docker exec deploy-vision-api-1 sh -c 'ulimit -n'` → 65536; `miopen-cache`/`miopen-config` volumes mounted; `/health` returns `open_fds`/`fd_deleted`/`fd_soft_limit` (`curl -s localhost:3001/health | jq '.open_fds, .fd_deleted, .fd_soft_limit'` — also handy as a periodic manual probe; nothing consumes the WARNING automatically).
 3. Expected first-start pattern: the volumes start empty → the leak continues at the organic ~52 FDs/day while the cache warms over the active shape space; this is NOT a failure of the fix. Only later restarts (warm cache) should show ~0/day immediately.
-4. Watch 2–3 days: `docker exec deploy-vision-api-1 sh -c "ls -l /proc/1/fd | grep -c '(deleted)'"` — expect the growth rate to fall from ~52/day to ~0 after cache warm-up; the cache volume grows then stabilizes (MB scale).
+4. Watch 2–3 days — BOTH counters, remotely via `/health` (`fd_deleted` vs `open_fds`) or host-side: `docker exec deploy-vision-api-1 sh -c "ls -l /proc/1/fd | grep -c '(deleted)'"` (expect growth to fall from ~52/day to ~0 after cache warm-up) AND the total/`miopen` FD counts — `docker exec deploy-vision-api-1 sh -c "ls /proc/1/fd | wc -l"` plus `docker exec deploy-vision-api-1 sh -c "ls -l /proc/1/fd | grep -c miopen"` (expect flat after warm-up; sustained `open_fds` growth with `fd_deleted` ≈ 0 = the leak is in the `hipModuleLoad` path — see the open assumption in design §2: containment still holds, but the FIND_MODE lever would not help). The cache volume grows then stabilizes (MB scale).
 5. Optional: once the cache volume stops growing, one deliberate container restart clears the warm-up-leaked FDs while keeping the cache (a single reset, not an autoheal loop).
 6. If the rate does not drop: MIOpen attribution is wrong → resume diagnosis (prod stays protected by the 65536 ceiling). Optional lever: uncomment `MIOPEN_FIND_MODE: FAST` in the AMD compose (edit the file — deliberately not read from `.env`).
 7. Rollback (if ever needed): remove the `ulimits`/volume lines from compose + redeploy; `docker volume rm miopen-cache miopen-config` resets the cache; the `/health` fields are additive and need no rollback.

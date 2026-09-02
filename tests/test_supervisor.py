@@ -114,6 +114,10 @@ def test_config_reads_every_variable():
         ("WATCHDOG_SMTP_PORT", "0"),
         ("WATCHDOG_ENABLED", "maybe"),
         ("WATCHDOG_SMTP_STARTTLS", "2"),
+        ("WATCHDOG_INTERVAL", "nan"),
+        ("WATCHDOG_INTERVAL", "inf"),
+        ("WATCHDOG_TIMEOUT", "1e400"),
+        ("WATCHDOG_FLAP_COOLDOWN", "-inf"),
     ],
 )
 def test_config_invalid_value_logs_error_and_keeps_default(caplog, name, value):
@@ -259,6 +263,17 @@ class RaisingNotifier:
         raise RuntimeError("smtp exploded")
 
 
+class OrderRecordingNotifier:
+    """Records, for every notification, whether the process group had already been killed."""
+
+    def __init__(self, child):
+        self.child = child
+        self.killed_when_notified: list[bool] = []
+
+    def notify(self, event):
+        self.killed_when_notified.append(self.child.group_killed)
+
+
 def _event(**overrides) -> sv.RestartEvent:
     base = dict(reason="health_failed", uptime=3600.0, failures=3, exit_code=3, detail="timed out after 10s")
     base.update(overrides)
@@ -370,12 +385,14 @@ class FakeChild:
         self.unkillable = unkillable
         self.signals: list[int] = []
         self.group_killed = False
+        self.wait_timeouts: list[float] = []
         self._returncode: int | None = None
 
     def _exited(self) -> bool:
         return self.exit_at is not None and self.exit_at <= self.clock.now
 
     def wait(self, timeout: float) -> int | None:
+        self.wait_timeouts.append(timeout)
         if self._returncode is not None:
             return self._returncode
         if not self._exited():
@@ -594,6 +611,17 @@ def test_raising_notifier_does_not_prevent_restart(caplog):
     assert "notifier raised RuntimeError: smtp exploded" in caplog.text
 
 
+def test_child_is_killed_before_the_notification_is_sent():
+    """A stalled relay must not delay the SIGKILL by several SMTP timeouts."""
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    notifier = OrderRecordingNotifier(child)
+    probe = ScriptedProbe([True, False, False, False])
+    sup = make_supervisor(make_config(min_uptime=0.0), child, probe, clock=clock, notifier=notifier)
+    assert sup.run() == 3
+    assert notifier.killed_when_notified == [True]
+
+
 def test_unkillable_child_still_exits_with_restart_code(caplog):
     clock = FakeClock(start=1000.0)
     child = FakeChild(clock, unkillable=True)
@@ -603,6 +631,37 @@ def test_unkillable_child_still_exits_with_restart_code(caplog):
         assert sup.run() == 3
     assert child.group_killed is True
     assert "still alive 2s after SIGKILL" in caplog.text
+
+
+def test_zero_stop_grace_still_confirms_the_kill_before_complaining(caplog):
+    """wait(timeout=0) is a single WNOHANG poll: the child is not reaped yet and was not "alive"."""
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    probe = ScriptedProbe([True, False, False, False])
+    sup = make_supervisor(make_config(min_uptime=0.0, stop_grace=0.0), child, probe, clock=clock)
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        assert sup.run() == 3
+    assert sv.KILL_CONFIRM_MIN_WAIT == 1.0
+    assert child.wait_timeouts[-1] == pytest.approx(1.0)
+    assert "still alive" not in caplog.text
+
+
+def test_child_that_cannot_be_started_exits_127_without_mail(caplog):
+    """A missing binary is a configuration error, not a hang: no restart code, no mail."""
+    def failing_factory(cmd):
+        raise FileNotFoundError(f"no such file: {cmd[0]}")
+
+    notifier = RecordingNotifier()
+    sup = sv.Supervisor(
+        make_config(), ["child", "--flag"],
+        probe=ScriptedProbe([True]), notifier=notifier, clock=FakeClock(),
+        child_factory=failing_factory, tick=1.0,
+    )
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        assert sup.run() == sv.EXIT_EXEC_FAILED == 127
+    assert notifier.events == []
+    assert "cannot start child command child --flag" in caplog.text
+    assert "no such file: child" in caplog.text
 
 
 def test_child_pid_property():
@@ -742,6 +801,19 @@ def test_smoke_hung_child_is_killed_and_exit_code_is_3():
     assert time.monotonic() - started < 10
     with pytest.raises(ProcessLookupError):
         os.kill(sup.child_pid, 0)  # reaped: the pid is gone
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals and process groups")
+def test_smoke_zero_stop_grace_does_not_claim_the_child_survived(caplog):
+    cfg = make_config(interval=0.1, timeout=0.1, failures=2, startup_timeout=0.5,
+                      min_uptime=0.0, flap_cooldown=0.0, stop_grace=0.0)
+    sup = sv.Supervisor(cfg, _STUBBORN_CHILD, probe=lambda: False, notifier=sv.NullNotifier(), tick=0.05)
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        code = sup.run()
+    assert code == 3
+    assert "still alive" not in caplog.text
+    with pytest.raises(ProcessLookupError):
+        os.kill(sup.child_pid, 0)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signals and process groups")

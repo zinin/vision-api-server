@@ -33,7 +33,8 @@ Exit codes
 * child's code - the child exited on its own or after SIGTERM/SIGINT;
             ``128 + N`` when the child died from signal ``N``
 * ``2``   - usage error (no child command)
-* ``127`` - ``WATCHDOG_ENABLED=false`` and ``execvp`` of the child failed
+* ``127`` - the child command could not be started: ``execvp`` failed with
+            ``WATCHDOG_ENABLED=false``, or the supervised spawn failed
 * ``1``   - unexpected exception inside the supervisor
 """
 
@@ -41,6 +42,7 @@ import dataclasses
 import enum
 import http.client
 import logging
+import math
 import os
 import signal
 import smtplib
@@ -62,6 +64,9 @@ EXIT_EXEC_FAILED = 127
 EXIT_SUPERVISOR_BUG = 1
 SMTP_TIMEOUT = 10.0
 PENDING_LOG_INTERVAL = 60.0  # seconds between "still unhealthy" lines while cooling down
+# Floor for the wait that confirms the SIGKILL: wait(timeout=0) is a single WNOHANG poll, and a
+# child killed microseconds earlier has not been reaped yet, which would log an untrue "still alive".
+KILL_CONFIRM_MIN_WAIT = 1.0
 
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
@@ -99,6 +104,10 @@ def _parse_number(
         kind = "an integer" if integer else "a number"
         log.error("%s=%r is not %s; using default %r", name, raw, kind, default)
         return default
+    if isinstance(value, float) and not math.isfinite(value):
+        # nan compares False against every bound, inf makes the probe deadline unreachable.
+        log.error("%s=%r is not a finite number; using default %r", name, raw, default)
+        return default
     if value < minimum or (exclusive and value == minimum):
         bound = ">" if exclusive else ">="
         log.error("%s=%r must be %s %s; using default %r", name, raw, bound, minimum, default)
@@ -121,7 +130,9 @@ class Config:
     startup_timeout: float = 600.0  # wait for the first healthy answer (cold MIOpen compile)
     min_uptime: float = 600.0       # a hang before this uptime counts as flapping
     flap_cooldown: float = 900.0    # delay before restarting a flapping container; 0 = off
-    stop_grace: float = 8.0         # seconds to wait after SIGTERM/SIGKILL before giving up
+    stop_grace: float = 8.0         # seconds to wait after SIGTERM before SIGKILL; the wait that
+                                    # confirms the SIGKILL is at least KILL_CONFIRM_MIN_WAIT.
+                                    # Keep below the compose stop_grace_period (default 10 s)
     mail_to: str = ""               # non-empty enables e-mail notification
     mail_from: str = ""
     smtp_host: str = ""
@@ -386,7 +397,12 @@ class Supervisor:
 
     def run(self) -> int:
         """Block until the container must exit; return the exit code."""
-        self._child = self._child_factory(self._cmd)
+        try:
+            self._child = self._child_factory(self._cmd)
+        except OSError as exc:
+            # A missing binary or an unexecutable file: a configuration error, not a hang.
+            log.error("cannot start child command %s: %s", " ".join(self._cmd), exc)
+            return EXIT_EXEC_FAILED
         self._started_at = self._clock()
         self._next_probe_at = self._started_at + self._cfg.interval
         log.info("started child pid %d: %s", self._child.pid, " ".join(self._cmd))
@@ -472,17 +488,20 @@ class Supervisor:
             "restarting the container: reason=%s uptime=%.0fs consecutive_failures=%d (%s)",
             reason, uptime, self._failures, detail,
         )
-        self._notify(RestartEvent(reason=reason, uptime=uptime, failures=self._failures,
-                                  exit_code=EXIT_RESTART, detail=detail))
+        # Kill first, mail second: a stalled relay would otherwise hold the SIGKILL back by up to
+        # several times SMTP_TIMEOUT, and the notification still goes out before the process exits.
         self.kill_child()
-        returncode = self._child.wait(timeout=self._cfg.stop_grace)
+        confirm_wait = max(self._cfg.stop_grace, KILL_CONFIRM_MIN_WAIT)
+        returncode = self._child.wait(timeout=confirm_wait)
         if returncode is None:
             log.error(
                 "child pid %d is still alive %.0fs after SIGKILL; exiting anyway",
-                self._child.pid, self._cfg.stop_grace,
+                self._child.pid, confirm_wait,
             )
         else:
             log.info("child exited with status %d after SIGKILL", returncode)
+        self._notify(RestartEvent(reason=reason, uptime=uptime, failures=self._failures,
+                                  exit_code=EXIT_RESTART, detail=detail))
         log.error("exiting with code %d so that Docker restarts the container", EXIT_RESTART)
         return EXIT_RESTART
 

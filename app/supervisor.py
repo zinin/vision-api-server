@@ -38,9 +38,12 @@ Exit codes
 """
 
 import dataclasses
+import http.client
 import logging
 import os
 import socket
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
 
 log = logging.getLogger("supervisor")
@@ -147,3 +150,38 @@ class Config:
             smtp_password=env.get("WATCHDOG_SMTP_PASSWORD", ""),
             smtp_starttls=_parse_bool(env, "WATCHDOG_SMTP_STARTTLS", d.smtp_starttls),
         )
+
+
+class HealthProbe:
+    """One HTTP GET of the health URL. ``True`` only for HTTP 200.
+
+    ``last_failure`` holds a short reason for the most recent ``False`` (empty
+    after a success) so the supervisor can log it.
+    """
+
+    def __init__(self, url: str, timeout: float) -> None:
+        self.url = url
+        self.timeout = timeout
+        self.last_failure = ""
+
+    def __call__(self) -> bool:
+        try:
+            with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
+                if response.status == 200:
+                    self.last_failure = ""
+                    return True
+                self.last_failure = f"HTTP {response.status}"
+        except urllib.error.HTTPError as exc:
+            self.last_failure = f"HTTP {exc.code}"
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            # A connect timeout arrives wrapped in URLError(reason=TimeoutError); a read
+            # timeout (the hang signature: connection accepted, no answer) arrives bare.
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, TimeoutError):
+                self.last_failure = f"timed out after {self.timeout:g}s"
+            else:
+                self.last_failure = f"{type(reason).__name__}: {reason}"
+        except Exception as exc:  # noqa: BLE001 - a probe must never propagate
+            log.warning("health probe raised %s: %s", type(exc).__name__, exc)
+            self.last_failure = f"{type(exc).__name__}: {exc}"
+        return False

@@ -6,6 +6,9 @@ two smoke tests at the end (a real child process).
 """
 import logging
 import socket
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -136,3 +139,87 @@ def test_config_mail_requires_smtp_host(caplog):
 def test_config_empty_values_mean_unset():
     cfg = sv.Config.from_env({"WATCHDOG_INTERVAL": "", "WATCHDOG_HEALTH_URL": "  ", "WATCHDOG_MAIL_TO": ""})
     assert cfg == sv.Config.from_env({})
+
+
+# --------------------------------------------------------------------------- HealthProbe
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802 - http.server API
+        if self.path == "/ok":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status": "healthy"}')
+        elif self.path == "/slow":
+            time.sleep(1.0)
+            self.send_response(200)
+            self.end_headers()
+        elif self.path == "/created":
+            self.send_response(201)
+            self.end_headers()
+        else:
+            self.send_response(500)
+            self.end_headers()
+
+    def log_message(self, *args):  # silence the test output
+        pass
+
+
+class _QuietServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):  # the /slow handler hits a closed socket
+        pass
+
+
+@pytest.fixture
+def http_base_url():
+    server = _QuietServer(("127.0.0.1", 0), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_probe_returns_true_for_200(http_base_url):
+    probe = sv.HealthProbe(f"{http_base_url}/ok", timeout=2.0)
+    assert probe() is True
+    assert probe.last_failure == ""
+
+
+def test_probe_returns_false_for_500(http_base_url):
+    probe = sv.HealthProbe(f"{http_base_url}/error", timeout=2.0)
+    assert probe() is False
+    assert probe.last_failure == "HTTP 500"
+
+
+def test_probe_returns_false_for_non_200_success_codes(http_base_url):
+    probe = sv.HealthProbe(f"{http_base_url}/created", timeout=2.0)
+    assert probe() is False
+    assert probe.last_failure == "HTTP 201"
+
+
+def test_probe_returns_false_when_nothing_listens():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        free_port = s.getsockname()[1]
+    probe = sv.HealthProbe(f"http://127.0.0.1:{free_port}/health", timeout=2.0)
+    assert probe() is False
+    assert probe.last_failure != ""
+
+
+def test_probe_returns_false_on_timeout(http_base_url):
+    probe = sv.HealthProbe(f"{http_base_url}/slow", timeout=0.2)
+    started = time.monotonic()
+    assert probe() is False
+    assert time.monotonic() - started < 1.0
+    assert probe.last_failure == "timed out after 0.2s"
+
+
+def test_probe_success_clears_last_failure(http_base_url):
+    probe = sv.HealthProbe(f"{http_base_url}/error", timeout=2.0)
+    assert probe() is False
+    probe.url = f"{http_base_url}/ok"
+    assert probe() is True
+    assert probe.last_failure == ""

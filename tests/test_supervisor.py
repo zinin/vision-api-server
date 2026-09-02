@@ -5,6 +5,7 @@ test sleeps or touches the network, except the HealthProbe tests (local http.ser
 two smoke tests at the end (a real child process).
 """
 import logging
+import signal
 import socket
 import threading
 import time
@@ -315,3 +316,265 @@ def test_smtp_notifier_swallows_errors_and_logs_warning(caplog):
 
     assert "notification failed" in caplog.text
     assert "connection refused" in caplog.text
+
+
+# --------------------------------------------------------------------------- Supervisor fakes
+
+
+class FakeClock:
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakeChild:
+    """Scripted child. Exits with ``exit_code`` once the fake clock reaches ``exit_at``.
+
+    ``send_signal`` schedules a clean exit (code 0) at once unless ``ignores_signals``;
+    ``kill_group`` schedules exit code -9 (Popen's "killed by signal 9") unless ``unkillable``.
+    """
+
+    def __init__(self, clock: FakeClock, *, exit_code: int | None = None, exit_at: float | None = None,
+                 ignores_signals: bool = False, unkillable: bool = False):
+        self.pid = 4242
+        self.clock = clock
+        self.exit_code = exit_code
+        self.exit_at = exit_at
+        self.ignores_signals = ignores_signals
+        self.unkillable = unkillable
+        self.signals: list[int] = []
+        self.group_killed = False
+        self._returncode: int | None = None
+
+    def _exited(self) -> bool:
+        return self.exit_at is not None and self.exit_at <= self.clock.now
+
+    def wait(self, timeout: float) -> int | None:
+        if self._returncode is not None:
+            return self._returncode
+        if not self._exited():
+            self.clock.advance(timeout)
+        if self._exited():
+            self._returncode = self.exit_code
+            return self._returncode
+        return None
+
+    def send_signal(self, signum: int) -> None:
+        self.signals.append(signum)
+        if not self.ignores_signals and self._returncode is None:
+            self.exit_code, self.exit_at = 0, self.clock.now
+
+    def kill_group(self) -> None:
+        self.group_killed = True
+        if not self.unkillable and self._returncode is None:
+            self.exit_code, self.exit_at = -9, self.clock.now
+
+
+class ScriptedProbe:
+    """Returns ``results`` in order (the last one repeats); ``hooks`` maps call number -> callable."""
+
+    def __init__(self, results, hooks=None):
+        self.results = list(results)
+        self.hooks = hooks or {}
+        self.calls = 0
+        self.last_failure = "scripted failure"
+
+    def __call__(self) -> bool:
+        self.calls += 1
+        hook = self.hooks.get(self.calls)
+        if hook is not None:
+            hook()
+        return self.results[min(self.calls - 1, len(self.results) - 1)]
+
+
+def make_supervisor(cfg, child, probe, *, clock, notifier=None):
+    return sv.Supervisor(
+        cfg, ["child", "--flag"],
+        probe=probe, notifier=notifier or RecordingNotifier(), clock=clock,
+        child_factory=lambda cmd: child, tick=1.0,
+    )
+
+
+def run_until_stopped(cfg, clock, child, results, stop_at_call, notifier=None):
+    """Run with a scripted probe that requests a graceful stop at probe call ``stop_at_call``."""
+    holder = {}
+    probe = ScriptedProbe(results, hooks={stop_at_call: lambda: holder["sup"].request_stop(signal.SIGTERM)})
+    sup = make_supervisor(cfg, child, probe, clock=clock, notifier=notifier)
+    holder["sup"] = sup
+    return sup.run(), probe
+
+
+# --------------------------------------------------------------------------- Supervisor: core
+
+
+def test_healthy_service_is_left_alone():
+    clock, notifier = FakeClock(), RecordingNotifier()
+    child = FakeChild(clock)
+    code, probe = run_until_stopped(make_config(), clock, child, [True], stop_at_call=50, notifier=notifier)
+    assert code == 0
+    assert probe.calls == 50
+    assert child.group_killed is False
+    assert child.signals == [signal.SIGTERM]
+    assert notifier.events == []
+
+
+def test_starting_ignores_failures_until_first_success(caplog):
+    clock = FakeClock()
+    child = FakeChild(clock)
+    with caplog.at_level(logging.INFO, logger="supervisor"):
+        code, _ = run_until_stopped(make_config(), clock, child, [False] * 5 + [True], stop_at_call=8)
+    assert code == 0
+    assert child.group_killed is False
+    assert "healthy after 6s" in caplog.text
+
+
+def test_startup_timeout_restarts(caplog):
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    notifier = RecordingNotifier()
+    sup = make_supervisor(make_config(startup_timeout=10.0), child, ScriptedProbe([False]), clock=clock, notifier=notifier)
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        code = sup.run()
+    assert code == sv.EXIT_RESTART == 3
+    assert child.group_killed is True
+    assert clock.now == pytest.approx(1010.0)
+    assert [e.reason for e in notifier.events] == ["startup_timeout"]
+    assert notifier.events[0].exit_code == 3
+    assert notifier.events[0].uptime == pytest.approx(10.0)
+    assert "reason=startup_timeout" in caplog.text
+
+
+def test_running_success_resets_failure_counter():
+    clock = FakeClock()
+    child = FakeChild(clock)
+    notifier = RecordingNotifier()
+    results = [True, False, False, True, False, False, True]
+    code, _ = run_until_stopped(make_config(min_uptime=0.0), clock, child, results, stop_at_call=10, notifier=notifier)
+    assert code == 0
+    assert child.group_killed is False
+    assert notifier.events == []
+
+
+def test_three_failures_at_long_uptime_restart_immediately(caplog):
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    notifier = RecordingNotifier()
+    probe = ScriptedProbe([True, False, False, False])
+    sup = make_supervisor(make_config(min_uptime=0.0), child, probe, clock=clock, notifier=notifier)
+    with caplog.at_level(logging.WARNING, logger="supervisor"):
+        code = sup.run()
+    assert code == 3
+    assert child.group_killed is True
+    assert clock.now == pytest.approx(1004.0)
+    assert [e.reason for e in notifier.events] == ["health_failed"]
+    assert notifier.events[0].failures == 3
+    assert notifier.events[0].detail == "scripted failure"
+    assert "health probe failed (3/3): scripted failure" in caplog.text
+    assert "consecutive_failures=3" in caplog.text
+
+
+def test_child_exit_code_is_propagated_and_notified():
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock, exit_code=7, exit_at=1005.0)
+    notifier = RecordingNotifier()
+    sup = make_supervisor(make_config(), child, ScriptedProbe([True]), clock=clock, notifier=notifier)
+    assert sup.run() == 7
+    assert child.group_killed is False
+    assert [e.reason for e in notifier.events] == ["child_exited"]
+    assert notifier.events[0].exit_code == 7
+    assert notifier.events[0].detail == "child exit code 7"
+
+
+def test_child_killed_by_signal_maps_to_128_plus_signum():
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock, exit_code=-9, exit_at=1005.0)
+    sup = make_supervisor(make_config(), child, ScriptedProbe([True]), clock=clock)
+    assert sup.run() == 137
+
+
+def test_normalize_exit_code():
+    assert sv.normalize_exit_code(0) == 0
+    assert sv.normalize_exit_code(7) == 7
+    assert sv.normalize_exit_code(-9) == 137
+    assert sv.normalize_exit_code(-15) == 143
+
+
+def test_sigterm_is_forwarded_to_child_only():
+    clock = FakeClock()
+    child = FakeChild(clock)
+    notifier = RecordingNotifier()
+    code, _ = run_until_stopped(make_config(), clock, child, [True], stop_at_call=3, notifier=notifier)
+    assert code == 0
+    assert child.signals == [signal.SIGTERM]
+    assert child.group_killed is False
+    assert notifier.events == []
+
+
+def test_child_ignoring_sigterm_is_killed_after_grace(caplog):
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock, ignores_signals=True)
+    notifier = RecordingNotifier()
+    with caplog.at_level(logging.WARNING, logger="supervisor"):
+        code, _ = run_until_stopped(make_config(stop_grace=2.0), clock, child, [True], stop_at_call=3, notifier=notifier)
+    assert code == 137
+    assert child.signals == [signal.SIGTERM]
+    assert child.group_killed is True
+    assert clock.now == pytest.approx(1005.0)  # stop requested at 1003, grace 2s
+    assert notifier.events == []
+    assert "did not exit 2s after signal" in caplog.text
+
+
+def test_second_signal_kills_group_immediately():
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock, ignores_signals=True)
+    holder = {}
+
+    def twice():
+        holder["sup"].request_stop(signal.SIGTERM)
+        holder["sup"].request_stop(signal.SIGINT)
+
+    probe = ScriptedProbe([True], hooks={3: twice})
+    sup = make_supervisor(make_config(stop_grace=60.0), child, probe, clock=clock)
+    holder["sup"] = sup
+    assert sup.run() == 137
+    assert child.group_killed is True
+    assert clock.now == pytest.approx(1003.0)
+
+
+def test_raising_notifier_does_not_prevent_restart(caplog):
+    clock = FakeClock()
+    child = FakeChild(clock)
+    probe = ScriptedProbe([True, False, False, False])
+    sup = make_supervisor(make_config(min_uptime=0.0), child, probe, clock=clock, notifier=RaisingNotifier())
+    with caplog.at_level(logging.WARNING, logger="supervisor"):
+        assert sup.run() == 3
+    assert child.group_killed is True
+    assert "notifier raised RuntimeError: smtp exploded" in caplog.text
+
+
+def test_unkillable_child_still_exits_with_restart_code(caplog):
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock, unkillable=True)
+    probe = ScriptedProbe([True, False, False, False])
+    sup = make_supervisor(make_config(min_uptime=0.0, stop_grace=2.0), child, probe, clock=clock)
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        assert sup.run() == 3
+    assert child.group_killed is True
+    assert "still alive 2s after SIGKILL" in caplog.text
+
+
+def test_child_pid_property():
+    clock = FakeClock()
+    child = FakeChild(clock)
+    holder = {}
+    probe = ScriptedProbe([True], hooks={1: lambda: holder["sup"].request_stop(signal.SIGTERM)})
+    sup = make_supervisor(make_config(), child, probe, clock=clock)
+    holder["sup"] = sup
+    assert sup.child_pid is None
+    sup.run()
+    assert sup.child_pid == 4242

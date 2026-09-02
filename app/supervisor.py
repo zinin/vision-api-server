@@ -38,15 +38,18 @@ Exit codes
 """
 
 import dataclasses
+import enum
 import http.client
 import logging
 import os
+import signal
 import smtplib
 import socket
+import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from email.message import EmailMessage
 
 log = logging.getLogger("supervisor")
@@ -263,3 +266,204 @@ class SmtpNotifier:
             )
         )
         return message
+
+
+class ChildProcess:
+    """The real child: a thin wrapper around ``subprocess.Popen``.
+
+    The child gets its own session so that ``kill_group`` reaches uvicorn and
+    every ffmpeg it spawned in one call. Unit tests replace this class with a
+    scripted fake exposing the same four members.
+    """
+
+    def __init__(self, cmd: list[str]) -> None:
+        self._proc = subprocess.Popen(cmd, start_new_session=True)
+        self.pid = self._proc.pid
+
+    def wait(self, timeout: float) -> int | None:
+        """Exit status, or ``None`` if the child is still running after ``timeout`` seconds."""
+        try:
+            return self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def send_signal(self, signum: int) -> None:
+        try:
+            self._proc.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+    def kill_group(self) -> None:
+        try:
+            os.killpg(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+class State(enum.Enum):
+    STARTING = "starting"                # until the first HTTP 200
+    RUNNING = "running"                  # healthy, counting consecutive failures
+    PENDING_RESTART = "pending_restart"  # hang detected too soon after start; cooling down
+
+
+def normalize_exit_code(returncode: int) -> int:
+    """Map Popen's negative "killed by signal N" to the shell convention 128 + N."""
+    return returncode if returncode >= 0 else 128 - returncode
+
+
+class Supervisor:
+    """Runs the child, probes ``/health``, and decides when the container must restart.
+
+    Everything with side effects (child, probe, notifier, clock) is injected so the state
+    machine can be tested with fakes and a virtual clock.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        child_cmd: list[str],
+        *,
+        probe: Callable[[], bool],
+        notifier,
+        clock: Callable[[], float] = time.monotonic,
+        child_factory: Callable[[list[str]], ChildProcess] = ChildProcess,
+        tick: float = 1.0,
+    ) -> None:
+        self._cfg = config
+        self._cmd = list(child_cmd)
+        self._probe = probe
+        self._notifier = notifier
+        self._clock = clock
+        self._child_factory = child_factory
+        self._tick = tick  # granularity of the idle wait: child exits and signals are noticed within one tick
+        self._child: ChildProcess | None = None
+        self._state = State.STARTING
+        self._failures = 0
+        self._started_at = 0.0
+        self._next_probe_at = 0.0
+        self._stop_signal: int | None = None
+        self._stop_deadline = 0.0
+        self._group_killed = False
+
+    @property
+    def child_pid(self) -> int | None:
+        return None if self._child is None else self._child.pid
+
+    # -- public control ------------------------------------------------------------------------
+
+    def request_stop(self, signum: int) -> None:
+        """Forward ``signum`` to the child; a second call kills the process group at once.
+
+        Called from the SIGTERM/SIGINT handlers installed by ``main()`` and directly by tests.
+        """
+        if self._stop_signal is not None:
+            log.warning("second signal %d received; killing the process group now", signum)
+            self.kill_child()
+            return
+        self._stop_signal = signum
+        self._stop_deadline = self._clock() + self._cfg.stop_grace
+        if self._child is None:
+            return  # run() forwards the signal as soon as the child exists
+        log.info("forwarding signal %d to child pid %d", signum, self._child.pid)
+        self._child.send_signal(signum)
+
+    def kill_child(self) -> None:
+        if self._child is not None and not self._group_killed:
+            self._group_killed = True
+            self._child.kill_group()
+
+    def run(self) -> int:
+        """Block until the container must exit; return the exit code."""
+        self._child = self._child_factory(self._cmd)
+        self._started_at = self._clock()
+        self._next_probe_at = self._started_at + self._cfg.interval
+        log.info("started child pid %d: %s", self._child.pid, " ".join(self._cmd))
+        if self._stop_signal is not None:  # a signal arrived while the child was being spawned
+            self._child.send_signal(self._stop_signal)
+        while True:
+            returncode = self._child.wait(timeout=self._tick)
+            if returncode is not None:
+                return self._on_child_exit(returncode)
+            now = self._clock()
+            if self._stop_signal is not None:
+                if now >= self._stop_deadline and not self._group_killed:
+                    log.warning(
+                        "child did not exit %.0fs after signal %d; killing the process group",
+                        self._cfg.stop_grace, self._stop_signal,
+                    )
+                    self.kill_child()
+                continue  # no probing while stopping
+            if now >= self._next_probe_at:
+                self._next_probe_at = now + self._cfg.interval
+                reason = self._on_probe(self._probe(), now)
+                if reason is not None:
+                    return self._restart(reason)
+
+    # -- state machine -------------------------------------------------------------------------
+
+    def _on_probe(self, healthy: bool, now: float) -> str | None:
+        """Advance the state machine by one probe result; return a restart reason or ``None``."""
+        uptime = now - self._started_at
+        cfg = self._cfg
+        if self._state is State.STARTING:
+            if healthy:
+                self._state = State.RUNNING
+                self._failures = 0
+                log.info("healthy after %.0fs", uptime)
+                return None
+            log.warning(
+                "waiting for the first healthy response (%.0fs of %.0fs): %s",
+                uptime, cfg.startup_timeout, self._last_failure(),
+            )
+            return "startup_timeout" if uptime >= cfg.startup_timeout else None
+        if healthy:
+            self._failures = 0
+            return None
+        self._failures += 1
+        log.warning("health probe failed (%d/%d): %s", self._failures, cfg.failures, self._last_failure())
+        if self._failures < cfg.failures:
+            return None
+        return "health_failed"
+
+    def _last_failure(self) -> str:
+        return getattr(self._probe, "last_failure", "") or "probe failed"
+
+    # -- reactions -----------------------------------------------------------------------------
+
+    def _restart(self, reason: str) -> int:
+        uptime = self._clock() - self._started_at
+        detail = self._last_failure()
+        log.error(
+            "restarting the container: reason=%s uptime=%.0fs consecutive_failures=%d (%s)",
+            reason, uptime, self._failures, detail,
+        )
+        self._notify(RestartEvent(reason=reason, uptime=uptime, failures=self._failures,
+                                  exit_code=EXIT_RESTART, detail=detail))
+        self.kill_child()
+        returncode = self._child.wait(timeout=self._cfg.stop_grace)
+        if returncode is None:
+            log.error(
+                "child pid %d is still alive %.0fs after SIGKILL; exiting anyway",
+                self._child.pid, self._cfg.stop_grace,
+            )
+        else:
+            log.info("child exited with status %d after SIGKILL", returncode)
+        log.error("exiting with code %d so that Docker restarts the container", EXIT_RESTART)
+        return EXIT_RESTART
+
+    def _on_child_exit(self, returncode: int) -> int:
+        code = normalize_exit_code(returncode)
+        uptime = self._clock() - self._started_at
+        if self._stop_signal is not None:
+            log.info("child exited with code %d after signal %d", code, self._stop_signal)
+            return code
+        log.error("child exited on its own with code %d after %.0fs", code, uptime)
+        self._notify(RestartEvent(reason="child_exited", uptime=uptime, failures=self._failures,
+                                  exit_code=code, detail=f"child exit code {code}"))
+        return code
+
+    def _notify(self, event: RestartEvent) -> None:
+        try:
+            self._notifier.notify(event)
+        except Exception as exc:  # noqa: BLE001 - a broken notifier must not stop the restart
+            log.warning("notifier raised %s: %s", type(exc).__name__, exc)

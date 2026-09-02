@@ -45,6 +45,7 @@ import os
 import signal
 import smtplib
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -172,10 +173,15 @@ class HealthProbe:
         self.url = url
         self.timeout = timeout
         self.last_failure = ""
+        # An opener with proxies switched off: urlopen's default one honours http_proxy /
+        # HTTP_PROXY and has no loopback exemption, so on a host where Docker injects proxy
+        # variables every probe of 127.0.0.1 would be sent to the proxy, fail, and make the
+        # watchdog restart a perfectly healthy container.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def __call__(self) -> bool:
         try:
-            with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
+            with self._opener.open(self.url, timeout=self.timeout) as response:
                 if response.status == 200:
                     self.last_failure = ""
                     return True
@@ -235,7 +241,9 @@ class SmtpNotifier:
             message = self.build_message(event)
             with self._smtp_factory(self._cfg.smtp_host, self._cfg.smtp_port, timeout=SMTP_TIMEOUT) as smtp:
                 if self._cfg.smtp_starttls:
-                    smtp.starttls()
+                    # An explicit default context verifies the certificate and the hostname;
+                    # smtplib's own default does neither, which exposes the password below.
+                    smtp.starttls(context=ssl.create_default_context())
                 if self._cfg.smtp_user:
                     smtp.login(self._cfg.smtp_user, self._cfg.smtp_password)
                 smtp.send_message(message)

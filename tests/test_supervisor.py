@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -229,6 +230,19 @@ def test_probe_success_clears_last_failure(http_base_url):
     assert probe.last_failure == ""
 
 
+def test_probe_ignores_proxy_environment_variables(http_base_url, monkeypatch):
+    """A proxied loopback probe never reaches uvicorn: the watchdog would restart forever."""
+    # urlopen caches its module-level opener; drop it so the pre-fix code really reads the env.
+    monkeypatch.setattr(sv.urllib.request, "_opener", None)
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    probe = sv.HealthProbe(f"{http_base_url}/ok", timeout=2.0)
+    assert probe() is True
+    assert probe.last_failure == ""
+
+
 # --------------------------------------------------------------------------- Notifier
 
 
@@ -276,7 +290,12 @@ def test_smtp_notifier_sends_message_with_starttls_and_login():
     notifier.notify(_event())
 
     factory.assert_called_once_with("smtp.example.com", 2525, timeout=sv.SMTP_TIMEOUT)
-    smtp.starttls.assert_called_once_with()
+    smtp.starttls.assert_called_once()
+    # Without an explicit context smtplib uses an unverified one and login() leaks the password.
+    context = smtp.starttls.call_args.kwargs["context"]
+    assert isinstance(context, ssl.SSLContext)
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
     smtp.login.assert_called_once_with("user", "secret")
     smtp.send_message.assert_called_once()
     message = smtp.send_message.call_args.args[0]

@@ -772,6 +772,80 @@ def test_main_disabled_reports_execvp_failure(monkeypatch, caplog):
     assert "execvp nonexistent-command failed" in caplog.text
 
 
+_FAKE_SUPERVISORS: list["FakeSupervisor"] = []
+
+
+class FakeSupervisor:
+    """Stands in for the real Supervisor so main()'s wiring can be inspected without a child."""
+
+    def __init__(self, config, child_cmd, *, probe, notifier, **kwargs):
+        self.config = config
+        self.child_cmd = child_cmd
+        self.probe = probe
+        self.notifier = notifier
+        self.kwargs = kwargs
+        self.stopped_with: list[int] = []
+        self.killed = False
+        _FAKE_SUPERVISORS.append(self)
+
+    def run(self) -> int:
+        return 42
+
+    def request_stop(self, signum: int) -> None:
+        self.stopped_with.append(signum)
+
+    def kill_child(self) -> None:
+        self.killed = True
+
+
+class CrashingSupervisor(FakeSupervisor):
+    def run(self) -> int:
+        raise RuntimeError("state machine exploded")
+
+
+def test_main_wires_probe_notifier_and_signal_handlers(monkeypatch):
+    _FAKE_SUPERVISORS.clear()
+    handlers: list[tuple[int, object]] = []
+    monkeypatch.setattr(sv, "Supervisor", FakeSupervisor)
+    # Replaces the real signal.signal: the test process must keep its own handlers.
+    monkeypatch.setattr(sv.signal, "signal", lambda signum, handler: handlers.append((signum, handler)))
+
+    code = sv.main(["uvicorn", "main:app"],
+                   {"WATCHDOG_MAIL_TO": "ops@example.com", "WATCHDOG_SMTP_HOST": "smtp.example.com"})
+
+    assert code == 42
+    [supervisor] = _FAKE_SUPERVISORS
+    assert supervisor.child_cmd == ["uvicorn", "main:app"]
+    assert isinstance(supervisor.notifier, sv.SmtpNotifier)
+    assert isinstance(supervisor.probe, sv.HealthProbe)
+    assert supervisor.probe.url == "http://127.0.0.1:8000/health"
+    assert [signum for signum, _ in handlers] == [signal.SIGTERM, signal.SIGINT]
+    for signum, handler in handlers:
+        handler(signum, None)
+    assert supervisor.stopped_with == [signal.SIGTERM, signal.SIGINT]
+    assert supervisor.killed is False
+
+
+def test_main_without_mail_settings_uses_the_null_notifier(monkeypatch):
+    _FAKE_SUPERVISORS.clear()
+    monkeypatch.setattr(sv, "Supervisor", FakeSupervisor)
+    monkeypatch.setattr(sv.signal, "signal", lambda signum, handler: None)
+
+    assert sv.main(["uvicorn", "main:app"], {}) == 42
+    assert isinstance(_FAKE_SUPERVISORS[0].notifier, sv.NullNotifier)
+
+
+def test_main_kills_the_child_when_the_supervisor_crashes(monkeypatch, caplog):
+    _FAKE_SUPERVISORS.clear()
+    monkeypatch.setattr(sv, "Supervisor", CrashingSupervisor)
+    monkeypatch.setattr(sv.signal, "signal", lambda signum, handler: None)
+
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        assert sv.main(["uvicorn", "main:app"], {}) == sv.EXIT_SUPERVISOR_BUG == 1
+    assert _FAKE_SUPERVISORS[0].killed is True
+    assert "supervisor crashed" in caplog.text
+
+
 def test_configure_logging_honours_log_level(monkeypatch):
     captured = {}
     monkeypatch.setattr(sv.logging, "basicConfig", lambda **kwargs: captured.update(kwargs))
@@ -788,6 +862,28 @@ def test_configure_logging_honours_log_level(monkeypatch):
 
 _STUBBORN_CHILD = [sys.executable, "-c",
                    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"]
+
+# Ignores SIGTERM, spawns a plain-Popen grandchild (an ffmpeg stand-in), reports its pid, sleeps.
+_CHILD_WITH_GRANDCHILD = (
+    "import signal, subprocess, sys, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "grandchild = subprocess.Popen([sys.executable, '-c',\n"
+    "    'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
+    "open(sys.argv[1], 'w').write(str(grandchild.pid))\n"
+    "time.sleep(60)\n"
+)
+
+
+def _wait_until_gone(pid: int, timeout: float) -> bool:
+    """Poll until ``pid`` disappears; an orphan stays a zombie until init reaps it."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signals and process groups")
@@ -825,5 +921,29 @@ def test_smoke_stop_request_escalates_to_sigkill():
     code = sup.run()
     assert code == 137  # SIGTERM ignored -> SIGKILL after 0.5s -> 128 + 9
     assert time.monotonic() - started < 10
+    with pytest.raises(ProcessLookupError):
+        os.kill(sup.child_pid, 0)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals and process groups")
+def test_smoke_killpg_reaches_a_grandchild(tmp_path):
+    """Every ffmpeg is a grandchild of the supervisor; the group kill must reach it too."""
+    pid_file = tmp_path / "grandchild.pid"
+    cfg = make_config(interval=0.1, timeout=0.1, failures=2, startup_timeout=1.5,
+                      min_uptime=0.0, flap_cooldown=0.0, stop_grace=1.0)
+    cmd = [sys.executable, "-c", _CHILD_WITH_GRANDCHILD, str(pid_file)]
+    sup = sv.Supervisor(cfg, cmd, probe=lambda: False, notifier=sv.NullNotifier(), tick=0.05)
+
+    code = sup.run()
+
+    assert code == 3
+    grandchild_pid = int(pid_file.read_text())
+    try:
+        assert _wait_until_gone(grandchild_pid, timeout=3.0), "the grandchild survived killpg"
+    finally:
+        try:
+            os.kill(grandchild_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     with pytest.raises(ProcessLookupError):
         os.kill(sup.child_pid, 0)

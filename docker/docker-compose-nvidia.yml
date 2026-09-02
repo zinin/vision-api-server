@@ -16,6 +16,8 @@ services:
       MODELS_DIR: /models
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      # Process watchdog (supervisor.py) kill switch: false runs uvicorn unsupervised; empty = default (true).
+      WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-}
     deploy:
       resources:
         reservations:
@@ -23,6 +25,7 @@ services:
             - driver: nvidia
               capabilities: [gpu]
     restart: unless-stopped
+    init: true  # tini as PID 1; supervisor.py and uvicorn are ordinary children it can signal
     ulimits:
       nofile:
         soft: 65536

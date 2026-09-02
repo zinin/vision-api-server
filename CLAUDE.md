@@ -34,6 +34,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
 | `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
 | `app/detection_stabilizer.py` | Detection track stabilizer, IoU matching, class voting |
+| `app/supervisor.py` | Process watchdog: runs uvicorn as a child, restarts the container when `/health` hangs |
 
 ## Endpoints
 
@@ -78,6 +79,23 @@ STABILIZER_GRACE_CENTER=2.0     # Grace period seconds, object in center
 STABILIZER_GRACE_EDGE=0.5       # Grace period seconds, object at edge
 STABILIZER_CENTER_ZONE=0.6      # Frame fraction considered "center" (0-1]
 STABILIZER_MAX_STALENESS=5.0    # Max seconds before track becomes stale
+WATCHDOG_ENABLED=true           # false = run uvicorn without the watchdog (emergency lever)
+WATCHDOG_HEALTH_URL=http://127.0.0.1:8000/health
+WATCHDOG_INTERVAL=30            # seconds between /health probes
+WATCHDOG_TIMEOUT=10             # probe HTTP timeout
+WATCHDOG_FAILURES=3             # consecutive failures -> SIGKILL uvicorn, exit 3, Docker restarts
+WATCHDOG_STARTUP_TIMEOUT=600    # wait for the first healthy answer (cold MIOpen compile)
+WATCHDOG_MIN_UPTIME=600         # a hang before this uptime counts as flapping
+WATCHDOG_FLAP_COOLDOWN=900      # delay before restarting a flapping container; 0 = off
+WATCHDOG_STOP_GRACE=8           # seconds after SIGTERM before SIGKILL; keep below the compose
+                                # stop_grace_period (10 s). The wait confirming the SIGKILL is >= 1 s
+WATCHDOG_MAIL_TO=               # non-empty enables e-mail on every watchdog restart
+WATCHDOG_MAIL_FROM=vision-api@<hostname>
+WATCHDOG_SMTP_HOST=             # required for mail; port 587 + STARTTLS by default
+WATCHDOG_SMTP_PORT=587
+WATCHDOG_SMTP_USER=             # login only when set
+WATCHDOG_SMTP_PASSWORD=
+WATCHDOG_SMTP_STARTTLS=true
 # MIOPEN_FIND_MODE=FAST         # AMD emergency lever: fewer MIOpen kernel compiles (the ROCm
                                 # fd-leak trigger) at inference-perf cost (generic fallback
                                 # kernels). NOT read from .env — enable by uncommenting the line
@@ -96,7 +114,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-Tests cover config, Pydantic models, JobManager, and VideoAnnotator (mocked YOLO/FFmpeg).
+Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`).
 
 ## Key Patterns
 
@@ -111,6 +129,8 @@ Tests cover config, Pydantic models, JobManager, and VideoAnnotator (mocked YOLO
 **Detection Stabilizer**: Two-pass decode pipeline. Pass 1 decodes video + collects YOLO detections with lowered conf (no disk cache). DetectionStabilizer links detections into tracks via IoU, votes on stable class, fills gaps bidirectionally with position-aware grace periods. Pass 2 decodes video again + renders stabilized boxes. Class filtering applied after stabilization.
 
 **NVENC CPU fallback**: Pass 2 automatically retries on the CPU encoder (`libx265`/`libx264`/`libsvtav1`, CRF mode — source bitrate is dropped because CPU single-pass at 50–100 Mbps adds no visual gain) when `hevc_nvenc`/`h264_nvenc`/`av1_nvenc` fails to initialise. Classifier is encoder-side only: NVDEC / CUDA decode OOM will still surface as a hard failure. Pass 1 and stabilization are not re-run (the `stabilized` dict is reused). Every job tries NVENC first; no sticky disable. Operator note: the retry doubles Pass 2 wall-clock (one failed decode + one full CPU decode+encode), and CPU encoding runs ≈3–10× slower than NVENC — expect noticeable latency on affected jobs.
+
+**Process Watchdog**: `app/supervisor.py` is the container command; uvicorn is its child in its own process group, tini is PID 1 (`init: true`). The supervisor polls `/health` (30 s interval, 10 s timeout); 3 consecutive failures — or no healthy answer within 600 s of start — SIGKILL the process group and exit with code 3, and `restart: unless-stopped` recreates the container. Why a process and not a thread: the 2026-08-30 incident was a ROCm busy-spin holding the GIL, so nothing inside the uvicorn process could run for 2.5 days. Why uvicorn must not be PID 1: the kernel ignores SIGKILL sent to PID 1 from inside its own PID namespace. Anti-flapping is stateless: a hang less than 600 s after start waits 900 s (still probing, a healthy answer cancels) before killing. Standard library only, no application imports. `WATCHDOG_ENABLED=false` exec's uvicorn directly.
 
 ## Limits
 

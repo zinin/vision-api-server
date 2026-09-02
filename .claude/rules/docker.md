@@ -58,6 +58,10 @@ YOLO_DEVICE=cuda:0
 
 # TTL for cached models (seconds)
 YOLO_MODEL_TTL=900
+
+# Process watchdog: false runs uvicorn without supervisor.py. The only WATCHDOG_* variable
+# the dev compose files forward; the deploy files forward more (see deploy/.env.example)
+WATCHDOG_ENABLED=true
 ```
 
 **Device options:**
@@ -91,7 +95,7 @@ All Dockerfiles follow the same pattern:
 4. Install `requirements.txt`
 5. Copy `app/*.py` to `/app`
 6. Expose port 8000
-7. Run uvicorn
+7. Run `supervisor.py`, which runs uvicorn as a child and restarts the container when `/health` hangs (see Health Check)
 
 ## Health Check
 
@@ -105,6 +109,36 @@ healthcheck:
   retries: 3
   start_period: 40s
 ```
+
+The healthcheck only *reports* status; plain Docker never acts on `unhealthy`. Inside the container `supervisor.py` polls the same endpoint with the same thresholds and, after 3 consecutive failures (or no healthy answer within 600 s of start), SIGKILLs uvicorn's process group and exits with code 3, so `restart: unless-stopped` recreates the container. All compose files set `init: true` (tini as PID 1). `WATCHDOG_ENABLED=false` in `.env` disables the watchdog with every compose file; the other `WATCHDOG_*` knobs are forwarded by the deploy files only (see `deploy/.env.example`). On the host, `docker inspect -f '{{.RestartCount}}' <container>` counts watchdog restarts.
+
+### Verifying the watchdog
+
+`init: true` needs `docker-init` on the host. Check it **before** the first `--force-recreate`:
+without it the old container is removed and the new one fails to start.
+
+```bash
+docker run --rm --init alpine true     # must exit 0
+```
+
+Fire drill on a running container — freeze uvicorn and watch the watchdog react:
+
+```bash
+docker top <container> -o pid,cmd      # three lines contain "uvicorn main:app": docker-init (PID 1,
+                                       # whose command line also carries the whole child command),
+                                       # the supervisor ("python3 supervisor.py uvicorn main:app ..."),
+                                       # and the real uvicorn ("uvicorn main:app ..."). STOP the one
+                                       # whose command STARTS WITH "uvicorn" (the child).
+sudo kill -STOP <pid of the real uvicorn>
+# ~2 minutes later (3 probes x (30 s interval + 10 s timeout)):
+docker logs --since 5m <container> 2>&1 | grep supervisor:
+#   restarting the container: reason=health_failed ...
+docker inspect -f '{{.RestartCount}} {{.State.Health.Status}}' <container>
+#   1 healthy
+```
+
+`kill -CONT <pid>` undoes a mistaken SIGSTOP. Stopping docker-init or the supervisor instead of the
+child does nothing visible: the probe keeps failing only if uvicorn itself is frozen.
 
 ## GPU Requirements
 
@@ -181,3 +215,13 @@ And set `YOLO_MODELS` to use `/models/` path prefix.
 **Slow startup:**
 - First run downloads models (~25MB for yolo26s.pt)
 - Use volume mount for model persistence
+
+**Container restarts every few minutes:**
+- The watchdog is firing: `docker logs <container> 2>&1 | grep supervisor:` shows `restarting the container: reason=...`
+- `reason=startup_timeout` — model preload took longer than `WATCHDOG_STARTUP_TIMEOUT` (600 s); raise it or warm the MIOpen cache volume
+- `reason=health_failed` shortly after start — the GPU is probably hung: check `rocm-smi` / `nvidia-smi` and `dmesg`; reboot the host if the GPU never comes back
+- `child ... is still alive ... after SIGKILL` and the container never comes back — the child is
+  stuck in an uninterruptible kernel state (D state, almost always the GPU driver). SIGKILL cannot
+  touch it and the exiting PID namespace waits for it, so the container stays in "exiting"; only a
+  host reboot recovers it
+- Emergency: `WATCHDOG_ENABLED=false` in `.env` and `docker compose up -d`

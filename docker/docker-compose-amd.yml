@@ -17,11 +17,14 @@ services:
       # MIOPEN_FIND_MODE: FAST
       YOLO_DEVICE: 'cuda:0'
       MODELS_DIR: /models
+      # Process watchdog (supervisor.py) kill switch: false runs uvicorn unsupervised; empty = default (true).
+      WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-}
     volumes:
       - models:/models
       - miopen-cache:/root/.cache/miopen    # compiled GPU kernels (MIOpen fd-leak containment)
       - miopen-config:/root/.config/miopen  # MIOpen find-db + lock files
     restart: unless-stopped
+    init: true  # tini as PID 1; supervisor.py and uvicorn are ordinary children it can signal
     ulimits:
       nofile:
         soft: 65536

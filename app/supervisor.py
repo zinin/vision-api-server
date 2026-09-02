@@ -41,10 +41,13 @@ import dataclasses
 import http.client
 import logging
 import os
+import smtplib
 import socket
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from email.message import EmailMessage
 
 log = logging.getLogger("supervisor")
 
@@ -52,6 +55,7 @@ EXIT_RESTART = 3
 EXIT_USAGE = 2
 EXIT_EXEC_FAILED = 127
 EXIT_SUPERVISOR_BUG = 1
+SMTP_TIMEOUT = 10.0
 
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
@@ -185,3 +189,77 @@ class HealthProbe:
             log.warning("health probe raised %s: %s", type(exc).__name__, exc)
             self.last_failure = f"{type(exc).__name__}: {exc}"
         return False
+
+
+@dataclasses.dataclass(frozen=True)
+class RestartEvent:
+    """What the supervisor is about to do and why; handed to the notifier."""
+
+    reason: str        # "health_failed" | "startup_timeout" | "child_exited"
+    uptime: float      # seconds since the child was started
+    failures: int      # consecutive failed probes at the time of the event
+    exit_code: int     # code the supervisor is about to exit with
+    detail: str = ""   # last probe failure, or the child's exit code
+
+
+class NullNotifier:
+    """Used when ``WATCHDOG_MAIL_TO`` is empty."""
+
+    def notify(self, event: RestartEvent) -> None:
+        return None
+
+
+class SmtpNotifier:
+    """Mails one message per watchdog action. Never raises: a broken relay must not delay a restart."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        child_cmd: list[str],
+        hostname: str | None = None,
+        smtp_factory=smtplib.SMTP,
+    ) -> None:
+        self._cfg = config
+        self._child_cmd = list(child_cmd)
+        self._hostname = hostname or socket.gethostname()
+        self._smtp_factory = smtp_factory
+
+    def notify(self, event: RestartEvent) -> None:
+        try:
+            message = self.build_message(event)
+            with self._smtp_factory(self._cfg.smtp_host, self._cfg.smtp_port, timeout=SMTP_TIMEOUT) as smtp:
+                if self._cfg.smtp_starttls:
+                    smtp.starttls()
+                if self._cfg.smtp_user:
+                    smtp.login(self._cfg.smtp_user, self._cfg.smtp_password)
+                smtp.send_message(message)
+            log.info("notification sent to %s", self._cfg.mail_to)
+        except Exception as exc:  # noqa: BLE001 - notification must never block the restart
+            log.warning("notification failed: %s: %s", type(exc).__name__, exc)
+
+    def build_message(self, event: RestartEvent) -> EmailMessage:
+        message = EmailMessage()
+        message["Subject"] = f"[vision-api] restart: {event.reason} ({self._hostname})"
+        message["From"] = self._cfg.mail_from or f"vision-api@{self._hostname}"
+        message["To"] = self._cfg.mail_to
+        message.set_content(
+            "\n".join(
+                [
+                    f"The vision-api supervisor is restarting the container on {self._hostname}.",
+                    "",
+                    f"reason: {event.reason}",
+                    f"time (UTC): {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}",
+                    f"uptime: {event.uptime:.0f}s",
+                    f"consecutive failures: {event.failures}",
+                    f"detail: {event.detail or '-'}",
+                    f"health URL: {self._cfg.health_url}",
+                    f"child command: {' '.join(self._child_cmd)}",
+                    f"exit code: {event.exit_code}",
+                    "",
+                    "Check `docker logs <container>` for the supervisor lines and",
+                    "`docker inspect -f '{{.RestartCount}}' <container>` for the restart count.",
+                ]
+            )
+        )
+        return message

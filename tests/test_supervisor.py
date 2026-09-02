@@ -9,6 +9,7 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -223,3 +224,94 @@ def test_probe_success_clears_last_failure(http_base_url):
     probe.url = f"{http_base_url}/ok"
     assert probe() is True
     assert probe.last_failure == ""
+
+
+# --------------------------------------------------------------------------- Notifier
+
+
+class RecordingNotifier:
+    def __init__(self):
+        self.events: list[sv.RestartEvent] = []
+
+    def notify(self, event):
+        self.events.append(event)
+
+
+class RaisingNotifier:
+    def notify(self, event):
+        raise RuntimeError("smtp exploded")
+
+
+def _event(**overrides) -> sv.RestartEvent:
+    base = dict(reason="health_failed", uptime=3600.0, failures=3, exit_code=3, detail="timed out after 10s")
+    base.update(overrides)
+    return sv.RestartEvent(**base)
+
+
+def _smtp_double():
+    """A MagicMock usable as ``with factory(...) as smtp:``."""
+    smtp = MagicMock()
+    smtp.__enter__.return_value = smtp
+    factory = MagicMock(return_value=smtp)
+    return factory, smtp
+
+
+def test_null_notifier_does_nothing():
+    assert sv.NullNotifier().notify(_event()) is None  # must not raise, returns nothing
+
+
+def test_smtp_notifier_sends_message_with_starttls_and_login():
+    cfg = make_config(
+        health_url="http://127.0.0.1:8000/health",
+        mail_to="ops@example.com", mail_from="bot@example.com",
+        smtp_host="smtp.example.com", smtp_port=2525,
+        smtp_user="user", smtp_password="secret", smtp_starttls=True,
+    )
+    factory, smtp = _smtp_double()
+    notifier = sv.SmtpNotifier(cfg, child_cmd=["uvicorn", "main:app"], hostname="c0ffee", smtp_factory=factory)
+
+    notifier.notify(_event())
+
+    factory.assert_called_once_with("smtp.example.com", 2525, timeout=sv.SMTP_TIMEOUT)
+    smtp.starttls.assert_called_once_with()
+    smtp.login.assert_called_once_with("user", "secret")
+    smtp.send_message.assert_called_once()
+    message = smtp.send_message.call_args.args[0]
+    assert message["Subject"] == "[vision-api] restart: health_failed (c0ffee)"
+    assert message["From"] == "bot@example.com"
+    assert message["To"] == "ops@example.com"
+    body = message.get_content()
+    assert "reason: health_failed" in body
+    assert "uptime: 3600s" in body
+    assert "consecutive failures: 3" in body
+    assert "detail: timed out after 10s" in body
+    assert "health URL: http://127.0.0.1:8000/health" in body
+    assert "child command: uvicorn main:app" in body
+    assert "exit code: 3" in body
+    assert "RestartCount" in body
+
+
+def test_smtp_notifier_skips_starttls_and_login_when_not_configured():
+    cfg = make_config(mail_to="ops@example.com", smtp_host="smtp.example.com", smtp_starttls=False)
+    factory, smtp = _smtp_double()
+    notifier = sv.SmtpNotifier(cfg, child_cmd=["uvicorn"], hostname="c0ffee", smtp_factory=factory)
+
+    notifier.notify(_event(reason="startup_timeout"))
+
+    smtp.starttls.assert_not_called()
+    smtp.login.assert_not_called()
+    message = smtp.send_message.call_args.args[0]
+    assert message["Subject"] == "[vision-api] restart: startup_timeout (c0ffee)"
+    assert message["From"] == "vision-api@c0ffee"  # mail_from empty -> hostname fallback
+
+
+def test_smtp_notifier_swallows_errors_and_logs_warning(caplog):
+    cfg = make_config(mail_to="ops@example.com", smtp_host="smtp.example.com")
+    factory = MagicMock(side_effect=OSError("connection refused"))
+    notifier = sv.SmtpNotifier(cfg, child_cmd=["uvicorn"], hostname="c0ffee", smtp_factory=factory)
+
+    with caplog.at_level(logging.WARNING, logger="supervisor"):
+        notifier.notify(_event())  # must not raise
+
+    assert "notification failed" in caplog.text
+    assert "connection refused" in caplog.text

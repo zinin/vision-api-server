@@ -87,7 +87,8 @@ WATCHDOG_FAILURES=3             # consecutive failures -> SIGKILL uvicorn, exit 
 WATCHDOG_STARTUP_TIMEOUT=600    # wait for the first healthy answer (cold MIOpen compile)
 WATCHDOG_MIN_UPTIME=600         # a hang before this uptime counts as flapping
 WATCHDOG_FLAP_COOLDOWN=900      # delay before restarting a flapping container; 0 = off
-WATCHDOG_STOP_GRACE=8           # seconds after SIGTERM before SIGKILL
+WATCHDOG_STOP_GRACE=8           # seconds after SIGTERM before SIGKILL; keep below the compose
+                                # stop_grace_period (10 s). The wait confirming the SIGKILL is >= 1 s
 WATCHDOG_MAIL_TO=               # non-empty enables e-mail on every watchdog restart
 WATCHDOG_MAIL_FROM=vision-api@<hostname>
 WATCHDOG_SMTP_HOST=             # required for mail; port 587 + STARTTLS by default

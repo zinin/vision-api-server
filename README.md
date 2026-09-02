@@ -150,7 +150,7 @@ All settings via environment variables or `.env` file:
 | `WATCHDOG_FAILURES` | `3` | Consecutive failures before the container is restarted |
 | `WATCHDOG_STARTUP_TIMEOUT` | `600` | Seconds to wait for the first healthy answer |
 | `WATCHDOG_MIN_UPTIME` / `WATCHDOG_FLAP_COOLDOWN` | `600` / `900` | A hang earlier than `MIN_UPTIME` after start waits `FLAP_COOLDOWN` before restarting; `0` disables |
-| `WATCHDOG_STOP_GRACE` | `8` | Seconds after SIGTERM before SIGKILL |
+| `WATCHDOG_STOP_GRACE` | `8` | Seconds after SIGTERM before SIGKILL; keep below the compose `stop_grace_period` (10 s). The wait that confirms the SIGKILL is at least 1 s |
 | `WATCHDOG_MAIL_TO` | (empty) | E-mail every watchdog restart; needs `WATCHDOG_SMTP_HOST` (`_PORT` 587, `_USER`, `_PASSWORD`, `_STARTTLS` true, `WATCHDOG_MAIL_FROM`) |
 
 ## Architecture

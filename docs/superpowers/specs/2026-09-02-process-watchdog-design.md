@@ -142,12 +142,18 @@ States:
 
 1. Log one line: reason, uptime (monotonic seconds since the child was started), consecutive
    failures.
-2. Notify (see Notifications). Bounded by the SMTP timeout; failure is logged and ignored.
-3. `os.killpg(child.pid, SIGKILL)` (`ProcessLookupError` means the child already died — fine).
-4. `child.wait(timeout=WATCHDOG_STOP_GRACE)`. If the child is still alive after that (a process
-   stuck in an uninterruptible kernel state cannot die yet), log `ERROR` and continue; the
-   container exit tears down the PID namespace anyway.
-5. Log the outcome and return exit code **3**.
+2. `os.killpg(child.pid, SIGKILL)` (`ProcessLookupError` means the child already died — fine).
+3. `child.wait(timeout=max(WATCHDOG_STOP_GRACE, 1 s))` and log the outcome. The one-second floor
+   exists because `wait(timeout=0)` is a single `WNOHANG` poll: a child killed microseconds
+   earlier is not reaped yet and would be reported as surviving. If the child really is still
+   alive after the wait (a process stuck in an uninterruptible kernel state cannot die yet), log
+   `ERROR` and continue — but the container will not come back on its own either:
+   `zap_pid_ns_processes` blocks the exiting PID-namespace init until every task in the namespace
+   has gone, so the container stays in "exiting" and only a host reboot recovers it.
+4. Notify (see Notifications). Bounded by the SMTP timeout; failure is logged and ignored. The
+   kill deliberately comes first: a stalled relay would otherwise hold SIGKILL back by up to
+   several SMTP timeouts, and the mail still leaves before the process exits.
+5. Log the exit line and return exit code **3**.
 
 Exit code 3 is reserved for watchdog-initiated restarts so it is distinguishable in `docker
 events` / `docker inspect` from crashes. `restart: unless-stopped` restarts the container
@@ -182,7 +188,9 @@ Known limitation: the supervisor cannot count "N restarts per hour" or send a "r
 
 **E-mail (optional).** Enabled when `WATCHDOG_MAIL_TO` is non-empty. `SmtpNotifier` builds an
 `email.message.EmailMessage` and sends it with `smtplib.SMTP(host, port, timeout=10)`, STARTTLS
-when `WATCHDOG_SMTP_STARTTLS` is true, `login()` when a user is set. Every exception is caught and
+with a verifying `ssl.create_default_context()` when `WATCHDOG_SMTP_STARTTLS` is true (a relay
+whose certificate does not match its hostname therefore fails), `login()` when a user is set. The
+mail goes out after the kill, not before it (Reaction step 4). Every exception is caught and
 logged at `WARNING`; the restart proceeds regardless. If `WATCHDOG_MAIL_TO` is set but
 `WATCHDOG_SMTP_HOST` is empty, `Config` logs `ERROR mail disabled: WATCHDOG_SMTP_HOST is required`
 and uses `NullNotifier`.
@@ -205,14 +213,15 @@ The signal handlers only call `Supervisor.request_stop(signum)`; tests call the 
 - **Child exits on its own:** exit with the child's normalized code (negative `returncode` −N
   becomes 128 + N, e.g. 137 for SIGKILL). Notify `child_exited` unless a shutdown was requested.
 - **Usage error** (no child command in argv): print usage to stderr, exit 2.
-- **`execvp` failure** when disabled: log, exit 127.
+- **Child command cannot be started**: `execvp` failure when disabled, or a spawn that raises
+  `OSError` under supervision (missing binary): log, exit 127, no mail.
 - **Supervisor bug** (unexpected exception): traceback logged, child killed, exit 1.
 
 ### Configuration
 
 All variables are read from the environment by the supervisor itself (not via `config.py`). A
-malformed value logs `ERROR` and falls back to the default: a typo in a watchdog setting must not
-keep the service from starting. Booleans accept `true/1/yes/on` and `false/0/no/off`,
+malformed value — including a non-finite one such as `nan` or `inf` — logs `ERROR` and falls back
+to the default: a typo in a watchdog setting must not keep the service from starting. Booleans accept `true/1/yes/on` and `false/0/no/off`,
 case-insensitive; an empty value means "unset". The supervisor's own log level follows the
 application's `LOG_LEVEL` when it is a valid level name, else `INFO`.
 
@@ -226,7 +235,7 @@ application's `LOG_LEVEL` when it is a valid level name, else `INFO`.
 | `WATCHDOG_STARTUP_TIMEOUT` | `600` | seconds to wait for the first 200, > 0 |
 | `WATCHDOG_MIN_UPTIME` | `600` | uptime below which a hang is "flapping", ≥ 0 |
 | `WATCHDOG_FLAP_COOLDOWN` | `900` | delay before killing a flapping container, ≥ 0; 0 disables |
-| `WATCHDOG_STOP_GRACE` | `8` | seconds after SIGTERM (or SIGKILL) before giving up waiting, ≥ 0 |
+| `WATCHDOG_STOP_GRACE` | `8` | seconds after SIGTERM before SIGKILL, ≥ 0; keep below the compose `stop_grace_period` (10 s). The wait that confirms the SIGKILL is at least 1 s |
 | `WATCHDOG_MAIL_TO` | empty | recipient; non-empty enables mail |
 | `WATCHDOG_MAIL_FROM` | `vision-api@<hostname>` | sender |
 | `WATCHDOG_SMTP_HOST` | empty | required when mail is enabled |
@@ -344,7 +353,7 @@ deliverable.
   `miopen-cache` volume makes later starts fast.
 - **In-memory jobs are lost on restart.** Already true for any restart; the job API is documented
   as in-memory.
-- **Uninterruptible child.** Covered in Reaction step 4.
+- **Uninterruptible child.** Covered in Reaction step 3.
 
 ## Resolved questions from the incident notes
 

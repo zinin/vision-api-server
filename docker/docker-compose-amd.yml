@@ -22,6 +22,7 @@ services:
       - miopen-cache:/root/.cache/miopen    # compiled GPU kernels (MIOpen fd-leak containment)
       - miopen-config:/root/.config/miopen  # MIOpen find-db + lock files
     restart: unless-stopped
+    init: true  # tini as PID 1; supervisor.py and uvicorn are ordinary children it can signal
     ulimits:
       nofile:
         soft: 65536

@@ -36,4 +36,6 @@ RUN mkdir -p /models
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# supervisor.py runs uvicorn as a child and restarts the container when /health hangs
+# (see app/supervisor.py). WATCHDOG_ENABLED=false makes it exec uvicorn directly.
+CMD ["python3", "supervisor.py", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -16,6 +16,17 @@ services:
       VIDEO_HW_ACCEL: ${VIDEO_HW_ACCEL:-nvidia}
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      # Process watchdog (supervisor.py): restarts the container when /health hangs.
+      # Empty value = built-in default; see .env.example.
+      WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-}
+      WATCHDOG_STARTUP_TIMEOUT: ${WATCHDOG_STARTUP_TIMEOUT:-}
+      WATCHDOG_FLAP_COOLDOWN: ${WATCHDOG_FLAP_COOLDOWN:-}
+      WATCHDOG_MAIL_TO: ${WATCHDOG_MAIL_TO:-}
+      WATCHDOG_MAIL_FROM: ${WATCHDOG_MAIL_FROM:-}
+      WATCHDOG_SMTP_HOST: ${WATCHDOG_SMTP_HOST:-}
+      WATCHDOG_SMTP_PORT: ${WATCHDOG_SMTP_PORT:-}
+      WATCHDOG_SMTP_USER: ${WATCHDOG_SMTP_USER:-}
+      WATCHDOG_SMTP_PASSWORD: ${WATCHDOG_SMTP_PASSWORD:-}
     deploy:
       resources:
         reservations:
@@ -25,6 +36,7 @@ services:
     volumes:
       - models:/models
     restart: unless-stopped
+    init: true  # tini as PID 1; supervisor.py and uvicorn are ordinary children it can signal
     ulimits:
       nofile:
         soft: 65536

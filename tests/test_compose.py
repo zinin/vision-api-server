@@ -5,6 +5,11 @@ Guards docker-compose files against refactors that would silently drop the
 (docs/superpowers/specs/2026-07-01-fd-leak-miopen-containment-design.md) was
 removed from the tree before the PR; it lives in the fix/upload-fd-leak
 branch history.
+
+Also guards the process-watchdog wiring (design doc
+docs/superpowers/specs/2026-09-02-process-watchdog-design.md, likewise removed before the PR; it
+lives in the feat/process-watchdog branch history): `init: true` in every compose file, the
+`WATCHDOG_*` pass-throughs in the deployment files, and the supervisor `CMD` in every Dockerfile.
 """
 from pathlib import Path
 
@@ -16,6 +21,22 @@ COMPOSE_FILES = sorted((REPO_ROOT / "docker").glob("docker-compose-*.yml")) + so
     (REPO_ROOT / "docker" / "deploy").glob("docker-compose-*.yml")
 )
 AMD_FILES = [p for p in COMPOSE_FILES if "amd" in p.name]
+DEPLOY_FILES = [p for p in COMPOSE_FILES if p.parent.name == "deploy"]
+DOCKERFILES = sorted((REPO_ROOT / "docker").glob("*/Dockerfile"))
+
+# Variables docker/deploy/*.yml must forward from .env into the container (see .env.example).
+WATCHDOG_PASSTHROUGH = (
+    "WATCHDOG_ENABLED",
+    "WATCHDOG_STARTUP_TIMEOUT",
+    "WATCHDOG_FLAP_COOLDOWN",
+    "WATCHDOG_MAIL_TO",
+    "WATCHDOG_MAIL_FROM",
+    "WATCHDOG_SMTP_HOST",
+    "WATCHDOG_SMTP_PORT",
+    "WATCHDOG_SMTP_USER",
+    "WATCHDOG_SMTP_PASSWORD",
+)
+SUPERVISOR_CMD = 'CMD ["python3", "supervisor.py", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]'
 
 
 def _service(data):
@@ -44,3 +65,29 @@ def test_amd_miopen_cache_volumes(path):
     assert "miopen-config:/root/.config/miopen" in mounts, path
     declared = data.get("volumes") or {}
     assert {"miopen-cache", "miopen-config"} <= set(declared), path
+
+
+def test_expected_deploy_and_dockerfile_counts():
+    assert len(DEPLOY_FILES) == 3, DEPLOY_FILES
+    assert len(DOCKERFILES) == 3, DOCKERFILES
+
+
+@pytest.mark.parametrize("path", COMPOSE_FILES, ids=lambda p: f"{p.parent.name}/{p.name}")
+def test_init_true_so_tini_is_pid1(path):
+    # supervisor.py kills uvicorn as a child; tini as PID 1 keeps signal and zombie semantics standard
+    svc = _service(yaml.safe_load(path.read_text()))
+    assert svc.get("init") is True, path
+
+
+@pytest.mark.parametrize("path", DEPLOY_FILES, ids=lambda p: p.name)
+def test_deploy_compose_forwards_watchdog_variables(path):
+    env = _service(yaml.safe_load(path.read_text()))["environment"]
+    assert isinstance(env, dict), f"{path}: environment must be a mapping"
+    for key in WATCHDOG_PASSTHROUGH:
+        assert env.get(key) == "${%s:-}" % key, (path, key)
+
+
+@pytest.mark.parametrize("path", DOCKERFILES, ids=lambda p: p.parent.name)
+def test_dockerfile_runs_supervisor(path):
+    cmd_lines = [line.strip() for line in path.read_text().splitlines() if line.strip().startswith("CMD")]
+    assert cmd_lines == [SUPERVISOR_CMD], path

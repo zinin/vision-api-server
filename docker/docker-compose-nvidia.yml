@@ -23,6 +23,7 @@ services:
             - driver: nvidia
               capabilities: [gpu]
     restart: unless-stopped
+    init: true  # tini as PID 1; supervisor.py and uvicorn are ordinary children it can signal
     ulimits:
       nofile:
         soft: 65536

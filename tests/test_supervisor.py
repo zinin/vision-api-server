@@ -1,0 +1,138 @@
+"""Tests for app/supervisor.py — the process watchdog.
+
+The state machine is exercised with a scripted probe, a fake child, and a fake clock, so no
+test sleeps or touches the network, except the HealthProbe tests (local http.server) and the
+two smoke tests at the end (a real child process).
+"""
+import logging
+import socket
+
+import pytest
+
+import supervisor as sv
+
+
+def make_config(**overrides) -> sv.Config:
+    """Fast defaults for state-machine tests; every value overridable."""
+    base = dict(
+        interval=1.0,
+        timeout=1.0,
+        failures=3,
+        startup_timeout=10.0,
+        min_uptime=100.0,
+        flap_cooldown=50.0,
+        stop_grace=2.0,
+    )
+    base.update(overrides)
+    return sv.Config(**base)
+
+
+# --------------------------------------------------------------------------- Config
+
+
+def test_config_defaults_when_environment_is_empty():
+    cfg = sv.Config.from_env({})
+    assert cfg.enabled is True
+    assert cfg.health_url == "http://127.0.0.1:8000/health"
+    assert cfg.interval == 30.0
+    assert cfg.timeout == 10.0
+    assert cfg.failures == 3
+    assert cfg.startup_timeout == 600.0
+    assert cfg.min_uptime == 600.0
+    assert cfg.flap_cooldown == 900.0
+    assert cfg.stop_grace == 8.0
+    assert cfg.mail_to == ""
+    assert cfg.mail_from == f"vision-api@{socket.gethostname()}"
+    assert cfg.smtp_host == ""
+    assert cfg.smtp_port == 587
+    assert cfg.smtp_user == ""
+    assert cfg.smtp_password == ""
+    assert cfg.smtp_starttls is True
+    assert cfg.mail_enabled is False
+
+
+def test_config_reads_every_variable():
+    env = {
+        "WATCHDOG_ENABLED": "false",
+        "WATCHDOG_HEALTH_URL": "http://127.0.0.1:9000/health",
+        "WATCHDOG_INTERVAL": "5",
+        "WATCHDOG_TIMEOUT": "2.5",
+        "WATCHDOG_FAILURES": "2",
+        "WATCHDOG_STARTUP_TIMEOUT": "120",
+        "WATCHDOG_MIN_UPTIME": "0",
+        "WATCHDOG_FLAP_COOLDOWN": "0",
+        "WATCHDOG_STOP_GRACE": "3",
+        "WATCHDOG_MAIL_TO": "ops@example.com",
+        "WATCHDOG_MAIL_FROM": "bot@example.com",
+        "WATCHDOG_SMTP_HOST": "smtp.example.com",
+        "WATCHDOG_SMTP_PORT": "2525",
+        "WATCHDOG_SMTP_USER": "user",
+        "WATCHDOG_SMTP_PASSWORD": "secret",
+        "WATCHDOG_SMTP_STARTTLS": "no",
+    }
+    cfg = sv.Config.from_env(env)
+    assert cfg.enabled is False
+    assert cfg.health_url == "http://127.0.0.1:9000/health"
+    assert cfg.interval == 5.0
+    assert cfg.timeout == 2.5
+    assert cfg.failures == 2
+    assert cfg.startup_timeout == 120.0
+    assert cfg.min_uptime == 0.0
+    assert cfg.flap_cooldown == 0.0
+    assert cfg.stop_grace == 3.0
+    assert cfg.mail_to == "ops@example.com"
+    assert cfg.mail_from == "bot@example.com"
+    assert cfg.smtp_host == "smtp.example.com"
+    assert cfg.smtp_port == 2525
+    assert cfg.smtp_user == "user"
+    assert cfg.smtp_password == "secret"
+    assert cfg.smtp_starttls is False
+    assert cfg.mail_enabled is True
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("WATCHDOG_INTERVAL", "abc"),
+        ("WATCHDOG_INTERVAL", "0"),
+        ("WATCHDOG_TIMEOUT", "-1"),
+        ("WATCHDOG_FAILURES", "0"),
+        ("WATCHDOG_FAILURES", "1.5"),
+        ("WATCHDOG_STARTUP_TIMEOUT", "0"),
+        ("WATCHDOG_MIN_UPTIME", "-5"),
+        ("WATCHDOG_FLAP_COOLDOWN", "x"),
+        ("WATCHDOG_STOP_GRACE", "-0.1"),
+        ("WATCHDOG_SMTP_PORT", "70000"),
+        ("WATCHDOG_SMTP_PORT", "0"),
+        ("WATCHDOG_ENABLED", "maybe"),
+        ("WATCHDOG_SMTP_STARTTLS", "2"),
+    ],
+)
+def test_config_invalid_value_logs_error_and_keeps_default(caplog, name, value):
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        cfg = sv.Config.from_env({name: value})
+    assert cfg == sv.Config.from_env({}), (name, value)
+    assert name in caplog.text
+    assert "using default" in caplog.text
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("true", True), ("1", True), ("yes", True), ("ON", True),
+    ("false", False), ("0", False), ("No", False), ("off", False),
+    ("", True), ("   ", True),
+])
+def test_config_boolean_spellings(raw, expected):
+    assert sv.Config.from_env({"WATCHDOG_ENABLED": raw}).enabled is expected
+
+
+def test_config_mail_requires_smtp_host(caplog):
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        cfg = sv.Config.from_env({"WATCHDOG_MAIL_TO": "ops@example.com"})
+    assert cfg.mail_to == "ops@example.com"
+    assert cfg.mail_enabled is False
+    assert "WATCHDOG_SMTP_HOST is required" in caplog.text
+
+
+def test_config_empty_values_mean_unset():
+    cfg = sv.Config.from_env({"WATCHDOG_INTERVAL": "", "WATCHDOG_HEALTH_URL": "  ", "WATCHDOG_MAIL_TO": ""})
+    assert cfg == sv.Config.from_env({})

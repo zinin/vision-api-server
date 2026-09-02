@@ -396,7 +396,8 @@ class Supervisor:
             if now >= self._next_probe_at:
                 self._next_probe_at = now + self._cfg.interval
                 reason = self._on_probe(self._probe(), now)
-                if reason is not None:
+                # A stop that arrived while the probe was in flight wins over the probe result.
+                if reason is not None and self._stop_signal is None:
                     return self._restart(reason)
 
     # -- state machine -------------------------------------------------------------------------

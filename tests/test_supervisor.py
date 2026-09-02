@@ -546,6 +546,22 @@ def test_second_signal_kills_group_immediately():
     assert clock.now == pytest.approx(1003.0)
 
 
+def test_stop_request_during_final_failing_probe_does_not_restart():
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    notifier = RecordingNotifier()
+    holder = {}
+    # The third failure would trigger a restart; SIGTERM lands while that probe is in flight.
+    probe = ScriptedProbe([True, False, False, False],
+                          hooks={4: lambda: holder["sup"].request_stop(signal.SIGTERM)})
+    sup = make_supervisor(make_config(min_uptime=0.0), child, probe, clock=clock, notifier=notifier)
+    holder["sup"] = sup
+    assert sup.run() == 0
+    assert child.group_killed is False
+    assert child.signals == [signal.SIGTERM]
+    assert notifier.events == []
+
+
 def test_raising_notifier_does_not_prevent_restart(caplog):
     clock = FakeClock()
     child = FakeChild(clock)

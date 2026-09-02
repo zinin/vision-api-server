@@ -14,6 +14,8 @@ services:
       - VIDEO_HW_ACCEL=cpu
       - YOLO_DEVICE=cpu
       - MODELS_DIR=/models
+      # Process watchdog (supervisor.py) kill switch: false runs uvicorn unsupervised; empty = default (true).
+      - WATCHDOG_ENABLED=${WATCHDOG_ENABLED:-}
     volumes:
       - models:/models
     restart: unless-stopped

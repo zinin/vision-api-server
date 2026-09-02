@@ -16,6 +16,8 @@ services:
       MODELS_DIR: /models
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+      # Process watchdog (supervisor.py) kill switch: false runs uvicorn unsupervised; empty = default (true).
+      WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-}
     deploy:
       resources:
         reservations:

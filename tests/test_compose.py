@@ -8,8 +8,9 @@ branch history.
 
 Also guards the process-watchdog wiring (design doc
 docs/superpowers/specs/2026-09-02-process-watchdog-design.md, likewise removed before the PR; it
-lives in the feat/process-watchdog branch history): `init: true` in every compose file, the
-`WATCHDOG_*` pass-throughs in the deployment files, and the supervisor `CMD` in every Dockerfile.
+lives in the feat/process-watchdog branch history): `init: true` and the `WATCHDOG_ENABLED`
+kill switch in every compose file, the full `WATCHDOG_*` pass-through in the deployment files, and
+the supervisor `CMD` in every Dockerfile.
 """
 from pathlib import Path
 
@@ -85,6 +86,21 @@ def test_deploy_compose_forwards_watchdog_variables(path):
     assert isinstance(env, dict), f"{path}: environment must be a mapping"
     for key in WATCHDOG_PASSTHROUGH:
         assert env.get(key) == "${%s:-}" % key, (path, key)
+
+
+def _environment(svc):
+    """The service environment as a mapping; the CPU dev file uses the list form (KEY=VALUE)."""
+    env = svc.get("environment") or {}
+    if isinstance(env, list):
+        env = dict(item.partition("=")[::2] for item in env)
+    return env
+
+
+@pytest.mark.parametrize("path", COMPOSE_FILES, ids=lambda p: f"{p.parent.name}/{p.name}")
+def test_every_compose_forwards_the_watchdog_kill_switch(path):
+    # WATCHDOG_ENABLED=false in .env is the documented emergency lever for the dev and deploy workflows alike
+    env = _environment(_service(yaml.safe_load(path.read_text())))
+    assert env.get("WATCHDOG_ENABLED") == "${WATCHDOG_ENABLED:-}", path
 
 
 @pytest.mark.parametrize("path", DOCKERFILES, ids=lambda p: p.parent.name)

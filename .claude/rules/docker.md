@@ -58,6 +58,10 @@ YOLO_DEVICE=cuda:0
 
 # TTL for cached models (seconds)
 YOLO_MODEL_TTL=900
+
+# Process watchdog: false runs uvicorn without supervisor.py. The only WATCHDOG_* variable
+# the dev compose files forward; the deploy files forward more (see deploy/.env.example)
+WATCHDOG_ENABLED=true
 ```
 
 **Device options:**
@@ -106,7 +110,7 @@ healthcheck:
   start_period: 40s
 ```
 
-The healthcheck only *reports* status; plain Docker never acts on `unhealthy`. Inside the container `supervisor.py` polls the same endpoint with the same thresholds and, after 3 consecutive failures (or no healthy answer within 600 s of start), SIGKILLs uvicorn's process group and exits with code 3, so `restart: unless-stopped` recreates the container. All compose files set `init: true` (tini as PID 1). Tune with `WATCHDOG_*` (see `deploy/.env.example`); `WATCHDOG_ENABLED=false` disables the watchdog. On the host, `docker inspect -f '{{.RestartCount}}' <container>` counts watchdog restarts.
+The healthcheck only *reports* status; plain Docker never acts on `unhealthy`. Inside the container `supervisor.py` polls the same endpoint with the same thresholds and, after 3 consecutive failures (or no healthy answer within 600 s of start), SIGKILLs uvicorn's process group and exits with code 3, so `restart: unless-stopped` recreates the container. All compose files set `init: true` (tini as PID 1). `WATCHDOG_ENABLED=false` in `.env` disables the watchdog with every compose file; the other `WATCHDOG_*` knobs are forwarded by the deploy files only (see `deploy/.env.example`). On the host, `docker inspect -f '{{.RestartCount}}' <container>` counts watchdog restarts.
 
 ### Verifying the watchdog
 

@@ -17,6 +17,8 @@ services:
       # MIOPEN_FIND_MODE: FAST
       YOLO_DEVICE: 'cuda:0'
       MODELS_DIR: /models
+      # Process watchdog (supervisor.py) kill switch: false runs uvicorn unsupervised; empty = default (true).
+      WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-}
     volumes:
       - models:/models
       - miopen-cache:/root/.cache/miopen    # compiled GPU kernels (MIOpen fd-leak containment)

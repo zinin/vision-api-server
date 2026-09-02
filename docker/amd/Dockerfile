@@ -1,9 +1,12 @@
 # Pinned deliberately. rocm/pytorch:latest moved on to ROCm 7.14 / torch 2.13, whose runtime
 # spawns an AsyncEventsLoop thread that busy-spins a whole CPU core forever once a GPU context
-# exists -- an idle, perfectly healthy service burns 100% of a core. Reproduce without the app:
-#   python3 -c "import torch; torch.zeros(1).cuda()"   # ~0% on this tag, ~100% on ROCm 7.14
+# exists -- an idle, perfectly healthy service burns 100% of a core. Reproduce without the app;
+# the sleep is required, since the spin is only measurable while the process stays alive and idle:
+#   docker run --rm --device /dev/kfd --device /dev/dri --group-add video <image> \
+#     python3 -c "import torch; torch.zeros(1).cuda(); import time; time.sleep(60)"
+#   docker stats --no-stream    # ~0% on this tag, ~100% on ROCm 7.14
 # No HSA_* knob switches it off (INTERRUPT, MWAITX, ASYNCEVENTS_THREAD_PRIORITY,
-# GPU_MAX_HW_QUEUES, SDMA were all tested). Run that one-liner before moving this tag.
+# GPU_MAX_HW_QUEUES, SDMA were all tested). Run that check before moving this tag.
 FROM rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0
 
 ENV DEBIAN_FRONTEND=noninteractive

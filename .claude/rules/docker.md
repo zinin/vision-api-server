@@ -225,7 +225,9 @@ And set `YOLO_MODELS` to use `/models/` path prefix.
   ROCm runtime is busy-spinning; `py-spy dump` will not show it, because it is not a Python thread
 - Confirm with `perf record -F 199 -g -t <tid> -- sleep 5` -- `rocr::core::Runtime::AsyncEventsLoop`
   in `libhsa-runtime64.so` means the base image drifted off the pinned ROCm tag. Check with
-  `python3 -c "import torch; torch.zeros(1).cuda()"` in the image: an idle process must stay near 0%
+  `python3 -c "import torch; torch.zeros(1).cuda(); import time; time.sleep(60)"` in the image and watch
+  it with `docker stats --no-stream`: an idle process must stay near 0%. The sleep is required -- without
+  it Python exits immediately and there is no idle process whose CPU usage can be measured
 - `/proc/<tid>/syscall` reading `running` plus a frozen `voluntary_ctxt_switches` distinguishes a
   busy-spin from ordinary blocking work
 

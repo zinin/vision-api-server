@@ -91,7 +91,7 @@ All Dockerfiles follow the same pattern:
 4. Install `requirements.txt`
 5. Copy `app/*.py` to `/app`
 6. Expose port 8000
-7. Run uvicorn
+7. Run `supervisor.py`, which runs uvicorn as a child and restarts the container when `/health` hangs (see Health Check)
 
 ## Health Check
 
@@ -105,6 +105,8 @@ healthcheck:
   retries: 3
   start_period: 40s
 ```
+
+The healthcheck only *reports* status; plain Docker never acts on `unhealthy`. Inside the container `supervisor.py` polls the same endpoint with the same thresholds and, after 3 consecutive failures (or no healthy answer within 600 s of start), SIGKILLs uvicorn's process group and exits with code 3, so `restart: unless-stopped` recreates the container. All compose files set `init: true` (tini as PID 1). Tune with `WATCHDOG_*` (see `deploy/.env.example`); `WATCHDOG_ENABLED=false` disables the watchdog. On the host, `docker inspect -f '{{.RestartCount}}' <container>` counts watchdog restarts.
 
 ## GPU Requirements
 
@@ -181,3 +183,9 @@ And set `YOLO_MODELS` to use `/models/` path prefix.
 **Slow startup:**
 - First run downloads models (~25MB for yolo26s.pt)
 - Use volume mount for model persistence
+
+**Container restarts every few minutes:**
+- The watchdog is firing: `docker logs <container> 2>&1 | grep supervisor:` shows `restarting the container: reason=...`
+- `reason=startup_timeout` — model preload took longer than `WATCHDOG_STARTUP_TIMEOUT` (600 s); raise it or warm the MIOpen cache volume
+- `reason=health_failed` shortly after start — the GPU is probably hung: check `rocm-smi` / `nvidia-smi` and `dmesg`; reboot the host if the GPU never comes back
+- Emergency: `WATCHDOG_ENABLED=false` in `.env` and `docker compose up -d`

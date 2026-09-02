@@ -145,6 +145,13 @@ All settings via environment variables or `.env` file:
 | `VIDEO_CRF` | `18` | Quality: 0=lossless, 18=near-lossless, 23=default |
 | `VIDEO_HW_ACCEL` | `auto` | `auto` / `nvidia` / `amd` / `cpu` |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | AMD VAAPI render device |
+| `WATCHDOG_ENABLED` | `true` | Process watchdog; `false` runs uvicorn without it |
+| `WATCHDOG_INTERVAL` / `WATCHDOG_TIMEOUT` | `30` / `10` | `/health` probe period and HTTP timeout (seconds) |
+| `WATCHDOG_FAILURES` | `3` | Consecutive failures before the container is restarted |
+| `WATCHDOG_STARTUP_TIMEOUT` | `600` | Seconds to wait for the first healthy answer |
+| `WATCHDOG_MIN_UPTIME` / `WATCHDOG_FLAP_COOLDOWN` | `600` / `900` | A hang earlier than `MIN_UPTIME` after start waits `FLAP_COOLDOWN` before restarting; `0` disables |
+| `WATCHDOG_STOP_GRACE` | `8` | Seconds after SIGTERM before SIGKILL |
+| `WATCHDOG_MAIL_TO` | (empty) | E-mail every watchdog restart; needs `WATCHDOG_SMTP_HOST` (`_PORT` 587, `_USER`, `_PASSWORD`, `_STARTTLS` true, `WATCHDOG_MAIL_FROM`) |
 
 ## Architecture
 
@@ -174,6 +181,7 @@ flowchart TB
 - **Two-tier model cache** — preloaded models (configured at startup, never evicted) + cached models (loaded on demand, TTL-based eviction)
 - **Video annotation pipeline** — async job API with single background worker; YOLO every Nth frame with "hold mode" (reuse last detections for intermediate frames)
 - **Smart frame extraction** — FFmpeg scene-change detection with configurable threshold and minimum interval between frames
+- **Process watchdog** — `supervisor.py` runs uvicorn as a child and polls `/health` from outside the Python process; a GPU hang that freezes the interpreter (GIL held) ends in a SIGKILL and a container restart instead of an indefinite outage
 
 ## Limits
 
@@ -200,7 +208,8 @@ app/
 ├── inference_utils.py   # Async inference via ThreadPoolExecutor
 ├── image_utils.py       # Image validation and decoding
 ├── visualization.py     # Bounding box rendering
-└── dependencies.py      # FastAPI dependency injection
+├── dependencies.py      # FastAPI dependency injection
+└── supervisor.py        # Process watchdog: container command, restarts on hung /health
 
 docker/
 ├── nvidia/              # NVIDIA GPU Dockerfile + compose

@@ -46,6 +46,7 @@ import signal
 import smtplib
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -493,3 +494,55 @@ class Supervisor:
             self._notifier.notify(event)
         except Exception as exc:  # noqa: BLE001 - a broken notifier must not stop the restart
             log.warning("notifier raised %s: %s", type(exc).__name__, exc)
+
+
+def _configure_logging(level_name: str | None) -> None:
+    """Stderr, prefixed ``supervisor:``; level from ``LOG_LEVEL`` when valid, else INFO."""
+    level = logging.INFO
+    if level_name:
+        candidate = logging.getLevelName(level_name.strip().upper())
+        if isinstance(candidate, int):
+            level = candidate
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=level,
+        format="%(asctime)s supervisor: %(levelname)s %(message)s",
+    )
+
+
+def main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    env = os.environ if environ is None else environ
+    if not args:
+        print("usage: supervisor.py <command> [args...]", file=sys.stderr)
+        return EXIT_USAGE
+    _configure_logging(env.get("LOG_LEVEL"))
+    cfg = Config.from_env(env)
+    if not cfg.enabled:
+        log.warning("WATCHDOG_ENABLED=false: running %s without supervision", args[0])
+        try:
+            os.execvp(args[0], args)
+        except OSError as exc:
+            log.error("execvp %s failed: %s", args[0], exc)
+        return EXIT_EXEC_FAILED  # execvp only comes back on failure
+    probe = HealthProbe(cfg.health_url, cfg.timeout)
+    notifier = SmtpNotifier(cfg, child_cmd=args) if cfg.mail_enabled else NullNotifier()
+    supervisor = Supervisor(cfg, args, probe=probe, notifier=notifier)
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, lambda received, _frame: supervisor.request_stop(received))
+    log.info(
+        "watchdog armed: url=%s interval=%gs timeout=%gs failures=%d startup_timeout=%gs "
+        "min_uptime=%gs flap_cooldown=%gs stop_grace=%gs mail=%s",
+        cfg.health_url, cfg.interval, cfg.timeout, cfg.failures, cfg.startup_timeout,
+        cfg.min_uptime, cfg.flap_cooldown, cfg.stop_grace, cfg.mail_to or "off",
+    )
+    try:
+        return supervisor.run()
+    except Exception:  # noqa: BLE001 - last resort: never leave an orphaned child behind
+        log.exception("supervisor crashed; killing the child")
+        supervisor.kill_child()
+        return EXIT_SUPERVISOR_BUG
+
+
+if __name__ == "__main__":
+    sys.exit(main())

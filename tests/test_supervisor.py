@@ -5,8 +5,10 @@ test sleeps or touches the network, except the HealthProbe tests (local http.ser
 two smoke tests at the end (a real child process).
 """
 import logging
+import os
 import signal
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -661,3 +663,76 @@ def test_long_uptime_is_not_flapping():
     sup = make_supervisor(make_config(min_uptime=100.0, flap_cooldown=50.0), child, probe, clock=clock)
     assert sup.run() == 3
     assert clock.now == pytest.approx(1203.0)  # failures at t+201..203, no cooldown
+
+
+# --------------------------------------------------------------------------- main()
+
+
+def test_main_without_command_prints_usage(capsys):
+    assert sv.main([], {}) == sv.EXIT_USAGE == 2
+    assert "usage: supervisor.py <command>" in capsys.readouterr().err
+
+
+def test_main_disabled_execs_child_without_supervision(monkeypatch, caplog):
+    calls = []
+    monkeypatch.setattr(sv.os, "execvp", lambda file, args: calls.append((file, args)))
+    with caplog.at_level(logging.WARNING, logger="supervisor"):
+        code = sv.main(["uvicorn", "main:app"], {"WATCHDOG_ENABLED": "false"})
+    assert calls == [("uvicorn", ["uvicorn", "main:app"])]
+    assert code == sv.EXIT_EXEC_FAILED == 127  # execvp only returns on failure
+    assert "WATCHDOG_ENABLED=false" in caplog.text
+
+
+def test_main_disabled_reports_execvp_failure(monkeypatch, caplog):
+    def failing_execvp(file, args):
+        raise FileNotFoundError(f"no such file: {file}")
+
+    monkeypatch.setattr(sv.os, "execvp", failing_execvp)
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        code = sv.main(["nonexistent-command"], {"WATCHDOG_ENABLED": "0"})
+    assert code == 127
+    assert "execvp nonexistent-command failed" in caplog.text
+
+
+def test_configure_logging_honours_log_level(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(sv.logging, "basicConfig", lambda **kwargs: captured.update(kwargs))
+    sv._configure_logging("debug")
+    assert captured["level"] == logging.DEBUG
+    sv._configure_logging("NOT_A_LEVEL")
+    assert captured["level"] == logging.INFO
+    sv._configure_logging(None)
+    assert captured["level"] == logging.INFO
+    assert captured["format"] == "%(asctime)s supervisor: %(levelname)s %(message)s"
+
+
+# --------------------------------------------------------------------------- smoke: a real child
+
+_STUBBORN_CHILD = [sys.executable, "-c",
+                   "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals and process groups")
+def test_smoke_hung_child_is_killed_and_exit_code_is_3():
+    cfg = make_config(interval=0.1, timeout=0.1, failures=2, startup_timeout=0.5,
+                      min_uptime=0.0, flap_cooldown=0.0, stop_grace=2.0)
+    sup = sv.Supervisor(cfg, _STUBBORN_CHILD, probe=lambda: False, notifier=sv.NullNotifier(), tick=0.05)
+    started = time.monotonic()
+    code = sup.run()
+    assert code == 3
+    assert time.monotonic() - started < 10
+    with pytest.raises(ProcessLookupError):
+        os.kill(sup.child_pid, 0)  # reaped: the pid is gone
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals and process groups")
+def test_smoke_stop_request_escalates_to_sigkill():
+    cfg = make_config(interval=0.1, timeout=0.1, stop_grace=0.5)
+    sup = sv.Supervisor(cfg, _STUBBORN_CHILD, probe=lambda: True, notifier=sv.NullNotifier(), tick=0.05)
+    threading.Timer(0.3, lambda: sup.request_stop(signal.SIGTERM)).start()
+    started = time.monotonic()
+    code = sup.run()
+    assert code == 137  # SIGTERM ignored -> SIGKILL after 0.5s -> 128 + 9
+    assert time.monotonic() - started < 10
+    with pytest.raises(ProcessLookupError):
+        os.kill(sup.child_pid, 0)

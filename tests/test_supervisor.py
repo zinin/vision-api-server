@@ -594,3 +594,70 @@ def test_child_pid_property():
     assert sup.child_pid is None
     sup.run()
     assert sup.child_pid == 4242
+
+
+# --------------------------------------------------------------------------- Supervisor: anti-flapping
+
+
+def test_hang_at_short_uptime_waits_for_cooldown_before_restart(caplog):
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    notifier = RecordingNotifier()
+    probe = ScriptedProbe([True, False])  # healthy once, then failing forever
+    # cooldown 70 s (> 60 s) so the once-a-minute progress line fires exactly once
+    sup = make_supervisor(make_config(min_uptime=100.0, flap_cooldown=70.0), child, probe, clock=clock, notifier=notifier)
+    with caplog.at_level(logging.INFO, logger="supervisor"):
+        code = sup.run()
+    assert code == 3
+    assert child.group_killed is True
+    # 3 failures at t+4 -> cooldown until t+74 -> kill at the probe of t+74
+    assert clock.now == pytest.approx(1074.0)
+    assert [e.reason for e in notifier.events] == ["health_failed"]
+    assert notifier.events[0].uptime == pytest.approx(74.0)
+    assert "flapping suspected, restart delayed by 70s" in caplog.text
+    assert "still unhealthy; restart in 10s" in caplog.text  # logged once, at t+64
+
+
+def test_recovery_during_cooldown_cancels_restart(caplog):
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    notifier = RecordingNotifier()
+    results = [True, False, False, False] + [True] * 20
+    with caplog.at_level(logging.INFO, logger="supervisor"):
+        code, probe = run_until_stopped(make_config(min_uptime=100.0, flap_cooldown=50.0), clock, child, results,
+                                        stop_at_call=20, notifier=notifier)
+    assert code == 0
+    assert child.group_killed is False
+    assert notifier.events == []
+    assert "pending restart cancelled" in caplog.text
+
+
+def test_after_cancelled_cooldown_counter_starts_from_zero():
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    notifier = RecordingNotifier()
+    # hang -> pending -> recover -> two failures -> recover: never three in a row again
+    results = [True, False, False, False, True, False, False, True]
+    code, _ = run_until_stopped(make_config(min_uptime=100.0, flap_cooldown=50.0), clock, child, results,
+                                stop_at_call=12, notifier=notifier)
+    assert code == 0
+    assert child.group_killed is False
+    assert notifier.events == []
+
+
+def test_zero_cooldown_disables_flapping_rule():
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    probe = ScriptedProbe([True, False, False, False])
+    sup = make_supervisor(make_config(min_uptime=100.0, flap_cooldown=0.0), child, probe, clock=clock)
+    assert sup.run() == 3
+    assert clock.now == pytest.approx(1004.0)
+
+
+def test_long_uptime_is_not_flapping():
+    clock = FakeClock(start=1000.0)
+    child = FakeChild(clock)
+    probe = ScriptedProbe([True] * 200 + [False])
+    sup = make_supervisor(make_config(min_uptime=100.0, flap_cooldown=50.0), child, probe, clock=clock)
+    assert sup.run() == 3
+    assert clock.now == pytest.approx(1203.0)  # failures at t+201..203, no cooldown

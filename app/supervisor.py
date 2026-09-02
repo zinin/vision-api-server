@@ -59,6 +59,7 @@ EXIT_USAGE = 2
 EXIT_EXEC_FAILED = 127
 EXIT_SUPERVISOR_BUG = 1
 SMTP_TIMEOUT = 10.0
+PENDING_LOG_INTERVAL = 60.0  # seconds between "still unhealthy" lines while cooling down
 
 _TRUE = frozenset({"true", "1", "yes", "on"})
 _FALSE = frozenset({"false", "0", "no", "off"})
@@ -341,6 +342,8 @@ class Supervisor:
         self._failures = 0
         self._started_at = 0.0
         self._next_probe_at = 0.0
+        self._pending_deadline = 0.0
+        self._last_pending_log = 0.0
         self._stop_signal: int | None = None
         self._stop_deadline = 0.0
         self._group_killed = False
@@ -418,13 +421,35 @@ class Supervisor:
             )
             return "startup_timeout" if uptime >= cfg.startup_timeout else None
         if healthy:
+            if self._state is State.PENDING_RESTART:
+                log.info("healthy again; pending restart cancelled")
+            self._state = State.RUNNING
             self._failures = 0
             return None
         self._failures += 1
-        log.warning("health probe failed (%d/%d): %s", self._failures, cfg.failures, self._last_failure())
-        if self._failures < cfg.failures:
-            return None
-        return "health_failed"
+        if self._state is State.RUNNING:
+            log.warning("health probe failed (%d/%d): %s", self._failures, cfg.failures, self._last_failure())
+            if self._failures < cfg.failures:
+                return None
+            if cfg.flap_cooldown > 0 and uptime < cfg.min_uptime:
+                # A hang this soon after start smells like a dead GPU: restarting every two
+                # minutes would only churn. Wait, keep probing, and restart only if it stays hung.
+                self._state = State.PENDING_RESTART
+                self._pending_deadline = now + cfg.flap_cooldown
+                self._last_pending_log = now
+                log.warning(
+                    "hang detected only %.0fs after start (< %.0fs); flapping suspected, restart delayed by %.0fs",
+                    uptime, cfg.min_uptime, cfg.flap_cooldown,
+                )
+                return None
+            return "health_failed"
+        # PENDING_RESTART and still failing
+        if now >= self._pending_deadline:
+            return "health_failed"
+        if now - self._last_pending_log >= PENDING_LOG_INTERVAL:
+            self._last_pending_log = now
+            log.info("still unhealthy; restart in %.0fs", self._pending_deadline - now)
+        return None
 
     def _last_failure(self) -> str:
         return getattr(self._probe, "last_failure", "") or "probe failed"

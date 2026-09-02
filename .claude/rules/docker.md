@@ -120,8 +120,11 @@ docker run --rm --init alpine true     # must exit 0
 Fire drill on a running container — freeze uvicorn and watch the watchdog react:
 
 ```bash
-docker top <container> -o pid,cmd      # two lines contain "uvicorn main:app": the supervisor's
-                                       # own command line and the real uvicorn (the child)
+docker top <container> -o pid,cmd      # three lines contain "uvicorn main:app": docker-init (PID 1,
+                                       # whose command line also carries the whole child command),
+                                       # the supervisor ("python3 supervisor.py uvicorn main:app ..."),
+                                       # and the real uvicorn ("uvicorn main:app ..."). STOP the one
+                                       # whose command STARTS WITH "uvicorn" (the child).
 sudo kill -STOP <pid of the real uvicorn>
 # ~2 minutes later (3 probes x (30 s interval + 10 s timeout)):
 docker logs --since 5m <container> 2>&1 | grep supervisor:
@@ -130,8 +133,8 @@ docker inspect -f '{{.RestartCount}} {{.State.Health.Status}}' <container>
 #   1 healthy
 ```
 
-`kill -CONT <pid>` undoes a mistaken SIGSTOP. Stopping the supervisor process instead of the child
-does nothing visible: the probe keeps failing only if uvicorn itself is frozen.
+`kill -CONT <pid>` undoes a mistaken SIGSTOP. Stopping docker-init or the supervisor instead of the
+child does nothing visible: the probe keeps failing only if uvicorn itself is frozen.
 
 ## GPU Requirements
 

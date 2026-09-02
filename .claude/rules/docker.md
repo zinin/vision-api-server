@@ -121,14 +121,18 @@ without it the old container is removed and the new one fails to start.
 docker run --rm --init alpine true     # must exit 0
 ```
 
-Fire drill on a running container — freeze uvicorn and watch the watchdog react:
+Fire drill on a running container — freeze uvicorn and watch the watchdog react. Run it only once
+the container has been up for more than `WATCHDOG_MIN_UPTIME` (600 s): a hang detected earlier
+counts as flapping and the restart waits `WATCHDOG_FLAP_COOLDOWN` (900 s) first, so the drill
+would take 17 minutes instead of 2.
 
 ```bash
-docker top <container> -o pid,cmd      # three lines contain "uvicorn main:app": docker-init (PID 1,
+docker top <container> -o pid,ppid,cmd # three lines contain "uvicorn main:app": docker-init (PID 1,
                                        # whose command line also carries the whole child command),
                                        # the supervisor ("python3 supervisor.py uvicorn main:app ..."),
-                                       # and the real uvicorn ("uvicorn main:app ..."). STOP the one
-                                       # whose command STARTS WITH "uvicorn" (the child).
+                                       # and the real uvicorn ("/opt/venv/bin/python3
+                                       # /opt/venv/bin/uvicorn main:app ...", whose PPID is the
+                                       # supervisor). STOP the real uvicorn.
 sudo kill -STOP <pid of the real uvicorn>
 # ~2 minutes later (3 probes x (30 s interval + 10 s timeout)):
 docker logs --since 5m <container> 2>&1 | grep supervisor:

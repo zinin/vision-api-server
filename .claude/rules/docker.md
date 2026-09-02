@@ -82,7 +82,7 @@ Access API at `http://localhost:3001`
 | Variant | Base Image |
 |---------|------------|
 | NVIDIA | `nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04` |
-| AMD | `rocm/pytorch:latest` |
+| AMD | `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0` (pinned, see `docker/amd/Dockerfile`) |
 | CPU | `python:3.12-slim` |
 
 ## Dockerfile Overview
@@ -219,6 +219,15 @@ And set `YOLO_MODELS` to use `/models/` path prefix.
 **Slow startup:**
 - First run downloads models (~25MB for yolo26s.pt)
 - Use volume mount for model persistence
+
+**One CPU core pegged at 100% while the service is healthy:**
+- Not a hang -- the container answers `/health` and serves requests normally. A native thread of the
+  ROCm runtime is busy-spinning; `py-spy dump` will not show it, because it is not a Python thread
+- Confirm with `perf record -F 199 -g -t <tid> -- sleep 5` -- `rocr::core::Runtime::AsyncEventsLoop`
+  in `libhsa-runtime64.so` means the base image drifted off the pinned ROCm tag. Check with
+  `python3 -c "import torch; torch.zeros(1).cuda()"` in the image: an idle process must stay near 0%
+- `/proc/<tid>/syscall` reading `running` plus a frozen `voluntary_ctxt_switches` distinguishes a
+  busy-spin from ordinary blocking work
 
 **Container restarts every few minutes:**
 - The watchdog is firing: `docker logs <container> 2>&1 | grep supervisor:` shows `restarting the container: reason=...`

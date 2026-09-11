@@ -57,7 +57,7 @@ Video analysis on motion-selected frames.
 
 **Frame selection** (`app/frame_selection.py`):
 1. Frame 0 is always taken (`reason: first`).
-2. A grid frame every `max_gap` seconds (`reason: grid`). A grid longer than `max_frames` is thinned uniformly, keeping the first and the last grid frame.
+2. A grid frame every `max_gap` seconds, or `min_interval` if that is larger (`reason: grid`). A grid longer than `max_frames` is thinned uniformly, keeping the first and the last grid frame.
 3. Motion peaks fill the remaining budget: frames are ranked by `blob`, the area of the largest changed region between neighbouring frames (gray, 640 px wide) as a fraction of the frame, taken while above `motion_threshold` and at least `min_interval` from every selected frame (`reason: motion`). If the median `blob` over the segment exceeds 0.02 (rain, snow in IR), peaks are skipped and only the grid remains.
 
 `frame_number` is the frame index in the source video (0-based), `timestamp` its presentation time, `video_duration` comes from ffprobe. Unknown query parameters (e.g. the removed `scene_threshold`) are ignored.
@@ -90,12 +90,13 @@ Extract motion-selected key frames without detection.
   "success": true,
   "video_duration": 16.0,
   "video_resolution": [2880, 1620],
-  "frames_extracted": 4,
+  "frames_extracted": 5,
   "frames": [
     {"frame_number": 0,   "timestamp": 0.0,  "reason": "first",  "image_base64": "...", "width": 2880, "height": 1620},
     {"frame_number": 31,  "timestamp": 2.48, "reason": "motion", "image_base64": "...", "width": 2880, "height": 1620},
     {"frame_number": 50,  "timestamp": 4.0,  "reason": "grid",   "image_base64": "...", "width": 2880, "height": 1620},
-    {"frame_number": 100, "timestamp": 8.0,  "reason": "grid",   "image_base64": "...", "width": 2880, "height": 1620}
+    {"frame_number": 100, "timestamp": 8.0,  "reason": "grid",   "image_base64": "...", "width": 2880, "height": 1620},
+    {"frame_number": 150, "timestamp": 12.0, "reason": "grid",   "image_base64": "...", "width": 2880, "height": 1620}
   ],
   "processing_time_ms": 1700
 }

@@ -558,8 +558,8 @@ async def detect_objects_in_video(
 
     **Frame selection:**
     1. The first frame is always taken (`reason=first`).
-    2. A grid frame is taken every `max_gap` seconds (`reason=grid`); a grid longer
-       than `max_frames` is thinned uniformly.
+    2. A grid frame is taken every `max_gap` seconds, or `min_interval` if that is
+       larger (`reason=grid`); a grid longer than `max_frames` is thinned uniformly.
     3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
        never closer than `min_interval` to another selected frame (`reason=motion`).
        Segments where nearly every frame changes (rain or snow in IR) get the grid only.
@@ -736,8 +736,8 @@ async def extract_video_frames(
 
     **Frame selection:**
     1. The first frame is always taken (`reason=first`).
-    2. A grid frame is taken every `max_gap` seconds (`reason=grid`); a grid longer
-       than `max_frames` is thinned uniformly.
+    2. A grid frame is taken every `max_gap` seconds, or `min_interval` if that is
+       larger (`reason=grid`); a grid longer than `max_frames` is thinned uniformly.
     3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
        never closer than `min_interval` to another selected frame (`reason=motion`).
        Segments where nearly every frame changes (rain or snow in IR) get the grid only.

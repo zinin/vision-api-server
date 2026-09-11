@@ -4,12 +4,27 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
+
+from ffmpeg_pipe import _rc_to_str
+from frame_selection import (
+    SCAN_WIDTH,
+    STORM_MEDIAN_BLOB,
+    SelectedFrame,
+    SelectionParams,
+    blob_area,
+    median_blob,
+    prepare_frame,
+    select_frames,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +90,92 @@ def parse_showinfo(stderr: str) -> list[ShowinfoFrame]:
     return frames
 
 
+@dataclass
+class SelectionStats:
+    """What the selection did, for the INFO log line and the corpus check."""
+    total_frames: int
+    median_blob: float
+    storm: bool
+    counts: dict[str, int]      # selected frames per reason
+    pass1_seconds: float
+    pass2_seconds: float = 0.0
+
+
+@dataclass
+class ScanResult:
+    """Pass 1 output: the selection and everything needed to fetch the frames."""
+    selected: list[SelectedFrame]
+    pts: list[float]            # presentation time of every decoded frame
+    blob: list[float]           # metric of every decoded frame; blob[0] == 0.0
+    info: VideoInfo
+    stats: SelectionStats
+
+
+class _StderrCollector:
+    """Daemon thread draining an ffmpeg stderr pipe so it never blocks.
+    Keeps every showinfo frame and the last non-showinfo lines for error messages."""
+
+    def __init__(self, stream, keep_lines: int = 50):
+        self.frames: list[ShowinfoFrame] = []
+        self.tail: deque[str] = deque(maxlen=keep_lines)
+        self._stream = stream
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            for raw in self._stream:
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                parsed = parse_showinfo_line(line)
+                if parsed is not None:
+                    self.frames.append(parsed)
+                else:
+                    self.tail.append(line)
+        except (ValueError, OSError):
+            pass  # pipe closed
+
+    def join(self, timeout: float = 5.0) -> None:
+        self._thread.join(timeout)
+
+    def tail_text(self) -> str:
+        return "\n".join(self.tail)[-2000:]
+
+
+class _Deadline:
+    """Kills a subprocess when the wall-clock deadline passes, even if the
+    main thread is blocked in a pipe read."""
+
+    def __init__(self, process: subprocess.Popen, deadline: float):
+        self.expired = False
+        self._process = process
+        self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self) -> None:
+        self.expired = True
+        try:
+            self._process.kill()
+        except OSError:
+            pass  # already gone
+
+    def cancel(self) -> None:
+        self._timer.cancel()
+
+
+def _finish_process(process: subprocess.Popen, wait_seconds: float = 10.0) -> int | None:
+    """Wait for ffmpeg to exit; escalate to SIGKILL. None means it never exited."""
+    try:
+        return process.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            return process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            logger.warning("FFmpeg did not exit after SIGKILL; process may be leaked")
+            return None
+
+
 def _to_int(value) -> int:
     try:
         return int(value)
@@ -134,30 +235,31 @@ def parse_probe_output(data: dict) -> VideoInfo:
 
 
 class VideoFrameExtractor:
+    """Motion-based key frame extraction with ffmpeg.
+
+    Pass 1 (``scan``) decodes the whole video into gray 640 px frames through a
+    pipe, computes the ``blob`` motion metric per frame and applies
+    ``select_frames``. Pass 2 (``extract_frames``) decodes again and fetches
+    only the selected frames in full resolution.
     """
-    Extract key frames from video using ffmpeg with smart scene detection.
-    """
+
+    PROBE_TIMEOUT = 30.0
 
     def __init__(
             self,
-            scene_threshold: float = 0.05,
-            min_interval: float = 1.0,
             ffmpeg_path: str = "ffmpeg",
-            ffprobe_path: str = "ffprobe"
+            ffprobe_path: str = "ffprobe",
+            timeout: float = 300.0,
     ):
         """
-        Initialize extractor.
-
         Args:
-            scene_threshold: Scene change detection threshold (0.01-0.5, lower = more sensitive)
-            min_interval: Minimum interval between frames in seconds
             ffmpeg_path: Path to ffmpeg executable
             ffprobe_path: Path to ffprobe executable
+            timeout: Wall-clock deadline for one extraction (both passes), seconds
         """
-        self.scene_threshold = scene_threshold
-        self.min_interval = min_interval
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
+        self.timeout = timeout
 
         self._verify_ffmpeg()
 
@@ -179,8 +281,6 @@ class VideoFrameExtractor:
                 f"ffmpeg/ffprobe not found or not working. "
                 f"Please install ffmpeg: apt install ffmpeg"
             ) from e
-
-    PROBE_TIMEOUT = 30.0
 
     def get_video_info(self, video_path: str) -> VideoInfo:
         """Video metadata via ffprobe JSON.
@@ -213,6 +313,103 @@ class VideoFrameExtractor:
             raise ValueError(UNREADABLE_VIDEO_MESSAGE) from e
 
         return parse_probe_output(data)
+
+    def scan(self, video_path: str, params: SelectionParams) -> ScanResult:
+        """Pass 1 only: decode, measure motion, select. No full-resolution frames."""
+        return self._scan(video_path, params, deadline=time.monotonic() + self.timeout)
+
+    def _scan(self, video_path: str, params: SelectionParams, deadline: float) -> ScanResult:
+        info = self.get_video_info(video_path)
+        if info.width == 0 or info.height == 0:
+            raise ValueError(NO_VIDEO_STREAM_MESSAGE)
+        logger.info(
+            f"Video: duration={info.duration:.2f}s, resolution={info.width}x{info.height}, "
+            f"fps={info.fps:.2f}, codec={info.codec}"
+        )
+
+        started = time.monotonic()
+        pts, blob = self._scan_motion(video_path, info, deadline)
+        pass1_seconds = time.monotonic() - started
+
+        if info.duration <= 0.0:
+            logger.warning(f"ffprobe gave no duration; using the last frame pts {pts[-1]:.3f}s")
+            info.duration = pts[-1]
+        if any(later < earlier for earlier, later in zip(pts, pts[1:])):
+            logger.warning("Frame pts are not monotonic; selection uses them as reported")
+
+        selected = select_frames(pts, blob, params)
+        median_blob_value = median_blob(blob)
+        stats = SelectionStats(
+            total_frames=len(pts),
+            median_blob=median_blob_value,
+            storm=median_blob_value > STORM_MEDIAN_BLOB,
+            counts=dict(Counter(f.reason for f in selected)),
+            pass1_seconds=pass1_seconds,
+        )
+        return ScanResult(selected=selected, pts=pts, blob=blob, info=info, stats=stats)
+
+    def _scan_motion(
+            self, video_path: str, info: VideoInfo, deadline: float
+    ) -> tuple[list[float], list[float]]:
+        """Stream gray 640 px frames from ffmpeg and compute the blob metric per frame.
+
+        Memory is O(1) in the number of frames: only the previous prepared
+        frame and two lists of floats are kept.
+        """
+        scaled_h = int(round(info.height * SCAN_WIDTH / info.width / 2)) * 2
+        frame_size = SCAN_WIDTH * scaled_h
+        cmd = [
+            self.ffmpeg_path, "-hide_banner", "-nostats", "-loglevel", "info",
+            "-an", "-i", video_path,
+            "-vf", f"scale={SCAN_WIDTH}:{scaled_h},showinfo",
+            "-fps_mode", "passthrough",
+            "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+        ]
+        logger.debug(f"Motion scan command: {' '.join(cmd)}")
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        collector = _StderrCollector(process.stderr)
+        killer = _Deadline(process, deadline)
+        blob: list[float] = []
+        prev = None
+        try:
+            while True:
+                raw = process.stdout.read(frame_size)  # BufferedReader: short only at EOF
+                if len(raw) < frame_size:
+                    break
+                cur = prepare_frame(np.frombuffer(raw, np.uint8).reshape(scaled_h, SCAN_WIDTH))
+                blob.append(blob_area(prev, cur) if prev is not None else 0.0)
+                prev = cur
+        finally:
+            process.stdout.close()
+            returncode = _finish_process(process)
+            killer.cancel()
+            collector.join()
+
+        if killer.expired:
+            raise RuntimeError(
+                f"Frame extraction timed out after {self.timeout:.0f}s during the motion scan"
+            )
+        if not blob:
+            raise RuntimeError(
+                f"FFmpeg produced no frames ({_rc_to_str(returncode)}): {collector.tail_text()}"
+            )
+        if returncode != 0:
+            logger.warning(
+                f"FFmpeg motion scan exited with {_rc_to_str(returncode)} after {len(blob)} frames: "
+                f"{collector.tail_text()}"
+            )
+
+        pts = [f.pts for f in collector.frames]
+        if len(pts) != len(blob):
+            logger.warning(
+                f"Motion scan: {len(pts)} showinfo frames vs {len(blob)} decoded frames; "
+                f"truncating to the shorter"
+            )
+            n = min(len(pts), len(blob))
+            if n == 0:
+                raise RuntimeError("FFmpeg produced frames without showinfo timestamps")
+            pts, blob = pts[:n], blob[:n]
+        return pts, blob
 
     def extract_frames(
             self,

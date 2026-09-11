@@ -63,6 +63,11 @@ def _round_half_up(value: float) -> int:
     return int(value + 0.5)
 
 
+def median_blob(blob: Sequence[float]) -> float:
+    """Median metric of a segment, ignoring blob[0] (which is always 0). 0.0 for fewer than two frames."""
+    return float(median(blob[1:])) if len(blob) >= 2 else 0.0
+
+
 def select_frames(
     pts: Sequence[float],
     blob: Sequence[float],
@@ -102,7 +107,7 @@ def select_frames(
         return [base[p] for p in positions]
 
     # 4: storm — nearly every frame changes, the metric is blind, keep the grid only
-    if n >= 2 and median(blob[1:]) > STORM_MEDIAN_BLOB:
+    if median_blob(blob) > STORM_MEDIAN_BLOB:
         return base
 
     # 5: motion peaks, strongest first, ties by index, NMS by min_interval

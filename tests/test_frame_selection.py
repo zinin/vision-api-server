@@ -1,7 +1,15 @@
 import numpy as np
 import pytest
 
-from frame_selection import PTS_TOLERANCE, SelectedFrame, SelectionParams, blob_area, prepare_frame, select_frames
+from frame_selection import (
+    PTS_TOLERANCE,
+    SelectedFrame,
+    SelectionParams,
+    blob_area,
+    median_blob,
+    prepare_frame,
+    select_frames,
+)
 
 
 def _static(duration: float, fps: float = 10.0):
@@ -79,6 +87,18 @@ class TestStorm:
         blob[25] = 0.5
         selected = select_frames(pts, blob, SelectionParams())
         assert SelectedFrame(25, "motion") in selected
+
+
+class TestMedianBlob:
+    def test_empty_is_zero(self):
+        assert median_blob([]) == 0.0
+
+    def test_single_frame_is_zero(self):
+        assert median_blob([0.0]) == 0.0
+
+    def test_ignores_the_first_element(self):
+        # median of [0.01, 0.03, 0.05]; including blob[0] would give 0.02
+        assert median_blob([0.0, 0.01, 0.03, 0.05]) == pytest.approx(0.03)
 
 
 class TestPeaks:

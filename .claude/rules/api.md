@@ -40,7 +40,7 @@ Image object detection returning JSON.
 
 ### POST /detect/video
 
-Video analysis with smart frame extraction.
+Video analysis on motion-selected frames.
 
 **Parameters:**
 | Name | Type | Default | Range | Description |
@@ -49,15 +49,18 @@ Video analysis with smart frame extraction.
 | `conf` | float | 0.5 | 0.0-1.0 | Confidence threshold |
 | `imgsz` | int | 640 | 32-2016 | Inference image size |
 | `max_det` | int | 100 | 1-1000 | Max detections per frame |
-| `scene_threshold` | float | 0.05 | 0.01-0.5 | Scene change sensitivity |
-| `min_interval` | float | 1.0 | 0.1-30.0 | Min seconds between frames |
-| `max_frames` | int | 50 | 1-200 | Max frames to extract |
+| `max_gap` | float | 4.0 | 0.5-30.0 | Grid step, seconds |
+| `motion_threshold` | float | 0.001 | 0.0001-0.1 | Motion threshold, fraction of the frame |
+| `min_interval` | float | 1.0 | 0.1-30.0 | Min seconds between any two selected frames |
+| `max_frames` | int | 6 | 1-200 | Cap on selected frames |
 | `model` | string | null | — | Model name |
 
-**Frame Extraction Algorithm:**
-1. Always extracts first frame
-2. Extracts on scene changes (respecting min_interval)
-3. Extracts middle frame if only first was selected
+**Frame selection** (`app/frame_selection.py`):
+1. Frame 0 is always taken (`reason: first`).
+2. A grid frame every `max_gap` seconds (`reason: grid`). A grid longer than `max_frames` is thinned uniformly, keeping the first and the last grid frame.
+3. Motion peaks fill the remaining budget: frames are ranked by `blob`, the area of the largest changed region between neighbouring frames (gray, 640 px wide) as a fraction of the frame, taken while above `motion_threshold` and at least `min_interval` from every selected frame (`reason: motion`). If the median `blob` over the segment exceeds 0.02 (rain, snow in IR), peaks are skipped and only the grid remains.
+
+`frame_number` is the frame index in the source video (0-based), `timestamp` its presentation time, `video_duration` comes from ffprobe. Unknown query parameters (e.g. the removed `scene_threshold`) are ignored.
 
 ### POST /detect/visualize
 
@@ -77,28 +80,28 @@ Returns annotated image with bounding boxes.
 
 ### POST /extract/frames
 
-Extract key frames without detection.
+Extract motion-selected key frames without detection.
 
-**Parameters:** Same as `/detect/video` except detection params.
+**Parameters:** `file`, `max_gap`, `motion_threshold`, `min_interval`, `max_frames` as in `/detect/video`, plus `quality` (int, 85, 1-100, JPEG quality).
 
 **Response:**
 ```json
 {
-  "video_duration": 30.5,
-  "video_resolution": [1920, 1080],
-  "frames_extracted": 10,
+  "success": true,
+  "video_duration": 16.0,
+  "video_resolution": [2880, 1620],
+  "frames_extracted": 4,
   "frames": [
-    {
-      "frame_number": 0,
-      "timestamp": 0.0,
-      "image_base64": "...",
-      "width": 1920,
-      "height": 1080
-    }
+    {"frame_number": 0,   "timestamp": 0.0,  "reason": "first",  "image_base64": "...", "width": 2880, "height": 1620},
+    {"frame_number": 31,  "timestamp": 2.48, "reason": "motion", "image_base64": "...", "width": 2880, "height": 1620},
+    {"frame_number": 50,  "timestamp": 4.0,  "reason": "grid",   "image_base64": "...", "width": 2880, "height": 1620},
+    {"frame_number": 100, "timestamp": 8.0,  "reason": "grid",   "image_base64": "...", "width": 2880, "height": 1620}
   ],
-  "processing_time_ms": 500
+  "processing_time_ms": 1700
 }
 ```
+
+The list is never empty on success: frame 0 is always included. Cost: about 1.7 s for a 16-second 2880×1620 segment (two ffmpeg decodes: a 640 px gray scan and a fetch of the selected frames).
 
 ## Job Endpoints
 
@@ -240,6 +243,7 @@ All errors return JSON:
 **Status Codes:**
 - `400` — Invalid input (format, size, missing model)
 - `413` — File too large
+- `422` — Unreadable video, no video stream, or query parameter out of range
 - `500` — Internal error (model load, inference failure)
 
 ## Models

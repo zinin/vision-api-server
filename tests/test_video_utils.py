@@ -1,9 +1,11 @@
 import json
 import subprocess
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from frame_selection import SelectionParams
 from video_utils import (
     ShowinfoFrame,
     VideoFrameExtractor,
@@ -26,7 +28,7 @@ class TestExtractFramesNoVideoStream:
 
         extractor = VideoFrameExtractor()
         with pytest.raises(ValueError, match="no video stream"):
-            extractor.extract_frames("/tmp/fake.mp4")
+            extractor.extract_frames("/tmp/fake.mp4", SelectionParams())
 
     @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
     @patch.object(VideoFrameExtractor, "get_video_info")
@@ -37,7 +39,7 @@ class TestExtractFramesNoVideoStream:
 
         extractor = VideoFrameExtractor()
         with pytest.raises(ValueError, match="no video stream"):
-            extractor.extract_frames("/tmp/fake.mp4")
+            extractor.extract_frames("/tmp/fake.mp4", SelectionParams())
 
     @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
     @patch.object(VideoFrameExtractor, "get_video_info")
@@ -48,7 +50,20 @@ class TestExtractFramesNoVideoStream:
 
         extractor = VideoFrameExtractor()
         with pytest.raises(ValueError, match="no video stream"):
-            extractor.extract_frames("/tmp/fake.mp4")
+            extractor.extract_frames("/tmp/fake.mp4", SelectionParams())
+
+
+class TestScanMotionGuards:
+    @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
+    def test_degenerate_aspect_ratio_raises_runtime_error(self, mock_verify):
+        """Wider than 640:1 scales to zero height: fail before ffmpeg is started,
+        otherwise the read loop never sees EOF."""
+        info = VideoInfo(duration=1.0, width=1300, height=1, fps=10.0, codec="h264")
+
+        with pytest.raises(RuntimeError, match="zero-height"):
+            VideoFrameExtractor()._scan_motion(
+                "/tmp/fake.mp4", info, deadline=time.monotonic() + 1.0
+            )
 
 
 def _probe(stream: dict, fmt: dict | None = None) -> dict:

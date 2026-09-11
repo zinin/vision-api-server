@@ -1,12 +1,15 @@
 """Integration tests on synthetic lavfi clips. Skipped when ffmpeg/ffprobe are missing."""
+import asyncio
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from frame_selection import SelectionParams
-from video_utils import VideoFrameExtractor
+from video_utils import VideoFrameExtractor, extract_frames_from_video
 
 pytestmark = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
@@ -57,6 +60,26 @@ def storm_clip(clips_dir):
 @pytest.fixture(scope="module")
 def long_clip(clips_dir):
     return _make_clip(clips_dir / "long.mp4", LONG_SRC)
+
+
+@pytest.fixture(scope="module")
+def rotated_clip(clips_dir, static_clip):
+    """The static clip with a 90° display-rotation matrix, stream-copied."""
+    out = clips_dir / "rotated.mp4"
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-display_rotation", "90",
+         "-i", str(static_clip), "-c", "copy", str(out)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"ffmpeg lacks -display_rotation: {result.stderr.strip()[:200]}")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-select_streams", "v:0", str(out)],
+        capture_output=True, text=True, check=True,
+    )
+    if '"rotation"' not in probe.stdout:
+        pytest.skip("ffmpeg did not write rotation metadata")
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -132,3 +155,54 @@ class TestScan:
         extractor = VideoFrameExtractor(timeout=0.0)
         with pytest.raises(RuntimeError, match="timed out"):
             extractor.scan(str(long_clip), SelectionParams())
+
+
+class TestExtractFrames:
+    def test_static_clip_frames(self, extractor, static_clip):
+        result = extractor.extract_frames(str(static_clip), SelectionParams())
+
+        assert [f.frame_number for f in result.frames] == [0, 40, 80]
+        assert [f.reason for f in result.frames] == ["first", "grid", "grid"]
+        assert [round(f.timestamp, 1) for f in result.frames] == [0.0, 4.0, 8.0]
+        for frame in result.frames:
+            assert frame.image.shape == (240, 320, 3)
+            assert frame.image.dtype == np.uint8
+            assert frame.image.flags.writeable
+        assert result.info.duration == pytest.approx(10.0, abs=0.1)
+        assert result.stats.pass2_seconds > 0
+        assert result.stats.counts == {"first": 1, "grid": 2}
+
+    def test_frames_are_the_selected_ones(self, extractor, motion_clip):
+        """The white box is on screen only for t in [1, 3]: motion frames inside
+        that window contain white pixels, frame 0 is black."""
+        result = extractor.extract_frames(str(motion_clip), SelectionParams())
+
+        by_number = {f.frame_number: f for f in result.frames}
+        assert by_number[0].image.max() < 60
+        visible = [f for f in result.frames if f.reason == "motion" and 1.0 <= f.timestamp <= 3.0]
+        assert visible
+        assert all(f.image.max() > 200 for f in visible)
+
+    def test_rotated_clip_uses_display_dimensions(self, extractor, rotated_clip):
+        info = extractor.get_video_info(str(rotated_clip))
+        assert (info.width, info.height, info.rotation) == (240, 320, 90)
+
+        result = extractor.extract_frames(str(rotated_clip), SelectionParams())
+        assert result.frames[0].image.shape == (320, 240, 3)
+
+    def test_max_frames_two_keeps_first_and_last_grid_frame(self, extractor, static_clip):
+        result = extractor.extract_frames(str(static_clip), SelectionParams(max_frames=2))
+        assert [f.frame_number for f in result.frames] == [0, 80]
+
+    def test_async_wrapper_returns_result(self, static_clip):
+        result = asyncio.run(extract_frames_from_video(static_clip.read_bytes(), SelectionParams(max_frames=2)))
+        assert [f.frame_number for f in result.frames] == [0, 80]
+        assert result.info.duration == pytest.approx(10.0, abs=0.1)
+
+    def test_frame_grab_mismatch_raises_runtime_error(self, extractor, static_clip, monkeypatch):
+        """If the second pass returns frames that do not match the scan, fail loudly."""
+        scan = extractor.scan(str(static_clip), SelectionParams())
+        wrong_pts = [t + 0.5 for t in scan.pts]  # every pts off by half a second
+        with pytest.raises(RuntimeError, match="does not match"):
+            extractor._grab_frames(str(static_clip), scan.info, scan.selected, wrong_pts,
+                                   deadline=time.monotonic() + extractor.timeout)

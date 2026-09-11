@@ -8,14 +8,12 @@ import threading
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
-import cv2
 import numpy as np
 
 from ffmpeg_pipe import _rc_to_str
 from frame_selection import (
+    PTS_TOLERANCE,
     SCAN_WIDTH,
     STORM_MEDIAN_BLOB,
     SelectedFrame,
@@ -56,9 +54,10 @@ class VideoInfo:
 @dataclass
 class ExtractedFrame:
     """Extracted frame with metadata."""
-    image: np.ndarray
+    image: np.ndarray           # BGR uint8, H×W×3
     timestamp: float
     frame_number: int
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -107,6 +106,14 @@ class ScanResult:
     selected: list[SelectedFrame]
     pts: list[float]            # presentation time of every decoded frame
     blob: list[float]           # metric of every decoded frame; blob[0] == 0.0
+    info: VideoInfo
+    stats: SelectionStats
+
+
+@dataclass
+class ExtractionResult:
+    """Both passes done: the selected frames in full resolution plus metadata."""
+    frames: list[ExtractedFrame]
     info: VideoInfo
     stats: SelectionStats
 
@@ -357,6 +364,8 @@ class VideoFrameExtractor:
         frame and two lists of floats are kept.
         """
         scaled_h = int(round(info.height * SCAN_WIDTH / info.width / 2)) * 2
+        if scaled_h < 2:
+            raise RuntimeError(f"Video aspect ratio {info.width}x{info.height} scales to a zero-height frame")
         frame_size = SCAN_WIDTH * scaled_h
         cmd = [
             self.ffmpeg_path, "-hide_banner", "-nostats", "-loglevel", "info",
@@ -384,6 +393,7 @@ class VideoFrameExtractor:
             returncode = _finish_process(process)
             killer.cancel()
             collector.join()
+            process.stderr.close()
 
         if killer.expired:
             raise RuntimeError(
@@ -411,247 +421,125 @@ class VideoFrameExtractor:
             pts, blob = pts[:n], blob[:n]
         return pts, blob
 
-    def extract_frames(
-            self,
-            video_path: str,
-            output_dir: Optional[str] = None,
-            max_frames: int = 50
-    ) -> list[ExtractedFrame]:
-        """
-        Extract key frames from video using smart scene detection.
+    def extract_frames(self, video_path: str, params: SelectionParams) -> ExtractionResult:
+        """Both passes: select frames by motion, then fetch them in full resolution (BGR)."""
+        deadline = time.monotonic() + self.timeout
+        scan = self._scan(video_path, params, deadline)
 
-        Algorithm:
-        1. Always extract first frame
-        2. Extract frames on scene change (if min_interval passed)
-        3. Extract middle frame if only first frame was selected
+        started = time.monotonic()
+        frames = self._grab_frames(video_path, scan.info, scan.selected, scan.pts, deadline)
+        scan.stats.pass2_seconds = time.monotonic() - started
 
-        Args:
-            video_path: Path to video file
-            output_dir: Directory for temporary frames (uses tempdir if None)
-            max_frames: Maximum number of frames to extract
-
-        Returns:
-            List of ExtractedFrame objects
-        """
-        video_info = self.get_video_info(video_path)
-        mid_time = video_info.duration / 2
-
+        counts = scan.stats.counts
         logger.info(
-            f"Video: duration={video_info.duration:.2f}s, "
-            f"resolution={video_info.width}x{video_info.height}, "
-            f"mid_time={mid_time:.2f}s"
+            f"Frame selection: {len(frames)} frames (first {counts.get('first', 0)}, "
+            f"grid {counts.get('grid', 0)}, motion {counts.get('motion', 0)}) of {scan.stats.total_frames}, "
+            f"storm={scan.stats.storm}, median_blob={scan.stats.median_blob:.4f}, "
+            f"pass1={scan.stats.pass1_seconds:.2f}s, pass2={scan.stats.pass2_seconds:.2f}s"
         )
+        return ExtractionResult(frames=frames, info=scan.info, stats=scan.stats)
 
-        if video_info.width == 0 or video_info.height == 0:
-            raise ValueError(NO_VIDEO_STREAM_MESSAGE)
-
-        # Create temp directory if not provided
-        cleanup_dir = output_dir is None
-        if output_dir is None:
-            output_dir = tempfile.mkdtemp(prefix="yolo_video_")
-        else:
-            os.makedirs(output_dir, exist_ok=True)
-
-        try:
-            # Build ffmpeg filter for smart frame selection
-            # Conditions:
-            # 1. eq(n,0) - first frame (always)
-            # 2. gt(scene,T)*gte(t-prev_selected_t,I) - scene change + min interval
-            # 3. gte(t,MID)*eq(prev_selected_n,0) - middle if only 1st selected
-
-            select_filter = (
-                f"select='"
-                f"eq(n\\,0)+"
-                f"(gt(scene\\,{self.scene_threshold})*gte(t-prev_selected_t\\,{self.min_interval}))+"
-                f"(gte(t\\,{mid_time})*lte(prev_selected_n\\,1))"
-                f"'"
-            )
-
-            output_pattern = os.path.join(output_dir, "frame_%04d.jpg")
-
-            cmd = [
-                self.ffmpeg_path,
-                "-hide_banner",
-                "-loglevel", "info",
-                "-i", video_path,
-                "-vf", select_filter,
-                "-fps_mode", "vfr",
-                "-q:v", "2",
-                output_pattern
-            ]
-
-            logger.debug(f"FFmpeg command: {' '.join(cmd)}")
-
-            # Run ffmpeg
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 min timeout
-            )
-
-            if result.returncode != 0:
-                logger.warning(f"FFmpeg stderr: {result.stderr}")
-                # Try alternative method if smart select fails
-                return self._extract_frames_fallback(
-                    video_path, output_dir, video_info, max_frames
-                )
-
-            # Parse extracted timestamps from ffmpeg output
-            timestamps = self._parse_ffmpeg_timestamps(result.stderr)
-
-            # Load extracted frames
-            frames = self._load_frames(output_dir, timestamps, max_frames)
-
-            logger.info(f"Extracted {len(frames)} frames from video")
-
-            return frames
-
-        finally:
-            # Cleanup temp directory if we created it
-            if cleanup_dir and os.path.exists(output_dir):
-                import shutil
-                shutil.rmtree(output_dir, ignore_errors=True)
-
-    def _extract_frames_fallback(
+    def _grab_frames(
             self,
             video_path: str,
-            output_dir: str,
-            video_info: VideoInfo,
-            max_frames: int
+            info: VideoInfo,
+            selected: list[SelectedFrame],
+            pts: list[float],
+            deadline: float,
     ) -> list[ExtractedFrame]:
+        """Pass 2: decode again, let ``select`` pass only the chosen frames, read them as bgr24.
+
+        Output frames are matched to the selection by pts, never by position,
+        and every mismatch raises: silently returning frames with somebody
+        else's timestamps is worse than failing.
         """
-        Fallback frame extraction using fixed intervals.
-        Used when scene detection fails.
-        """
-        logger.info("Using fallback interval-based extraction")
-
-        # Calculate interval to get reasonable number of frames
-        target_frames = min(max_frames, 10)
-        interval = max(1.0, video_info.duration / target_frames)
-
-        output_pattern = os.path.join(output_dir, "frame_%04d.jpg")
-
+        if not selected:
+            raise RuntimeError("No frames selected")
+        expr = "+".join(f"eq(n\\,{f.index})" for f in selected)
         cmd = [
-            self.ffmpeg_path,
-            "-hide_banner",
-            "-loglevel", "warning",
-            "-i", video_path,
-            "-vf", f"fps=1/{interval}",
-            "-q:v", "2",
-            output_pattern
+            self.ffmpeg_path, "-hide_banner", "-nostats", "-loglevel", "info",
+            "-an", "-i", video_path,
+            "-vf", f"select='{expr}',showinfo",
+            "-fps_mode", "passthrough",
+            "-frames:v", str(len(selected)),
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
         ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-        if result.returncode != 0:
-            logger.error(f"ffmpeg fallback extraction failed for {video_path}")
-            logger.error(f"ffmpeg stderr: {result.stderr}")
+        logger.debug(f"Frame grab command: {' '.join(cmd)}")
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            out, err = process.communicate(timeout=max(1.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
             raise RuntimeError(
-                f"Failed to extract frames (fallback method): "
-                f"ffmpeg returned exit code {result.returncode}. "
-                f"stderr: {result.stderr.strip()}"
+                f"Frame extraction timed out after {self.timeout:.0f}s during the frame grab"
             )
 
-        # Generate timestamps based on interval
-        timestamps = {}
-        for i in range(target_frames):
-            timestamps[i + 1] = i * interval
+        stderr_text = err.decode("utf-8", errors="replace")
+        shown = parse_showinfo(stderr_text)
+        tail = "\n".join(line for line in stderr_text.splitlines() if "showinfo" not in line)[-2000:]
+        rc = _rc_to_str(process.returncode)
 
-        return self._load_frames(output_dir, timestamps, max_frames)
+        frame_size = info.width * info.height * 3
+        if len(out) % frame_size != 0:
+            raise RuntimeError(
+                f"FFmpeg frame grab returned {len(out)} bytes, not a multiple of the "
+                f"{info.width}x{info.height} frame size ({rc}): {tail}"
+            )
+        count = len(out) // frame_size
+        if count != len(selected) or len(shown) != count:
+            raise RuntimeError(
+                f"FFmpeg frame grab returned {count} frames and {len(shown)} showinfo lines, "
+                f"expected {len(selected)} ({rc}): {tail}"
+            )
+        if process.returncode != 0:
+            logger.warning(f"FFmpeg frame grab exited with {rc} but returned all frames: {tail}")
 
-    def _parse_ffmpeg_timestamps(self, stderr: str) -> dict[int, float]:
-        """
-        Parse frame timestamps from ffmpeg showinfo output.
-
-        Returns:
-            Dict mapping frame index (1-based) to timestamp
-        """
-        timestamps = {}
-
-        # Pattern for pts_time from showinfo filter
-        pts_pattern = re.compile(r'pts_time:(\d+\.?\d*)')
-
-        # Also try to find frame numbers
-        frame_pattern = re.compile(r'n:\s*(\d+)')
-
-        frame_idx = 0
-        for line in stderr.split('\n'):
-            pts_match = pts_pattern.search(line)
-            if pts_match:
-                frame_idx += 1
-                timestamps[frame_idx] = float(pts_match.group(1))
-
-        return timestamps
-
-    def _load_frames(
-            self,
-            output_dir: str,
-            timestamps: dict[int, float],
-            max_frames: int
-    ) -> list[ExtractedFrame]:
-        """Load extracted frame images from directory."""
-        frames = []
-
-        # Find all frame files
-        frame_files = sorted(Path(output_dir).glob("frame_*.jpg"))
-
-        for idx, frame_path in enumerate(frame_files[:max_frames], start=1):
-            image = cv2.imread(str(frame_path))
-
-            if image is None:
-                logger.warning(f"Failed to load frame: {frame_path}")
-                continue
-
-            # Convert BGR to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-            timestamp = timestamps.get(idx, idx - 1)  # fallback to index
-
+        frames: list[ExtractedFrame] = []
+        used: set[int] = set()
+        for k, frame_info in enumerate(shown):
+            if (frame_info.width, frame_info.height) != (info.width, info.height):
+                raise RuntimeError(
+                    f"FFmpeg frame size {frame_info.width}x{frame_info.height} differs from the "
+                    f"expected {info.width}x{info.height}"
+                )
+            match = next(
+                (f for f in selected
+                 if f.index not in used and abs(pts[f.index] - frame_info.pts) <= PTS_TOLERANCE),
+                None,
+            )
+            if match is None:
+                raise RuntimeError(
+                    f"Frame with pts {frame_info.pts:.3f} does not match any selected frame"
+                )
+            used.add(match.index)
+            image = (
+                np.frombuffer(out, dtype=np.uint8, count=frame_size, offset=k * frame_size)
+                .reshape(info.height, info.width, 3)
+                .copy()  # writable, independent of the pipe buffer
+            )
             frames.append(ExtractedFrame(
                 image=image,
-                timestamp=timestamp,
-                frame_number=idx
+                timestamp=pts[match.index],
+                frame_number=match.index,
+                reason=match.reason,
             ))
-
+        frames.sort(key=lambda f: f.frame_number)
         return frames
 
 
-async def extract_frames_from_video(
-        video_data: bytes,
-        scene_threshold: float = 0.05,
-        min_interval: float = 1.0,
-        max_frames: int = 50
-) -> list[ExtractedFrame]:
-    """
-    Async wrapper for video frame extraction.
-
-    Args:
-        video_data: Video file bytes
-        scene_threshold: Scene detection sensitivity
-        min_interval: Minimum seconds between frames
-        max_frames: Maximum frames to extract
-
-    Returns:
-        List of extracted frames
-    """
+async def extract_frames_from_video(video_data: bytes, params: SelectionParams) -> ExtractionResult:
+    """Async wrapper: write the upload to a temp file and run both passes in the default executor."""
     import asyncio
 
-    def _extract():
-        # Write video to temp file
+    def _extract() -> ExtractionResult:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             tmp.write(video_data)
             tmp_path = tmp.name
-
         try:
-            extractor = VideoFrameExtractor(
-                scene_threshold=scene_threshold,
-                min_interval=min_interval
-            )
-            return extractor.extract_frames(tmp_path, max_frames=max_frames)
+            return VideoFrameExtractor().extract_frames(tmp_path, params)
         finally:
             os.unlink(tmp_path)
 
-    # Run in thread pool to not block event loop
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _extract)

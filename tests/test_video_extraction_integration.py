@@ -1,14 +1,24 @@
 """Integration tests on synthetic lavfi clips. Skipped when ffmpeg/ffprobe are missing."""
 import asyncio
+import base64
 import shutil
 import subprocess
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
+import cv2
 import numpy as np
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from config import Settings, get_settings
+from dependencies import get_job_manager, get_model_manager
 from frame_selection import SelectionParams
+from job_manager import JobManager
+from main import app
 from video_utils import VideoFrameExtractor, extract_frames_from_video
 
 pytestmark = pytest.mark.skipif(
@@ -85,6 +95,41 @@ def rotated_clip(clips_dir, static_clip):
 @pytest.fixture(scope="module")
 def extractor():
     return VideoFrameExtractor()
+
+
+@asynccontextmanager
+async def _noop_lifespan(app: FastAPI):
+    yield
+
+
+@pytest.fixture
+def mock_model_manager():
+    mm = MagicMock()
+    entry = MagicMock()
+    entry.model.names = {0: "person"}
+    entry.model.predict.return_value = []  # no detections on synthetic clips
+    entry.model_name = "yolo26n.pt"
+    mm.get_model = AsyncMock(return_value=entry)
+    mm._preloaded = {"yolo26n.pt": entry}
+    mm._cached = {}
+    return mm
+
+
+@pytest.fixture
+def client(tmp_path, mock_model_manager):
+    app.router.lifespan_context = _noop_lifespan
+    app.dependency_overrides[get_settings] = lambda: Settings(yolo_models="{}", video_jobs_dir=str(tmp_path))
+    app.dependency_overrides[get_job_manager] = lambda: JobManager(
+        jobs_dir=str(tmp_path), ttl_seconds=3600, max_queued=10
+    )
+    app.dependency_overrides[get_model_manager] = lambda: mock_model_manager
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+def _upload(path: Path):
+    return {"file": (path.name, path.read_bytes(), "video/mp4")}
 
 
 def _by_reason(selected, reason):
@@ -206,3 +251,77 @@ class TestExtractFrames:
         with pytest.raises(RuntimeError, match="does not match"):
             extractor._grab_frames(str(static_clip), scan.info, scan.selected, wrong_pts,
                                    deadline=time.monotonic() + extractor.timeout)
+
+
+class TestExtractFramesEndpoint:
+    def test_static_clip_response(self, client, static_clip):
+        response = client.post("/extract/frames", files=_upload(static_clip))
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["success"] is True
+        assert body["video_duration"] == pytest.approx(10.0, abs=0.1)
+        assert body["video_resolution"] == [320, 240]
+        assert body["frames_extracted"] == 3
+        assert [f["frame_number"] for f in body["frames"]] == [0, 40, 80]
+        assert [f["reason"] for f in body["frames"]] == ["first", "grid", "grid"]
+        assert [round(f["timestamp"], 1) for f in body["frames"]] == [0.0, 4.0, 8.0]
+        first = body["frames"][0]
+        assert (first["width"], first["height"]) == (320, 240)
+        jpeg = base64.b64decode(first["image_base64"])
+        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        assert image.shape == (240, 320, 3)
+
+    def test_legacy_client_query_still_works(self, client, static_clip):
+        """frigate-analyzer sends scene_threshold until it is updated; FastAPI ignores it."""
+        response = client.post(
+            "/extract/frames?scene_threshold=0.05&min_interval=1.0&max_frames=50&quality=85",
+            files=_upload(static_clip),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["frames_extracted"] == 3
+
+    def test_max_frames_caps_output(self, client, static_clip):
+        response = client.post("/extract/frames?max_frames=2", files=_upload(static_clip))
+        assert response.status_code == 200, response.text
+        assert [f["frame_number"] for f in response.json()["frames"]] == [0, 80]
+
+    def test_max_gap_changes_grid(self, client, static_clip):
+        response = client.post("/extract/frames?max_gap=2", files=_upload(static_clip))
+        assert response.status_code == 200, response.text
+        assert [f["frame_number"] for f in response.json()["frames"]] == [0, 20, 40, 60, 80]
+
+    def test_out_of_range_max_gap_rejected(self, client, static_clip):
+        response = client.post("/extract/frames?max_gap=0.1", files=_upload(static_clip))
+        assert response.status_code == 422
+
+    def test_audio_only_file_rejected_with_422(self, client, tmp_path):
+        audio = tmp_path / "audio.mp4"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+             "-i", "sine=frequency=440:duration=1", "-c:a", "aac", str(audio)],
+            check=True, timeout=60,
+        )
+        response = client.post("/extract/frames", files=_upload(audio))
+        assert response.status_code == 422
+        assert "no video stream" in response.json()["detail"]
+
+
+class TestDetectVideoEndpoint:
+    def test_static_clip_response(self, client, static_clip):
+        response = client.post("/detect/video", files=_upload(static_clip))
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["frames_analyzed"] == 3
+        assert body["video_duration"] == pytest.approx(10.0, abs=0.1)
+        assert body["video_resolution"] == [320, 240]
+        assert [f["frame_number"] for f in body["frames"]] == [0, 40, 80]
+        assert [f["reason"] for f in body["frames"]] == ["first", "grid", "grid"]
+        assert body["total_detections"] == 0
+        assert body["model"] == "yolo26n.pt"
+
+    def test_selection_params_are_passed_through(self, client, static_clip):
+        response = client.post("/detect/video?max_gap=2&max_frames=3", files=_upload(static_clip))
+        assert response.status_code == 200, response.text
+        assert [f["frame_number"] for f in response.json()["frames"]] == [0, 40, 80]

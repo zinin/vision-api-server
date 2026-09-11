@@ -44,6 +44,7 @@ from visualization import encode_image_to_bytes
 from job_manager import JobManager, JobStatus
 from video_annotator import VideoAnnotator, AnnotationParams, JobCancelledError
 from detection_stabilizer import StabilizerConfig
+from frame_selection import SelectionParams
 from inference_utils import get_executor
 from video_utils import extract_frames_from_video, VideoFrameExtractor
 
@@ -345,7 +346,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
 app = FastAPI(
     title="YOLO Detection API",
     description="REST API for image and video analysis using Ultralytics YOLO",
-    version="2.3.0",
+    version="3.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -372,18 +373,22 @@ ImageSizeQuery = Annotated[int, Query(ge=32, le=2016, description="Image size fo
 MaxDetQuery = Annotated[int, Query(ge=1, le=1000, description="Maximum detections")]
 ModelQuery = Annotated[str | None, Query(description="Model name (e.g. yolo26s.pt). If not specified, uses default model.")]
 
-# Video-specific query parameters
-SceneThresholdQuery = Annotated[
+# Frame selection query parameters, shared by /detect/video and /extract/frames
+MaxGapQuery = Annotated[
     float,
-    Query(ge=0.01, le=0.5, description="Scene change threshold (lower = more sensitive)")
+    Query(ge=0.5, le=30.0, description="Grid step in seconds: a frame is always taken once this much time passed since the previous selected one")
+]
+MotionThresholdQuery = Annotated[
+    float,
+    Query(ge=0.0001, le=0.1, description="Motion threshold: area of the largest changed region as a fraction of the frame")
 ]
 MinIntervalQuery = Annotated[
     float,
-    Query(ge=0.1, le=30.0, description="Minimum interval between frames (seconds)")
+    Query(ge=0.1, le=30.0, description="Minimum interval between any two selected frames (seconds)")
 ]
 MaxFramesQuery = Annotated[
     int,
-    Query(ge=1, le=200, description="Maximum frames to extract")
+    Query(ge=1, le=200, description="Maximum number of frames to select")
 ]
 
 
@@ -396,7 +401,7 @@ async def root(
     preloaded = list(model_manager._preloaded.keys())
     return {
         "service": "YOLO Detection API",
-        "version": "2.2.0",
+        "version": "3.0.0",
         "preloaded_models": preloaded,
         "default_device": model_manager.default_device,
         "status": "ready",
@@ -540,29 +545,34 @@ async def detect_objects_in_video(
         conf: ConfidenceQuery = 0.5,
         imgsz: ImageSizeQuery = 640,
         max_det: MaxDetQuery = 100,
-        scene_threshold: SceneThresholdQuery = 0.05,
+        max_gap: MaxGapQuery = 4.0,
+        motion_threshold: MotionThresholdQuery = 0.001,
         min_interval: MinIntervalQuery = 1.0,
-        max_frames: MaxFramesQuery = 50,
+        max_frames: MaxFramesQuery = 6,
         model: ModelQuery = None,
         model_manager: ModelManager = Depends(get_model_manager),
         settings: Settings = Depends(get_settings)
 ):
     """
-    Analyze video using YOLO object detection with smart frame extraction.
+    Analyze video using YOLO object detection on motion-selected frames.
 
-    **Frame extraction algorithm:**
-    1. Always extracts the first frame
-    2. Extracts frames on scene changes (respecting min_interval)
-    3. Extracts middle frame if only first frame was selected
+    **Frame selection:**
+    1. The first frame is always taken (`reason=first`).
+    2. A grid frame is taken every `max_gap` seconds (`reason=grid`); a grid longer
+       than `max_frames` is thinned uniformly.
+    3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
+       never closer than `min_interval` to another selected frame (`reason=motion`).
+       Segments where nearly every frame changes (rain or snow in IR) get the grid only.
 
     **Parameters:**
     - **file**: Video file (MP4, AVI, MOV, MKV, WEBM, WMV, FLV)
     - **conf**: Confidence threshold (0.0 - 1.0)
     - **imgsz**: Image size for processing
     - **max_det**: Maximum detections per frame
-    - **scene_threshold**: Scene change sensitivity (0.01-0.5, lower = more frames)
-    - **min_interval**: Minimum seconds between extracted frames
-    - **max_frames**: Maximum total frames to analyze
+    - **max_gap**: Grid step in seconds (0.5-30)
+    - **motion_threshold**: Motion threshold as a fraction of the frame (0.0001-0.1)
+    - **min_interval**: Minimum seconds between selected frames (0.1-30)
+    - **max_frames**: Maximum frames to analyze (1-200)
     - **model**: Model name (e.g. yolo26s.pt). If not specified, uses first preloaded model.
     """
     start_time = time.perf_counter()
@@ -587,7 +597,8 @@ async def detect_objects_in_video(
 
     logger.info(
         f"Processing video: {file.filename}, conf={conf}, model={model_name}, "
-        f"scene_threshold={scene_threshold}, min_interval={min_interval}"
+        f"max_gap={max_gap}, motion_threshold={motion_threshold}, "
+        f"min_interval={min_interval}, max_frames={max_frames}"
     )
 
     # Read video data with size check
@@ -599,13 +610,14 @@ async def detect_objects_in_video(
         )
 
     # Extract frames
+    params = SelectionParams(
+        max_gap=max_gap,
+        motion_threshold=motion_threshold,
+        min_interval=min_interval,
+        max_frames=max_frames,
+    )
     try:
-        frames = await extract_frames_from_video(
-            video_data=video_data,
-            scene_threshold=scene_threshold,
-            min_interval=min_interval,
-            max_frames=max_frames
-        )
+        extraction = await extract_frames_from_video(video_data=video_data, params=params)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except RuntimeError as e:
@@ -614,12 +626,7 @@ async def detect_objects_in_video(
             detail=f"Failed to extract frames: {str(e)}"
         )
 
-    if not frames:
-        raise HTTPException(
-            status_code=400,
-            detail="No frames could be extracted from video"
-        )
-
+    frames = extraction.frames
     logger.info(f"Extracted {len(frames)} frames from video")
 
     # Get model (may load on-demand)
@@ -637,8 +644,7 @@ async def detect_objects_in_video(
     first_frame = frames[0]
     video_height, video_width = first_frame.image.shape[:2]
 
-    # Estimate video duration from last frame timestamp
-    video_duration = frames[-1].timestamp if frames else 0.0
+    video_duration = extraction.info.duration
 
     for frame in frames:
         # Run inference on frame
@@ -678,6 +684,7 @@ async def detect_objects_in_video(
         frame_results.append(FrameDetection(
             frame_number=frame.frame_number,
             timestamp=round(frame.timestamp, 3),
+            reason=frame.reason,
             detections=frame_detections,
             count=len(frame_detections)
         ))
@@ -716,26 +723,31 @@ async def detect_objects_in_video(
 @app.post("/extract/frames", response_model=FrameExtractionResponse, tags=["Frame Extraction"])
 async def extract_video_frames(
         file: UploadFile = File(..., description="Video file for frame extraction"),
-        scene_threshold: SceneThresholdQuery = 0.05,
+        max_gap: MaxGapQuery = 4.0,
+        motion_threshold: MotionThresholdQuery = 0.001,
         min_interval: MinIntervalQuery = 1.0,
-        max_frames: MaxFramesQuery = 50,
+        max_frames: MaxFramesQuery = 6,
         quality: Annotated[int, Query(ge=1, le=100, description="JPEG quality")] = 85
 ):
     """
-    Extract key frames from video without object detection.
+    Extract motion-selected key frames from video without object detection.
 
     Returns frames as base64-encoded JPEG images.
 
-    **Frame extraction algorithm:**
-    1. Always extracts the first frame
-    2. Extracts frames on scene changes (respecting min_interval)
-    3. Extracts middle frame if only first frame was selected
+    **Frame selection:**
+    1. The first frame is always taken (`reason=first`).
+    2. A grid frame is taken every `max_gap` seconds (`reason=grid`); a grid longer
+       than `max_frames` is thinned uniformly.
+    3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
+       never closer than `min_interval` to another selected frame (`reason=motion`).
+       Segments where nearly every frame changes (rain or snow in IR) get the grid only.
 
     **Parameters:**
     - **file**: Video file (MP4, AVI, MOV, MKV, WEBM, WMV, FLV)
-    - **scene_threshold**: Scene change sensitivity (0.01-0.5, lower = more frames)
-    - **min_interval**: Minimum seconds between extracted frames
-    - **max_frames**: Maximum total frames to extract
+    - **max_gap**: Grid step in seconds (0.5-30)
+    - **motion_threshold**: Motion threshold as a fraction of the frame (0.0001-0.1)
+    - **min_interval**: Minimum seconds between selected frames (0.1-30)
+    - **max_frames**: Maximum frames to extract (1-200)
     - **quality**: JPEG compression quality (1-100)
     """
     start_time = time.perf_counter()
@@ -750,8 +762,8 @@ async def extract_video_frames(
             )
 
     logger.info(
-        f"Extracting frames from video: {file.filename}, "
-        f"scene_threshold={scene_threshold}, min_interval={min_interval}"
+        f"Extracting frames from video: {file.filename}, max_gap={max_gap}, "
+        f"motion_threshold={motion_threshold}, min_interval={min_interval}, max_frames={max_frames}"
     )
 
     # Read video data with size check
@@ -763,13 +775,14 @@ async def extract_video_frames(
         )
 
     # Extract frames
+    params = SelectionParams(
+        max_gap=max_gap,
+        motion_threshold=motion_threshold,
+        min_interval=min_interval,
+        max_frames=max_frames,
+    )
     try:
-        frames = await extract_frames_from_video(
-            video_data=video_data,
-            scene_threshold=scene_threshold,
-            min_interval=min_interval,
-            max_frames=max_frames
-        )
+        extraction = await extract_frames_from_video(video_data=video_data, params=params)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except RuntimeError as e:
@@ -778,42 +791,29 @@ async def extract_video_frames(
             detail=f"Failed to extract frames: {str(e)}"
         )
 
-    if not frames:
-        raise HTTPException(
-            status_code=400,
-            detail="No frames could be extracted from video"
-        )
-
+    frames = extraction.frames
     logger.info(f"Extracted {len(frames)} frames from video")
 
     # Get video dimensions from first frame
-    first_frame = frames[0]
-    video_height, video_width = first_frame.image.shape[:2]
+    video_height, video_width = frames[0].image.shape[:2]
 
-    # Estimate video duration from last frame timestamp
-    video_duration = frames[-1].timestamp if frames else 0.0
-
-    # Convert frames to base64-encoded JPEG
+    # Convert frames to base64-encoded JPEG (frames are BGR, which is what cv2 expects)
     frame_results: list[ExtractedFrameData] = []
     for frame in frames:
-        # Convert RGB to BGR for cv2
-        bgr_image = cv2.cvtColor(frame.image, cv2.COLOR_RGB2BGR)
-
-        # Encode to JPEG
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
-        success, jpeg_data = cv2.imencode('.jpg', bgr_image, encode_params)
+        success, jpeg_data = cv2.imencode('.jpg', frame.image, encode_params)
 
         if not success:
             logger.warning(f"Failed to encode frame {frame.frame_number}")
             continue
 
-        # Convert to base64
         image_base64 = base64.b64encode(jpeg_data.tobytes()).decode('utf-8')
 
         height, width = frame.image.shape[:2]
         frame_results.append(ExtractedFrameData(
             frame_number=frame.frame_number,
             timestamp=round(frame.timestamp, 3),
+            reason=frame.reason,
             image_base64=image_base64,
             width=width,
             height=height
@@ -822,7 +822,7 @@ async def extract_video_frames(
     processing_time_ms = int((time.perf_counter() - start_time) * 1000)
 
     response = FrameExtractionResponse(
-        video_duration=round(video_duration, 3),
+        video_duration=round(extraction.info.duration, 3),
         video_resolution=(video_width, video_height),
         frames_extracted=len(frame_results),
         frames=frame_results,

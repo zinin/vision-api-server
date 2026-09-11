@@ -55,12 +55,13 @@ class TestExtractFramesNoVideoStream:
 
 class TestScanMotionGuards:
     @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
-    def test_degenerate_aspect_ratio_raises_runtime_error(self, mock_verify):
+    def test_degenerate_aspect_ratio_raises_value_error(self, mock_verify):
         """Wider than 640:1 scales to zero height: fail before ffmpeg is started,
-        otherwise the read loop never sees EOF."""
+        otherwise the read loop never sees EOF. A property of the file, so ValueError
+        (422), not RuntimeError (500) — the client must not retry it."""
         info = VideoInfo(duration=1.0, width=1300, height=1, fps=10.0, codec="h264")
 
-        with pytest.raises(RuntimeError, match="zero-height"):
+        with pytest.raises(ValueError, match="zero-height"):
             VideoFrameExtractor()._scan_motion(
                 "/tmp/fake.mp4", info, deadline=time.monotonic() + 1.0
             )

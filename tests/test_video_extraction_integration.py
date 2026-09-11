@@ -36,6 +36,8 @@ MOTION_SRC = (
 # per-pixel random noise on every frame: a storm for the metric
 STORM_SRC = "nullsrc=s=320x240:r=10:d=10,geq=lum='random(1)*255':cb=128:cr=128"
 LONG_SRC = "color=c=gray:s=320x240:r=10:d=40"
+# a saturated colour: the only clip that tells BGR from RGB
+RED_SRC = "color=c=red:s=320x240:r=10:d=3"
 
 
 def _make_clip(path: Path, source: str) -> Path:
@@ -70,6 +72,11 @@ def storm_clip(clips_dir):
 @pytest.fixture(scope="module")
 def long_clip(clips_dir):
     return _make_clip(clips_dir / "long.mp4", LONG_SRC)
+
+
+@pytest.fixture(scope="module")
+def red_clip(clips_dir):
+    return _make_clip(clips_dir / "red.mp4", RED_SRC)
 
 
 @pytest.fixture(scope="module")
@@ -235,6 +242,16 @@ class TestExtractFrames:
         result = extractor.extract_frames(str(rotated_clip), SelectionParams())
         assert result.frames[0].image.shape == (320, 240, 3)
 
+    def test_red_clip_frame_is_bgr(self, extractor, red_clip):
+        """Channel order is BGR the whole way out, as YOLO and cv2 expect. A red
+        source frame must come back blue-low/red-high; a cvtColor(RGB2BGR) anywhere
+        in the path would swap them, and every other fixture clip is gray."""
+        result = extractor.extract_frames(str(red_clip), SelectionParams())
+
+        blue, green, red = (int(v) for v in result.frames[0].image[120, 160])
+        assert red > 180, (blue, green, red)
+        assert blue < 60 and green < 60, (blue, green, red)
+
     def test_max_frames_two_keeps_first_and_last_grid_frame(self, extractor, static_clip):
         result = extractor.extract_frames(str(static_clip), SelectionParams(max_frames=2))
         assert [f.frame_number for f in result.frames] == [0, 80]
@@ -271,6 +288,18 @@ class TestExtractFramesEndpoint:
         jpeg = base64.b64decode(first["image_base64"])
         image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
         assert image.shape == (240, 320, 3)
+
+    def test_red_clip_jpeg_is_bgr(self, client, red_clip):
+        """The same channel-order pin through the endpoint: cv2.imencode is handed
+        BGR, so decoding the returned JPEG must give back a red pixel."""
+        response = client.post("/extract/frames", files=_upload(red_clip))
+
+        assert response.status_code == 200, response.text
+        jpeg = base64.b64decode(response.json()["frames"][0]["image_base64"])
+        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        blue, green, red = (int(v) for v in image[120, 160])
+        assert red > 180, (blue, green, red)
+        assert blue < 60 and green < 60, (blue, green, red)
 
     def test_legacy_client_query_still_works(self, client, static_clip):
         """frigate-analyzer sends scene_threshold until it is updated; FastAPI ignores it."""

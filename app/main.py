@@ -376,7 +376,7 @@ ModelQuery = Annotated[str | None, Query(description="Model name (e.g. yolo26s.p
 # Frame selection query parameters, shared by /detect/video and /extract/frames
 MaxGapQuery = Annotated[
     float,
-    Query(ge=0.5, le=30.0, description="Grid step in seconds: a frame is always taken once this much time passed since the previous selected one")
+    Query(ge=0.5, le=30.0, description="Grid step in seconds, or min_interval if that is larger: a grid frame is taken once this much time passed since the previous grid frame (motion peaks do not shift the grid)")
 ]
 MotionThresholdQuery = Annotated[
     float,
@@ -559,7 +559,9 @@ async def detect_objects_in_video(
     **Frame selection:**
     1. The first frame is always taken (`reason=first`).
     2. A grid frame is taken every `max_gap` seconds, or `min_interval` if that is
-       larger (`reason=grid`); a grid longer than `max_frames` is thinned uniformly.
+       larger (`reason=grid`); a grid longer than `max_frames` is thinned uniformly
+       and step 3 is skipped, so a video longer than about `(max_frames - 1) * max_gap`
+       seconds (about 24 s at the defaults) yields grid frames only.
     3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
        never closer than `min_interval` to another selected frame (`reason=motion`).
        Segments where nearly every frame changes (rain or snow in IR) get the grid only.
@@ -737,7 +739,9 @@ async def extract_video_frames(
     **Frame selection:**
     1. The first frame is always taken (`reason=first`).
     2. A grid frame is taken every `max_gap` seconds, or `min_interval` if that is
-       larger (`reason=grid`); a grid longer than `max_frames` is thinned uniformly.
+       larger (`reason=grid`); a grid longer than `max_frames` is thinned uniformly
+       and step 3 is skipped, so a video longer than about `(max_frames - 1) * max_gap`
+       seconds (about 24 s at the defaults) yields grid frames only.
     3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
        never closer than `min_interval` to another selected frame (`reason=motion`).
        Segments where nearly every frame changes (rain or snow in IR) get the grid only.

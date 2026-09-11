@@ -57,7 +57,7 @@ Video analysis on motion-selected frames.
 
 **Frame selection** (`app/frame_selection.py`):
 1. Frame 0 is always taken (`reason: first`).
-2. A grid frame every `max_gap` seconds, or `min_interval` if that is larger (`reason: grid`). A grid longer than `max_frames` is thinned uniformly, keeping the first and the last grid frame.
+2. A grid frame every `max_gap` seconds, or `min_interval` if that is larger (`reason: grid`), counted from the previous grid frame — a motion peak never shifts the grid. A grid longer than `max_frames` is thinned uniformly, keeping the first and the last grid frame; the thinned grid then uses the whole budget and step 3 is skipped, so a video longer than about `(max_frames − 1) × max_gap` seconds (≈24 s at the defaults) yields grid frames only, however strong its motion.
 3. Motion peaks fill the remaining budget: frames are ranked by `blob`, the area of the largest changed region between neighbouring frames (gray, 640 px wide) as a fraction of the frame, taken while above `motion_threshold` and at least `min_interval` from every selected frame (`reason: motion`). If the median `blob` over the segment exceeds 0.02 (rain, snow in IR), peaks are skipped and only the grid remains.
 
 `frame_number` is the frame index in the source video (0-based), `timestamp` its presentation time, `video_duration` comes from ffprobe. Unknown query parameters (e.g. the removed `scene_threshold`) are ignored.

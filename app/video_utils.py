@@ -246,8 +246,9 @@ class VideoFrameExtractor:
 
     Pass 1 (``scan``) decodes the whole video into gray 640 px frames through a
     pipe, computes the ``blob`` motion metric per frame and applies
-    ``select_frames``. Pass 2 (``extract_frames``) decodes again and fetches
-    only the selected frames in full resolution.
+    ``select_frames``. Pass 2 (``extract_frames``) decodes again and reads out
+    the selected frames in full resolution: ``select`` drops the other frames
+    after decoding, so everything up to the last selected frame is decoded.
     """
 
     PROBE_TIMEOUT = 30.0
@@ -365,7 +366,7 @@ class VideoFrameExtractor:
         """
         scaled_h = int(round(info.height * SCAN_WIDTH / info.width / 2)) * 2
         if scaled_h < 2:
-            raise RuntimeError(f"Video aspect ratio {info.width}x{info.height} scales to a zero-height frame")
+            raise ValueError(f"Video aspect ratio {info.width}x{info.height} scales to a zero-height frame")
         frame_size = SCAN_WIDTH * scaled_h
         cmd = [
             self.ffmpeg_path, "-hide_banner", "-nostats", "-loglevel", "info",
@@ -390,8 +391,8 @@ class VideoFrameExtractor:
                 prev = cur
         finally:
             process.stdout.close()
-            returncode = _finish_process(process)
             killer.cancel()
+            returncode = _finish_process(process)
             collector.join()
             process.stderr.close()
 
@@ -470,14 +471,19 @@ class VideoFrameExtractor:
             out, err = process.communicate(timeout=max(1.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             process.kill()
-            process.communicate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                logger.warning("FFmpeg did not exit after SIGKILL; process may be leaked")
             raise RuntimeError(
                 f"Frame extraction timed out after {self.timeout:.0f}s during the frame grab"
             )
 
         stderr_text = err.decode("utf-8", errors="replace")
         shown = parse_showinfo(stderr_text)
-        tail = "\n".join(line for line in stderr_text.splitlines() if "showinfo" not in line)[-2000:]
+        tail = "\n".join(
+            line for line in stderr_text.splitlines() if parse_showinfo_line(line) is None
+        )[-2000:]
         rc = _rc_to_str(process.returncode)
 
         frame_size = info.width * info.height * 3
@@ -534,8 +540,8 @@ async def extract_frames_from_video(video_data: bytes, params: SelectionParams) 
 
     def _extract() -> ExtractionResult:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            tmp.write(video_data)
             tmp_path = tmp.name
+            tmp.write(video_data)
         try:
             return VideoFrameExtractor().extract_frames(tmp_path, params)
         finally:

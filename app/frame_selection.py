@@ -8,10 +8,16 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Literal, Sequence
 
+import cv2
+import numpy as np
+
 SCAN_WIDTH = 640          # width of the gray frames the metric is computed on
 DIFF_THRESHOLD = 20       # brightness levels; |cur - prev| above this counts as changed
 STORM_MEDIAN_BLOB = 0.02  # median blob over a segment above this = storm (rain, snow in IR)
 PTS_TOLERANCE = 1e-3      # seconds; camera pts jitter tolerance in time comparisons
+
+_KERNEL_OPEN = np.ones((3, 3), np.uint8)
+_KERNEL_DILATE = np.ones((7, 7), np.uint8)
 
 Reason = Literal["first", "grid", "motion"]
 
@@ -29,6 +35,28 @@ class SelectionParams:
 class SelectedFrame:
     index: int      # frame index in the source video (0-based, ffmpeg's ``n``)
     reason: Reason
+
+
+def prepare_frame(gray: np.ndarray) -> np.ndarray:
+    """Blur a gray frame 3×3 once. The caller keeps the result: it is the input for two pairs."""
+    return cv2.blur(gray, (3, 3))
+
+
+def blob_area(prev: np.ndarray, cur: np.ndarray) -> float:
+    """Area of the largest changed region between two prepared frames, as a fraction of the frame.
+
+    Reproduces ``mask_stats`` from the research scripts, on which the default
+    thresholds were tuned: absdiff, 3×3 blur, mask above ``DIFF_THRESHOLD``,
+    3×3 opening, 7×7 dilation, largest 8-connected component.
+    """
+    diff = cv2.blur(cv2.absdiff(prev, cur), (3, 3))
+    mask = (diff > DIFF_THRESHOLD).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _KERNEL_OPEN)
+    mask = cv2.dilate(mask, _KERNEL_DILATE)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count <= 1:
+        return 0.0
+    return float(stats[1:, cv2.CC_STAT_AREA].max()) / float(mask.size)
 
 
 def _round_half_up(value: float) -> int:

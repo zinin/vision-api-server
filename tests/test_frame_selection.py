@@ -1,6 +1,7 @@
+import numpy as np
 import pytest
 
-from frame_selection import PTS_TOLERANCE, SelectedFrame, SelectionParams, select_frames
+from frame_selection import PTS_TOLERANCE, SelectedFrame, SelectionParams, blob_area, prepare_frame, select_frames
 
 
 def _static(duration: float, fps: float = 10.0):
@@ -131,3 +132,37 @@ class TestPeaks:
         blob[20] = 0.01
         selected = select_frames(pts, blob, SelectionParams())
         assert _indices(selected) == sorted(_indices(selected))
+
+
+class TestBlobArea:
+    def test_identical_frames_give_zero(self):
+        frame = prepare_frame(np.full((360, 640), 128, np.uint8))
+        assert blob_area(frame, frame) == 0.0
+
+    def test_square_gives_its_dilated_area(self):
+        prev = prepare_frame(np.zeros((360, 640), np.uint8))
+        cur_raw = np.zeros((360, 640), np.uint8)
+        cur_raw[100:140, 100:140] = 255  # 40×40 square
+        value = blob_area(prev, prepare_frame(cur_raw))
+        # 40×40 = 0.0069 of the frame before blur and dilation, at most 50×50 = 0.0109 after
+        assert 0.0069 <= value <= 0.0109
+
+    def test_noise_below_threshold_gives_zero(self):
+        rng = np.random.default_rng(0)
+        prev = prepare_frame(np.full((360, 640), 128, np.uint8))
+        cur = prepare_frame(rng.integers(120, 137, size=(360, 640), dtype=np.uint8))
+        assert blob_area(prev, cur) == 0.0
+
+    def test_largest_component_only(self):
+        prev = prepare_frame(np.zeros((360, 640), np.uint8))
+        cur_raw = np.zeros((360, 640), np.uint8)
+        cur_raw[10:20, 10:20] = 255      # small blob, 10×10
+        cur_raw[200:260, 300:360] = 255  # big blob, 60×60
+        value = blob_area(prev, prepare_frame(cur_raw))
+        assert 60 * 60 / (640 * 360) <= value <= 70 * 70 / (640 * 360)
+
+    def test_returns_python_float(self):
+        prev = prepare_frame(np.zeros((360, 640), np.uint8))
+        cur_raw = np.zeros((360, 640), np.uint8)
+        cur_raw[50:90, 50:90] = 255
+        assert type(blob_area(prev, prepare_frame(cur_raw))) is float

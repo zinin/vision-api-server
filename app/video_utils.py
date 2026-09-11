@@ -1,10 +1,11 @@
+import json
+import logging
+import os
+import re
 import subprocess
 import tempfile
-import os
-import logging
-import re
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -12,15 +13,29 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+NO_VIDEO_STREAM_MESSAGE = (
+    "File contains no video stream. Only audio or metadata streams were found."
+)
+UNREADABLE_VIDEO_MESSAGE = (
+    "File could not be read as a valid video. "
+    "The file may be corrupted or not a supported video format."
+)
+
+_PTS_RE = re.compile(r"pts_time:\s*(-?[0-9.]+)")
+_SIZE_RE = re.compile(r"\bs:(\d+)x(\d+)")
+
 
 @dataclass
 class VideoInfo:
-    """Video metadata."""
+    """Video metadata from ffprobe. ``width`` and ``height`` are the display
+    dimensions after the rotation metadata is applied, which is what ffmpeg
+    outputs because it autorotates by default."""
     duration: float
     width: int
     height: int
     fps: float
     codec: str
+    rotation: int = 0
 
 
 @dataclass
@@ -29,6 +44,93 @@ class ExtractedFrame:
     image: np.ndarray
     timestamp: float
     frame_number: int
+
+
+@dataclass(frozen=True)
+class ShowinfoFrame:
+    """One frame line of ffmpeg's ``showinfo`` filter."""
+    pts: float
+    width: int
+    height: int
+
+
+def parse_showinfo_line(line: str) -> ShowinfoFrame | None:
+    """Parse one ffmpeg stderr line; None unless it is a showinfo frame line."""
+    if "showinfo" not in line:
+        return None
+    pts = _PTS_RE.search(line)
+    size = _SIZE_RE.search(line)
+    if pts is None or size is None:
+        return None
+    return ShowinfoFrame(pts=float(pts.group(1)), width=int(size.group(1)), height=int(size.group(2)))
+
+
+def parse_showinfo(stderr: str) -> list[ShowinfoFrame]:
+    """All showinfo frame lines of an ffmpeg stderr dump, in order."""
+    frames = []
+    for line in stderr.splitlines():
+        parsed = parse_showinfo_line(line)
+        if parsed is not None:
+            frames.append(parsed)
+    return frames
+
+
+def _to_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _to_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_fps(value) -> float:
+    """ffprobe frame rates are fractions like ``12500/1000``; ``0/0`` means unknown."""
+    if value is None:
+        return 0.0
+    text = str(value)
+    if "/" not in text:
+        return _to_float(text)
+    num, _, den = text.partition("/")
+    den_f = _to_float(den)
+    return _to_float(num) / den_f if den_f > 0 else 0.0
+
+
+def _parse_rotation(stream: dict) -> int:
+    """Rotation in degrees from the Display Matrix side data or the legacy ``rotate`` tag.
+    Only the magnitude matters: the value decides whether width and height swap."""
+    for side_data in stream.get("side_data_list") or []:
+        if isinstance(side_data, dict) and "rotation" in side_data:
+            return abs(int(round(_to_float(side_data["rotation"])))) % 360
+    tag = (stream.get("tags") or {}).get("rotate")
+    if tag is not None:
+        return abs(int(round(_to_float(tag)))) % 360
+    return 0
+
+
+def parse_probe_output(data: dict) -> VideoInfo:
+    """Build VideoInfo from ``ffprobe -print_format json -show_streams -show_format`` output."""
+    streams = data.get("streams") or []
+    if not streams:
+        raise ValueError(NO_VIDEO_STREAM_MESSAGE)
+    stream = streams[0]
+    width = _to_int(stream.get("width"))
+    height = _to_int(stream.get("height"))
+    if width <= 0 or height <= 0:
+        raise ValueError(NO_VIDEO_STREAM_MESSAGE)
+    rotation = _parse_rotation(stream)
+    if rotation in (90, 270):
+        width, height = height, width
+    fmt = data.get("format") or {}
+    duration = _to_float(fmt.get("duration")) or _to_float(stream.get("duration")) or 0.0
+    fps = _parse_fps(stream.get("avg_frame_rate")) or _parse_fps(stream.get("r_frame_rate")) or 0.0
+    codec = stream.get("codec_name") or "unknown"
+    return VideoInfo(duration=duration, width=width, height=height, fps=fps, codec=codec, rotation=rotation)
 
 
 class VideoFrameExtractor:
@@ -78,123 +180,39 @@ class VideoFrameExtractor:
                 f"Please install ffmpeg: apt install ffmpeg"
             ) from e
 
+    PROBE_TIMEOUT = 30.0
+
     def get_video_info(self, video_path: str) -> VideoInfo:
-        """
-        Get video metadata using ffprobe.
+        """Video metadata via ffprobe JSON.
 
-        Args:
-            video_path: Path to video file
-
-        Returns:
-            VideoInfo with duration, dimensions, fps, codec
+        Raises ValueError when the file is unreadable or has no video stream
+        (the HTTP layer maps it to 422) and RuntimeError when ffprobe hangs.
         """
         cmd = [
             self.ffprobe_path,
             "-v", "error",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_format",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,r_frame_rate,codec_name,duration",
-            "-show_entries", "format=duration",
-            "-of", "csv=p=0:s=,",
-            video_path
+            video_path,
         ]
-
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as e:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=self.PROBE_TIMEOUT)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"ffprobe timed out after {self.PROBE_TIMEOUT:.0f}s") from e
+
+        if result.returncode != 0:
             logger.warning(f"ffprobe failed for video: {video_path}")
-            logger.warning(f"ffprobe stderr: {e.stderr}")
-            raise ValueError(
-                "File could not be read as a valid video. "
-                "The file may be corrupted or not a supported video format."
-            ) from e
+            logger.warning(f"ffprobe stderr: {result.stderr}")
+            raise ValueError(UNREADABLE_VIDEO_MESSAGE)
 
-        output = result.stdout.strip()
-
-        # Parse output - format varies, handle both cases
-        lines = [l.strip() for l in output.split('\n') if l.strip()]
-
-        # Try to extract values
-        width = height = 0
-        fps = 30.0
-        duration = 0.0
-        codec = "unknown"
-
-        for line in lines:
-            parts = line.split(',')
-            for part in parts:
-                part = part.strip()
-                # Check for duration (float value)
-                try:
-                    val = float(part)
-                    if val > 100:  # Likely width/height
-                        if width == 0:
-                            width = int(val)
-                        elif height == 0:
-                            height = int(val)
-                    else:
-                        duration = val
-                except ValueError:
-                    # Check for fps fraction
-                    if '/' in part:
-                        try:
-                            num, den = part.split('/')
-                            fps = float(num) / float(den)
-                        except:
-                            pass
-                    elif part.isalpha():
-                        codec = part
-
-        # Alternative parsing using dedicated ffprobe calls
-        if duration == 0:
-            duration = self._get_duration(video_path)
-        if width == 0 or height == 0:
-            width, height = self._get_dimensions(video_path)
-
-        return VideoInfo(
-            duration=duration,
-            width=width,
-            height=height,
-            fps=fps,
-            codec=codec
-        )
-
-    def _get_duration(self, video_path: str) -> float:
-        """Get video duration."""
-        cmd = [
-            self.ffprobe_path,
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "csv=p=0",
-            video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.warning(f"ffprobe _get_duration failed for {video_path}: {result.stderr}")
-            return 0.0
         try:
-            return float(result.stdout.strip())
-        except ValueError:
-            return 0.0
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            raise ValueError(UNREADABLE_VIDEO_MESSAGE) from e
 
-    def _get_dimensions(self, video_path: str) -> tuple[int, int]:
-        """Get video dimensions."""
-        cmd = [
-            self.ffprobe_path,
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0:s=x",
-            video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.warning(f"ffprobe _get_dimensions failed for {video_path}: {result.stderr}")
-            return 0, 0
-        try:
-            w, h = result.stdout.strip().split('x')
-            return int(w), int(h)
-        except ValueError:
-            return 0, 0
+        return parse_probe_output(data)
 
     def extract_frames(
             self,
@@ -228,10 +246,7 @@ class VideoFrameExtractor:
         )
 
         if video_info.width == 0 or video_info.height == 0:
-            raise ValueError(
-                "File contains no video stream. "
-                "Only audio or metadata streams were found."
-            )
+            raise ValueError(NO_VIDEO_STREAM_MESSAGE)
 
         # Create temp directory if not provided
         cleanup_dir = output_dir is None

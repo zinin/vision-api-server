@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-11-motion-frame-selection-design.md`
 
-**Status (2026-09-12):** Tasks 1-8 complete. The final whole-branch review is done; its single fix wave is commit `0059599` (bounded pass-2 kill drain, ValueError on the degenerate aspect ratio, cancel-before-reap, showinfo tail classifier, tmp_path binding, MaxGapQuery description, pass-2 wording, documented thinning cliff, BGR channel-order test). Remaining: one parked docs fix — "about 24 s at the defaults" must read 20 s at `app/main.py:564`, `app/main.py:744` and `.claude/rules/api.md:60`, because `(max_frames - 1) * max_gap` is 20, while 24 is the thinning threshold — and Task 9.
+**Status (2026-09-12):** Tasks 1-8 complete. The final whole-branch review is done; its single fix wave is commit `0059599` (bounded pass-2 kill drain, ValueError on the degenerate aspect ratio, cancel-before-reap, showinfo tail classifier, tmp_path binding, MaxGapQuery description, pass-2 wording, documented thinning cliff, BGR channel-order test). Two commits landed after it: `647e573` corrects the grid-only threshold in the docs (20 s, not 24 s — the two thresholds are distinct), and `17ca740` fixes the cliff itself under ruling R15, thinning the grid to `max_frames - 1` so one slot always stays free for the strongest motion peak. 448 tests pass; the corpus numbers at `max_frames=6` are unchanged. Remaining: Task 9 and the PR.
 
 ## Global Constraints
 
@@ -104,7 +104,7 @@
 
 - [ ] **Step 1: Убедиться, что всё зелёное и рабочее дерево чистое**
 
-Run: `.venv/bin/python -m pytest tests/ -q && git status --short`
+Run: `LOG_LEVEL=INFO .venv/bin/python -m pytest tests/ -q && git status --short`
 Expected: все тесты PASS; в статусе только неотслеживаемые файлы (`.mcp.json`, веса, `docs/research/`, старые промпты).
 
 - [ ] **Step 2: Удалить документы из ветки**

@@ -22,7 +22,8 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 |------|---------|
 | `app/main.py` | FastAPI app, endpoints, lifespan |
 | `app/model_manager.py` | YOLO model lifecycle, two-tier caching |
-| `app/video_utils.py` | FFmpeg frame extraction, scene detection |
+| `app/video_utils.py` | FFmpeg two-pass frame extraction: motion scan, selected-frame fetch |
+| `app/frame_selection.py` | Motion metric (`blob`) and the frame selection rule (grid + motion peaks) |
 | `app/inference_utils.py` | Async inference with ThreadPoolExecutor |
 | `app/image_utils.py` | Image validation, decoding |
 | `app/visualization.py` | DetectionVisualizer, bbox rendering |
@@ -41,9 +42,9 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/detect` | POST | Image detection (JSON) |
-| `/detect/video` | POST | Video detection with smart frames |
+| `/detect/video` | POST | Video detection on motion-selected frames |
 | `/detect/visualize` | POST | Image with drawn bboxes |
-| `/extract/frames` | POST | Extract frames as base64 |
+| `/extract/frames` | POST | Extract motion-selected frames as base64 |
 | `/detect/video/visualize` | POST | Submit video for annotation (async, returns job_id) |
 | `/jobs/{job_id}` | GET | Job status and progress |
 | `/jobs/{job_id}/download` | GET | Download annotated video |
@@ -62,6 +63,7 @@ MODELS_DIR=/models                      # Model files directory (Docker volume)
 MAX_FILE_SIZE=10485760                  # Max image size (default 10MB)
 MAX_EXECUTOR_WORKERS=4                  # ThreadPool workers
 INFERENCE_TIMEOUT=30.0                  # Timeout seconds
+VIDEO_EXTRACT_TIMEOUT=300.0             # Wall-clock deadline for both ffmpeg passes of one video request
 LOG_LEVEL=INFO                          # Logging level (DEBUG, INFO, WARNING, ERROR)
 VIDEO_JOB_TTL=3600                      # Completed job TTL seconds
 VIDEO_JOBS_DIR=/tmp/vision_jobs         # Job files directory
@@ -114,7 +116,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`).
+Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`), motion frame selection (`tests/test_frame_selection.py`: the rule and the metric on arrays; `tests/test_video_extraction_integration.py`: both ffmpeg passes and both video endpoints on lavfi clips).
 
 ## Key Patterns
 
@@ -122,7 +124,7 @@ Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFm
 
 **Two-Tier Caching**: Preloaded (never evicted) + cached (TTL-based eviction).
 
-**Smart Frames**: FFmpeg scene detection with fallback to interval-based extraction.
+**Motion Frames**: Two ffmpeg passes. Pass 1 streams gray 640 px frames through a pipe and computes `blob`, the area of the largest changed region between neighbouring frames; pass 2 decodes again and reads out the selected frames with `select`, which drops the other frames after decoding. Selection: frame 0, a grid every `max_gap` (4 s, or `min_interval` when that is larger) thinned to `max_frames − 1` so one slot always stays free, then the strongest motion peaks above `motion_threshold` (0.001) at least `min_interval` (1 s) apart, capped at `max_frames` (6); the held-back frame returns to the grid when no peak can use it. A segment whose median `blob` exceeds 0.02 (rain, snow in IR) gets the grid only. Real pts from `showinfo`; `video_duration` from ffprobe. Tests use lavfi-generated clips, no binary fixtures.
 
 **Video Annotation**: Async job API — YOLO every Nth frame + hold mode (reuse detections) for intermediate frames. Single worker, in-memory job state (requires `workers=1`).
 

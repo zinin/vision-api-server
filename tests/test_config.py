@@ -38,6 +38,18 @@ class TestVideoHwAccel:
         assert s.vaapi_device == "/dev/dri/renderD129"
 
 
+class TestVideoExtractTimeout:
+    def test_default(self):
+        assert Settings(yolo_models="{}").video_extract_timeout == 300.0
+
+    def test_below_minimum_rejected(self):
+        with pytest.raises(ValidationError):
+            Settings(yolo_models="{}", video_extract_timeout=5)
+
+    def test_minimum_accepted(self):
+        assert Settings(yolo_models="{}", video_extract_timeout=10).video_extract_timeout == 10.0
+
+
 class TestVideoCodecAuto:
     def test_default_is_auto(self):
         s = Settings(yolo_models='{}')

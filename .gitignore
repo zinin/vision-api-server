@@ -208,3 +208,8 @@ Thumbs.db
 # config/config.yaml
 # .env.local
 # .env.production
+
+# Local MCP config with credentials, model weights, research corpus — never committed
+.mcp.json
+*.pt
+docs/research/

@@ -5,7 +5,7 @@ YOLO-based object detection REST API built with FastAPI. Supports image and vide
 ## Features
 
 - **Image Detection** — object detection with JSON response or annotated image output
-- **Video Analysis** — smart frame extraction with scene-change detection
+- **Video Analysis** — motion-based frame selection: time grid plus the strongest motion peaks
 - **Video Annotation** — async pipeline: YOLO every Nth frame + hold mode for real-time bbox overlay
 - **Multi-Backend** — NVIDIA GPU (CUDA/NVENC), AMD GPU (ROCm/VAAPI), CPU
 - **Hardware-Accelerated Encoding** — auto-detected FFmpeg HW accel for video decode/encode
@@ -58,9 +58,9 @@ Stop: `./docker-down-nvidia.sh` (same for amd/cpu).
 |----------|--------|-------------|
 | `/detect` | POST | Image detection → JSON |
 | `/detect/visualize` | POST | Image detection → annotated JPEG |
-| `/detect/video` | POST | Video smart-frame detection → JSON |
+| `/detect/video` | POST | Video detection on motion-selected frames → JSON |
 | `/detect/video/visualize` | POST | Submit video annotation job (async) |
-| `/extract/frames` | POST | Extract key frames as base64 |
+| `/extract/frames` | POST | Extract motion-selected frames as base64 |
 | `/jobs/{job_id}` | GET | Job status and progress |
 | `/jobs/{job_id}/download` | GET | Download annotated video |
 | `/models` | GET | List loaded/cached models |
@@ -86,7 +86,7 @@ curl -X POST "http://localhost:3001/detect?model=yolo26m.pt" \
 curl -X POST "http://localhost:3001/detect/visualize" \
   -F "file=@image.jpg" -o annotated.jpg
 
-# Video analysis (smart frames)
+# Video analysis (motion-selected frames)
 curl -X POST "http://localhost:3001/detect/video?max_frames=20" \
   -F "file=@video.mp4"
 
@@ -112,6 +112,10 @@ curl http://localhost:3001/jobs/$JOB/download -o annotated.mp4
 | `classes` | string | — | — | Comma-separated class filter (`person,car`) |
 | `detect_every` | int | 5 | 1–300 | YOLO every N frames (video annotation) |
 
+### Upgrading from 2.x
+
+Clients should send `max_frames=6` (frigate-analyzer: `DETECT_MAX_FRAMES=6`) and drop `scene_threshold`; with the old `max_frames=50` a 16-second segment with motion returns up to 16 frames where 2.x returned 2, roughly 8× the inferences on `/detect/video` until the client is updated. `/detect/video` now hands YOLO frames in BGR (2.x passed RGB by mistake), so detections on the same recordings differ from 2.x.
+
 ## Models
 
 YOLO26 models are downloaded automatically on first use:
@@ -136,6 +140,7 @@ All settings via environment variables or `.env` file:
 | `MAX_FILE_SIZE` | `10485760` | Max image upload size in bytes |
 | `MAX_EXECUTOR_WORKERS` | `4` | ThreadPoolExecutor workers |
 | `INFERENCE_TIMEOUT` | `30.0` | Inference timeout in seconds |
+| `VIDEO_EXTRACT_TIMEOUT` | `300.0` | Wall-clock deadline for both ffmpeg passes of one video request, seconds (min 10) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `VIDEO_JOB_TTL` | `3600` | Completed job TTL in seconds |
 | `VIDEO_JOBS_DIR` | `/tmp/vision_jobs` | Job files directory |
@@ -164,7 +169,7 @@ flowchart TB
     end
 
     E1 --> TPE["ThreadPoolExecutor<br/>(YOLO inference)"]
-    E2 --> FFE["FFmpeg Scene Detection"]
+    E2 --> FFE["FFmpeg Two-Pass Extraction<br/>(motion scan → frame fetch)"]
     E2 --> TPE
     E3 --> JM["JobManager<br/>(async queue)"]
 
@@ -180,7 +185,7 @@ flowchart TB
 - **Async inference** — YOLO runs in `ThreadPoolExecutor` via `run_in_executor()` to keep the event loop responsive
 - **Two-tier model cache** — preloaded models (configured at startup, never evicted) + cached models (loaded on demand, TTL-based eviction)
 - **Video annotation pipeline** — async job API with single background worker; YOLO every Nth frame with "hold mode" (reuse last detections for intermediate frames)
-- **Smart frame extraction** — FFmpeg scene-change detection with configurable threshold and minimum interval between frames
+- **Motion-based frame selection** — two FFmpeg passes: a gray 640 px scan measures the largest changed region between neighbouring frames, then the selected frames are read out at full resolution; the selection is frame 0, a grid every `max_gap` (or `min_interval`, whichever is larger) thinned to `max_frames - 1`, and the strongest motion peaks above `motion_threshold`, no closer than `min_interval` and capped at `max_frames` — so a recording of any length keeps a slot for the strongest motion peak (the slot returns to the grid when no peak qualifies)
 - **Process watchdog** — `supervisor.py` runs uvicorn as a child and polls `/health` from outside the Python process; a GPU hang that freezes the interpreter (GIL held) ends in a SIGKILL and a container restart instead of an indefinite outage
 
 ## Limits
@@ -204,7 +209,8 @@ app/
 ├── video_annotator.py   # YOLO + hold mode video annotation
 ├── ffmpeg_pipe.py       # FFmpeg subprocess pipe decoder/encoder
 ├── hw_accel.py          # Hardware acceleration detection
-├── video_utils.py       # Frame extraction, scene detection
+├── video_utils.py       # Two-pass frame extraction: motion scan + frame fetch
+├── frame_selection.py   # Motion metric and frame selection rule
 ├── inference_utils.py   # Async inference via ThreadPoolExecutor
 ├── image_utils.py       # Image validation and decoding
 ├── visualization.py     # Bounding box rendering

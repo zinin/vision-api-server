@@ -1,4 +1,13 @@
-from models import JobCreatedResponse, JobStatusResponse, JobStats
+import pytest
+from pydantic import ValidationError
+
+from models import (
+    ExtractedFrameData,
+    FrameDetection,
+    JobCreatedResponse,
+    JobStatusResponse,
+    JobStats,
+)
 
 
 def test_job_created_response():
@@ -44,3 +53,18 @@ def test_job_status_response_completed():
     data = resp.model_dump()
     assert data["stats"]["total_frames"] == 900
     assert data["download_url"] == "/jobs/abc123/download"
+
+
+def test_frame_detection_carries_reason():
+    frame = FrameDetection(frame_number=40, timestamp=4.0, reason="grid", detections=[], count=0)
+    assert frame.model_dump()["reason"] == "grid"
+
+
+def test_extracted_frame_rejects_unknown_reason():
+    with pytest.raises(ValidationError):
+        ExtractedFrameData(frame_number=0, timestamp=0.0, reason="scene", image_base64="", width=1, height=1)
+
+
+def test_video_detection_settings_removed():
+    import models
+    assert not hasattr(models, "VideoDetectionSettings")

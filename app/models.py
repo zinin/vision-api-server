@@ -1,6 +1,8 @@
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Annotated, Literal
 
+from frame_selection import Reason
+
 
 class BoundingBox(BaseModel):
     """Bounding box coordinates in pixel values."""
@@ -58,8 +60,11 @@ class ImageSize(BaseModel):
 
 class FrameDetection(BaseModel):
     """Detection results for a single video frame."""
-    frame_number: int = Field(description="Frame number (1-based)")
-    timestamp: float = Field(description="Frame timestamp in seconds")
+    frame_number: int = Field(description="Frame index in the source video (0-based)")
+    timestamp: float = Field(description="Frame presentation time in seconds")
+    reason: Reason = Field(
+        description="Why the frame was selected: the first frame, the time grid, or a motion peak"
+    )
     detections: list[Detection] = Field(default_factory=list)
     count: int = Field(description="Number of detections in frame")
 
@@ -118,32 +123,13 @@ class VideoDetectionResponse(BaseModel):
     )
 
 
-class VideoDetectionSettings(BaseModel):
-    """Settings for video frame extraction."""
-    scene_threshold: float = Field(
-        default=0.05,
-        ge=0.01,
-        le=0.5,
-        description="Scene change threshold (lower = more sensitive)"
-    )
-    min_interval: float = Field(
-        default=1.0,
-        ge=0.1,
-        le=30.0,
-        description="Minimum interval between frames in seconds"
-    )
-    max_frames: int = Field(
-        default=50,
-        ge=1,
-        le=200,
-        description="Maximum number of frames to extract"
-    )
-
-
 class ExtractedFrameData(BaseModel):
     """Single extracted frame with base64-encoded image data."""
-    frame_number: int = Field(description="Frame number (1-based)")
-    timestamp: float = Field(description="Frame timestamp in seconds")
+    frame_number: int = Field(description="Frame index in the source video (0-based)")
+    timestamp: float = Field(description="Frame presentation time in seconds")
+    reason: Reason = Field(
+        description="Why the frame was selected: the first frame, the time grid, or a motion peak"
+    )
     image_base64: str = Field(description="JPEG image encoded as base64 string")
     width: int = Field(description="Frame width in pixels")
     height: int = Field(description="Frame height in pixels")

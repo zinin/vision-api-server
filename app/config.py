@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "INFO"
     inference_timeout: float = 30.0
+    video_extract_timeout: float = Field(default=300.0, ge=10.0)  # wall-clock deadline for both ffmpeg passes of one video request, seconds
     max_executor_workers: int = 4
 
     # Video annotation job settings

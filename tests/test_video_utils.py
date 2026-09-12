@@ -89,6 +89,14 @@ class TestExtractFramesFromVideoTempFile:
         assert not os.path.exists(created[0])
 
 
+class TestExtractFramesFromVideoTimeout:
+    @patch("video_utils.VideoFrameExtractor")
+    def test_timeout_reaches_the_extractor(self, mock_extractor):
+        asyncio.run(extract_frames_from_video(b"x", SelectionParams(), timeout=42.0))
+
+        mock_extractor.assert_called_once_with(timeout=42.0)
+
+
 class TestScanMotionGuards:
     @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
     def test_degenerate_aspect_ratio_raises_value_error(self, mock_verify):

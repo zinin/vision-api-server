@@ -564,15 +564,20 @@ class VideoFrameExtractor:
         return frames
 
 
-async def extract_frames_from_video(video_data: bytes, params: SelectionParams) -> ExtractionResult:
-    """Async wrapper: write the upload to a temp file and run both passes in the default executor."""
+async def extract_frames_from_video(
+        video_data: bytes, params: SelectionParams, timeout: float = 300.0
+) -> ExtractionResult:
+    """Async wrapper: write the upload to a temp file and run both passes in the default executor.
+
+    ``timeout`` is the wall-clock deadline for both ffmpeg passes together.
+    """
 
     def _extract() -> ExtractionResult:
         tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         try:
             with tmp:
                 tmp.write(video_data)
-            return VideoFrameExtractor().extract_frames(tmp.name, params)
+            return VideoFrameExtractor(timeout=timeout).extract_frames(tmp.name, params)
         finally:
             os.unlink(tmp.name)
 

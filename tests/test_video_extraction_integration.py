@@ -192,6 +192,15 @@ def _by_reason(selected, reason):
     return [f for f in selected if f.reason == reason]
 
 
+def _recording_extractor(recorded: dict):
+    """Stand-in for extract_frames_from_video: records its keyword arguments, then fails."""
+    async def _extract(**kwargs):
+        recorded.update(kwargs)
+        raise RuntimeError("boom")
+
+    return _extract
+
+
 class TestScan:
     def test_static_clip_first_and_grid(self, extractor, static_clip):
         result = extractor.scan(str(static_clip), SelectionParams())
@@ -457,6 +466,18 @@ class TestExtractFramesEndpoint:
         assert response.status_code == 500
         assert response.json()["detail"].startswith("Failed to extract frames")
 
+    def test_configured_timeout_reaches_the_extractor(self, client, tmp_path, static_clip, monkeypatch):
+        recorded: dict = {}
+        app.dependency_overrides[get_settings] = lambda: Settings(
+            yolo_models="{}", video_jobs_dir=str(tmp_path), video_extract_timeout=10.0
+        )
+        monkeypatch.setattr(main, "extract_frames_from_video", _recording_extractor(recorded))
+
+        response = client.post("/extract/frames", files=_upload(static_clip))
+
+        assert response.status_code == 500
+        assert recorded["timeout"] == 10.0
+
     def test_audio_only_file_rejected_with_422(self, client, tmp_path):
         audio = tmp_path / "audio.mp4"
         subprocess.run(
@@ -495,3 +516,15 @@ class TestDetectVideoEndpoint:
 
         assert response.status_code == 500
         assert response.json()["detail"].startswith("Failed to extract frames")
+
+    def test_configured_timeout_reaches_the_extractor(self, client, tmp_path, static_clip, monkeypatch):
+        recorded: dict = {}
+        app.dependency_overrides[get_settings] = lambda: Settings(
+            yolo_models="{}", video_jobs_dir=str(tmp_path), video_extract_timeout=10.0
+        )
+        monkeypatch.setattr(main, "extract_frames_from_video", _recording_extractor(recorded))
+
+        response = client.post("/detect/video", files=_upload(static_clip))
+
+        assert response.status_code == 500
+        assert recorded["timeout"] == 10.0

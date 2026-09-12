@@ -627,7 +627,9 @@ async def detect_objects_in_video(
 
     # Extract frames
     try:
-        extraction = await extract_frames_from_video(video_data=video_data, params=params)
+        extraction = await extract_frames_from_video(
+            video_data=video_data, params=params, timeout=settings.video_extract_timeout
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except RuntimeError as e:
@@ -734,7 +736,8 @@ async def detect_objects_in_video(
 async def extract_video_frames(
         file: UploadFile = File(..., description="Video file for frame extraction"),
         params: SelectionParams = Depends(selection_params),
-        quality: Annotated[int, Query(ge=1, le=100, description="JPEG quality")] = 85
+        quality: Annotated[int, Query(ge=1, le=100, description="JPEG quality")] = 85,
+        settings: Settings = Depends(get_settings)
 ):
     """
     Extract motion-selected key frames from video without object detection.
@@ -786,7 +789,9 @@ async def extract_video_frames(
 
     # Extract frames
     try:
-        extraction = await extract_frames_from_video(video_data=video_data, params=params)
+        extraction = await extract_frames_from_video(
+            video_data=video_data, params=params, timeout=settings.video_extract_timeout
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except RuntimeError as e:

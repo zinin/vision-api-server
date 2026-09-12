@@ -140,6 +140,7 @@ All settings via environment variables or `.env` file:
 | `MAX_FILE_SIZE` | `10485760` | Max image upload size in bytes |
 | `MAX_EXECUTOR_WORKERS` | `4` | ThreadPoolExecutor workers |
 | `INFERENCE_TIMEOUT` | `30.0` | Inference timeout in seconds |
+| `VIDEO_EXTRACT_TIMEOUT` | `300.0` | Wall-clock deadline for both ffmpeg passes of one video request, seconds (min 10) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `VIDEO_JOB_TTL` | `3600` | Completed job TTL in seconds |
 | `VIDEO_JOBS_DIR` | `/tmp/vision_jobs` | Job files directory |

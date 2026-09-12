@@ -63,6 +63,7 @@ MODELS_DIR=/models                      # Model files directory (Docker volume)
 MAX_FILE_SIZE=10485760                  # Max image size (default 10MB)
 MAX_EXECUTOR_WORKERS=4                  # ThreadPool workers
 INFERENCE_TIMEOUT=30.0                  # Timeout seconds
+VIDEO_EXTRACT_TIMEOUT=300.0             # Wall-clock deadline for both ffmpeg passes of one video request
 LOG_LEVEL=INFO                          # Logging level (DEBUG, INFO, WARNING, ERROR)
 VIDEO_JOB_TTL=3600                      # Completed job TTL seconds
 VIDEO_JOBS_DIR=/tmp/vision_jobs         # Job files directory

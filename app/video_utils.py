@@ -248,9 +248,11 @@ class VideoFrameExtractor:
 
     Pass 1 (``scan``) decodes the whole video into gray 640 px frames through a
     pipe, computes the ``blob`` motion metric per frame and applies
-    ``select_frames``. Pass 2 (``extract_frames``) decodes again and reads out
-    the selected frames in full resolution: ``select`` drops the other frames
-    after decoding, so everything up to the last selected frame is decoded.
+    ``select_frames``. Pass 2 (``extract_frames``) decodes again and streams out
+    the selected frames in full resolution, one at a time into preallocated
+    arrays: ``select`` drops the other frames after decoding, so everything up
+    to the last selected frame is decoded, and the peak memory is one frame per
+    selected frame.
     """
 
     PROBE_TIMEOUT = 30.0
@@ -454,11 +456,13 @@ class VideoFrameExtractor:
             pts: list[float],
             deadline: float,
     ) -> list[ExtractedFrame]:
-        """Pass 2: decode again, let ``select`` pass only the chosen frames, read them as bgr24.
+        """Pass 2: decode again, let ``select`` pass only the chosen frames, stream them as bgr24.
 
-        Output frames are matched to the selection by pts, never by position,
-        and every mismatch raises: silently returning frames with somebody
-        else's timestamps is worse than failing.
+        Every frame is read straight into a preallocated array, so the peak
+        memory is one frame per selected frame and nothing is copied. Output
+        frames are matched to the selection by pts, never by position, and every
+        mismatch raises: silently returning frames with somebody else's
+        timestamps is worse than failing.
         """
         if not selected:
             raise RuntimeError("No frames selected")
@@ -476,38 +480,53 @@ class VideoFrameExtractor:
         process = subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        collector = _StderrCollector(process.stderr)
+        killer = _Deadline(process, deadline)
+        frame_size = info.width * info.height * 3
+        images: list[np.ndarray] = []
+        partial = 0
         try:
-            out, err = process.communicate(timeout=max(1.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            try:
-                process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                logger.warning("FFmpeg did not exit after SIGKILL; process may be leaked")
+            while True:
+                buf = np.empty((info.height, info.width, 3), np.uint8)
+                n = process.stdout.readinto(buf)  # BufferedReader: short only at EOF
+                if n == 0:
+                    break
+                if n < frame_size:
+                    partial = n
+                    break
+                images.append(buf)
+                if len(images) > len(selected):
+                    raise RuntimeError(
+                        f"FFmpeg frame grab returned more than the {len(selected)} selected frames"
+                    )
+        finally:
+            process.stdout.close()
+            killer.cancel()
+            returncode = _finish_process(process)
+            collector.join()
+            process.stderr.close()
+
+        if killer.expired:
             raise RuntimeError(
                 f"Frame extraction timed out after {self.timeout:.0f}s during the frame grab"
             )
 
-        stderr_text = err.decode("utf-8", errors="replace")
-        shown = parse_showinfo(stderr_text)
-        tail = "\n".join(
-            line for line in stderr_text.splitlines() if parse_showinfo_line(line) is None
-        )[-2000:]
-        rc = rc_to_str(process.returncode)
+        shown = collector.frames
+        tail = collector.tail_text()
+        rc = rc_to_str(returncode)
 
-        frame_size = info.width * info.height * 3
-        if len(out) % frame_size != 0:
+        if partial:
             raise RuntimeError(
-                f"FFmpeg frame grab returned {len(out)} bytes, not a multiple of the "
-                f"{info.width}x{info.height} frame size ({rc}): {tail}"
+                f"FFmpeg frame grab returned {len(images) * frame_size + partial} bytes, not a "
+                f"multiple of the {info.width}x{info.height} frame size ({rc}): {tail}"
             )
-        count = len(out) // frame_size
+        count = len(images)
         if count != len(selected) or len(shown) != count:
             raise RuntimeError(
                 f"FFmpeg frame grab returned {count} frames and {len(shown)} showinfo lines, "
                 f"expected {len(selected)} ({rc}): {tail}"
             )
-        if process.returncode != 0:
+        if returncode != 0:
             logger.warning(f"FFmpeg frame grab exited with {rc} but returned all frames: {tail}")
 
         frames: list[ExtractedFrame] = []
@@ -528,13 +547,8 @@ class VideoFrameExtractor:
                     f"Frame with pts {frame_info.pts:.3f} does not match any selected frame"
                 )
             used.add(match.index)
-            image = (
-                np.frombuffer(out, dtype=np.uint8, count=frame_size, offset=k * frame_size)
-                .reshape(info.height, info.width, 3)
-                .copy()  # writable, independent of the pipe buffer
-            )
             frames.append(ExtractedFrame(
-                image=image,
+                image=images[k],
                 timestamp=pts[match.index],
                 frame_number=match.index,
                 reason=match.reason,

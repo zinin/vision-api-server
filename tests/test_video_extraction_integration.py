@@ -360,6 +360,13 @@ class TestPipelineGuards:
             extractor._grab_frames(str(static_clip), swapped, scan.selected, scan.pts,
                                    deadline=time.monotonic() + extractor.timeout)
 
+    def test_expired_deadline_in_pass_two_raises_runtime_error(self, extractor, static_clip):
+        """The deadline is enforced while the frames are streamed, not by a communicate() timeout."""
+        scan = extractor.scan(str(static_clip), SelectionParams())
+        with pytest.raises(RuntimeError, match="timed out"):
+            extractor._grab_frames(str(static_clip), scan.info, scan.selected, scan.pts,
+                                   deadline=time.monotonic() - 1.0)
+
     def test_missing_showinfo_lines_truncate_the_scan(self, extractor, static_clip, monkeypatch):
         """Fewer timestamps than decoded frames: both lists are cut to the shorter one."""
         real_parse = video_utils.parse_showinfo_line

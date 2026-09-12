@@ -11,6 +11,7 @@ import pytest
 import video_utils
 from frame_selection import SelectionParams
 from video_utils import (
+    MAX_SCAN_HEIGHT,
     ShowinfoFrame,
     VideoFrameExtractor,
     VideoInfo,
@@ -97,6 +98,18 @@ class TestScanMotionGuards:
         info = VideoInfo(duration=1.0, width=1300, height=1, fps=10.0, codec="h264")
 
         with pytest.raises(ValueError, match="zero-height"):
+            VideoFrameExtractor()._scan_motion(
+                "/tmp/fake.mp4", info, deadline=time.monotonic() + 1.0
+            )
+
+    @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
+    def test_extreme_portrait_aspect_ratio_raises_value_error(self, mock_verify):
+        """Taller than 1:8 would make one gray scan frame hundreds of megabytes:
+        reject the crafted header before ffmpeg starts, as ValueError (422)."""
+        assert MAX_SCAN_HEIGHT == 5120
+        info = VideoInfo(duration=1.0, width=16, height=16384, fps=10.0, codec="h264")
+
+        with pytest.raises(ValueError, match="limit is 5120"):
             VideoFrameExtractor()._scan_motion(
                 "/tmp/fake.mp4", info, deadline=time.monotonic() + 1.0
             )

@@ -36,6 +36,8 @@ UNREADABLE_VIDEO_MESSAGE = (
     "The file may be corrupted or not a supported video format."
 )
 
+MAX_SCAN_HEIGHT = 8 * SCAN_WIDTH  # gray scan frames taller than 1:8 are rejected before ffmpeg starts
+
 _PTS_RE = re.compile(r"pts_time:\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
 _SIZE_RE = re.compile(r"\bs:(\d+)x(\d+)")
 
@@ -371,6 +373,11 @@ class VideoFrameExtractor:
         scaled_h = int(round(info.height * SCAN_WIDTH / info.width / 2)) * 2
         if scaled_h < 2:
             raise ValueError(f"Video aspect ratio {info.width}x{info.height} scales to a zero-height frame")
+        if scaled_h > MAX_SCAN_HEIGHT:
+            raise ValueError(
+                f"Video aspect ratio {info.width}x{info.height} scales to a {scaled_h} px high frame; "
+                f"the limit is {MAX_SCAN_HEIGHT} px"
+            )
         frame_size = SCAN_WIDTH * scaled_h
         cmd = [
             self.ffmpeg_path, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info",

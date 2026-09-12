@@ -246,7 +246,7 @@ All errors return JSON:
 **Status Codes:**
 - `400` — Invalid input (format, size, missing model)
 - `413` — File too large
-- `422` — Unreadable video, no video stream, or query parameter out of range
+- `422` — Unreadable video, no video stream, an aspect ratio the 640 px scan cannot handle (wider than about 640:1 or taller than 1:8), or query parameter out of range
 - `500` — Internal error (model load, inference failure)
 
 ## Models

@@ -559,9 +559,11 @@ async def detect_objects_in_video(
     **Frame selection:**
     1. The first frame is always taken (`reason=first`).
     2. A grid frame is taken every `max_gap` seconds, or `min_interval` if that is
-       larger (`reason=grid`); a grid longer than `max_frames` is thinned uniformly
-       and step 3 is skipped, so a video longer than about `(max_frames - 1) * max_gap`
-       seconds (about 24 s at the defaults) yields grid frames only.
+       larger (`reason=grid`). The grid has priority over step 3: once it fills
+       `max_frames`, no budget is left for peaks, so a video longer than
+       `(max_frames - 1)` grid steps (about 20 s at the defaults) yields grid frames
+       only. Past `max_frames` grid steps (about 24 s) the grid itself is thinned
+       uniformly.
     3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
        never closer than `min_interval` to another selected frame (`reason=motion`).
        Segments where nearly every frame changes (rain or snow in IR) get the grid only.
@@ -739,9 +741,11 @@ async def extract_video_frames(
     **Frame selection:**
     1. The first frame is always taken (`reason=first`).
     2. A grid frame is taken every `max_gap` seconds, or `min_interval` if that is
-       larger (`reason=grid`); a grid longer than `max_frames` is thinned uniformly
-       and step 3 is skipped, so a video longer than about `(max_frames - 1) * max_gap`
-       seconds (about 24 s at the defaults) yields grid frames only.
+       larger (`reason=grid`). The grid has priority over step 3: once it fills
+       `max_frames`, no budget is left for peaks, so a video longer than
+       `(max_frames - 1)` grid steps (about 20 s at the defaults) yields grid frames
+       only. Past `max_frames` grid steps (about 24 s) the grid itself is thinned
+       uniformly.
     3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
        never closer than `min_interval` to another selected frame (`reason=motion`).
        Segments where nearly every frame changes (rain or snow in IR) get the grid only.

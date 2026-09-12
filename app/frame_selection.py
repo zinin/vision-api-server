@@ -63,6 +63,16 @@ def _round_half_up(value: float) -> int:
     return int(value + 0.5)
 
 
+def _thin(grid: list[SelectedFrame], cap: int) -> list[SelectedFrame]:
+    """Thin a grid down to `cap` frames, uniformly, keeping the first and the last."""
+    if len(grid) <= cap:
+        return grid
+    if cap == 1:
+        return [grid[0]]
+    positions = [_round_half_up(k * (len(grid) - 1) / (cap - 1)) for k in range(cap)]
+    return [grid[p] for p in positions]
+
+
 def median_blob(blob: Sequence[float]) -> float:
     """Median metric of a segment, ignoring blob[0] (which is always 0). 0.0 for fewer than two frames."""
     return float(median(blob[1:])) if len(blob) >= 2 else 0.0
@@ -77,11 +87,14 @@ def select_frames(
 
     ``pts[i]`` is the presentation time of frame ``i``; ``blob[i]`` is the
     metric between frames ``i - 1`` and ``i`` (``blob[0]`` is 0). The rule:
-    frame 0, then a time grid every ``max(max_gap, min_interval)`` seconds,
-    thinned uniformly when it exceeds ``max_frames``; unless the segment is a
-    storm (median blob above ``STORM_MEDIAN_BLOB``), the remaining budget is
-    filled with the strongest motion peaks at least ``min_interval`` away from
-    every selected frame. Deterministic; the result is sorted by index.
+    frame 0, then a time grid every ``max(max_gap, min_interval)`` seconds. A
+    storm (median blob above ``STORM_MEDIAN_BLOB``) ends there, with the grid
+    thinned uniformly to ``max_frames``. Otherwise the grid is thinned one frame
+    short of ``max_frames`` and the remaining budget is filled with the strongest
+    motion peaks at least ``min_interval`` away from every selected frame, so a
+    recording of any length keeps at least one motion frame. The held-back frame
+    returns to the grid when no peak can use it. Deterministic; the result is
+    sorted by index.
     """
     n = len(pts)
     if len(blob) != n:
@@ -98,20 +111,17 @@ def select_frames(
             base.append(SelectedFrame(i, "grid"))
             last = pts[i]
 
-    # 3: uniform thinning keeps the first and the last grid frame; no budget is left for peaks
+    # 3: storm — nearly every frame changes, the metric is blind, keep the grid only
     cap = params.max_frames
-    if len(base) > cap:
-        if cap == 1:
-            return [base[0]]
-        positions = [_round_half_up(k * (len(base) - 1) / (cap - 1)) for k in range(cap)]
-        return [base[p] for p in positions]
-
-    # 4: storm — nearly every frame changes, the metric is blind, keep the grid only
+    full_grid = _thin(base, cap)
     if median_blob(blob) > STORM_MEDIAN_BLOB:
-        return base
+        return full_grid
+
+    # 4: hold one slot back, so a grid that fills the budget cannot crowd motion out entirely
+    selected = list(_thin(base, max(1, cap - 1)))  # copied: the peak loop appends to it
+    reserved = len(selected)
 
     # 5: motion peaks, strongest first, ties by index, NMS by min_interval
-    selected = list(base)
     taken = {f.index for f in selected}
     candidates = sorted(
         (i for i in range(n) if blob[i] > params.motion_threshold and i not in taken),
@@ -122,5 +132,9 @@ def select_frames(
             break
         if all(abs(pts[i] - pts[f.index]) >= params.min_interval - PTS_TOLERANCE for f in selected):
             selected.append(SelectedFrame(i, "motion"))
+
+    # the slot buys coverage only when a peak uses it; otherwise the grid frame goes back
+    if len(selected) == reserved:
+        return full_grid
 
     return sorted(selected, key=lambda f: f.index)

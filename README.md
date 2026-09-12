@@ -180,7 +180,7 @@ flowchart TB
 - **Async inference** — YOLO runs in `ThreadPoolExecutor` via `run_in_executor()` to keep the event loop responsive
 - **Two-tier model cache** — preloaded models (configured at startup, never evicted) + cached models (loaded on demand, TTL-based eviction)
 - **Video annotation pipeline** — async job API with single background worker; YOLO every Nth frame with "hold mode" (reuse last detections for intermediate frames)
-- **Motion-based frame selection** — two FFmpeg passes: a gray 640 px scan measures the largest changed region between neighbouring frames, then the selected frames are read out at full resolution; the selection is frame 0, a grid every `max_gap` (or `min_interval`, whichever is larger), and the strongest motion peaks above `motion_threshold`, no closer than `min_interval` and capped at `max_frames`
+- **Motion-based frame selection** — two FFmpeg passes: a gray 640 px scan measures the largest changed region between neighbouring frames, then the selected frames are read out at full resolution; the selection is frame 0, a grid every `max_gap` (or `min_interval`, whichever is larger) thinned to `max_frames - 1`, and the strongest motion peaks above `motion_threshold`, no closer than `min_interval` and capped at `max_frames` — so a recording of any length keeps at least one motion frame
 - **Process watchdog** — `supervisor.py` runs uvicorn as a child and polls `/health` from outside the Python process; a GPU hang that freezes the interpreter (GIL held) ends in a SIGKILL and a container restart instead of an indefinite outage
 
 ## Limits

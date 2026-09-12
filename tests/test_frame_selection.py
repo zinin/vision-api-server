@@ -67,10 +67,52 @@ class TestThinning:
         pts, blob = _static(40.0)
         assert select_frames(pts, blob, SelectionParams(max_frames=1)) == [SelectedFrame(0, "first")]
 
-    def test_thinning_leaves_no_budget_for_peaks(self):
+
+class TestMotionReserve:
+    """The grid is held one frame short of `max_frames` so a peak always fits."""
+
+    def test_long_clip_keeps_one_motion_slot(self):
         pts, blob = _static(40.0)
         blob[100] = 0.05
         selected = select_frames(pts, blob, SelectionParams(max_gap=4.0, max_frames=6))
+        assert SelectedFrame(100, "motion") in selected
+        assert len(selected) == 6
+
+    def test_grid_filling_the_budget_exactly_still_keeps_a_motion_slot(self):
+        # 20 s: the grid is exactly max_frames frames, so nothing is thinned
+        pts, blob = _static(20.1)
+        blob[70] = 0.05
+        selected = select_frames(pts, blob, SelectionParams(max_gap=4.0, max_frames=6))
+        assert SelectedFrame(70, "motion") in selected
+        assert len(selected) == 6
+
+    def test_only_one_slot_is_held_back(self):
+        pts, blob = _static(40.0)
+        for i in (50, 100, 150, 250, 350):
+            blob[i] = 0.05
+        selected = select_frames(pts, blob, SelectionParams(max_gap=4.0, max_frames=6))
+        assert _reasons(selected).count("motion") == 1
+        assert len(selected) == 6
+
+    def test_quiet_long_clip_keeps_the_full_grid(self):
+        pts, blob = _static(40.0)
+        selected = select_frames(pts, blob, SelectionParams(max_gap=4.0, max_frames=6))
+        assert _indices(selected) == [0, 80, 160, 200, 280, 360]
+        assert _reasons(selected) == ["first"] + ["grid"] * 5
+
+    def test_unusable_peak_gives_the_full_grid_back(self):
+        # the only candidate sits 0.5 s from a grid frame, closer than min_interval
+        pts, blob = _static(40.0)
+        blob[85] = 0.05
+        selected = select_frames(pts, blob, SelectionParams(max_gap=4.0, max_frames=6))
+        assert _indices(selected) == [0, 80, 160, 200, 280, 360]
+        assert "motion" not in _reasons(selected)
+
+    def test_storm_on_a_long_clip_keeps_the_full_grid(self):
+        pts, _ = _static(40.0)
+        blob = [0.0] + [0.05] * (len(pts) - 1)
+        selected = select_frames(pts, blob, SelectionParams(max_gap=4.0, max_frames=6))
+        assert _indices(selected) == [0, 80, 160, 200, 280, 360]
         assert "motion" not in _reasons(selected)
 
 

@@ -559,11 +559,9 @@ async def detect_objects_in_video(
     **Frame selection:**
     1. The first frame is always taken (`reason=first`).
     2. A grid frame is taken every `max_gap` seconds, or `min_interval` if that is
-       larger (`reason=grid`). The grid has priority over step 3: once it fills
-       `max_frames`, no budget is left for peaks, so a video longer than
-       `(max_frames - 1)` grid steps (about 20 s at the defaults) yields grid frames
-       only. Past `max_frames` grid steps (about 24 s) the grid itself is thinned
-       uniformly.
+       larger (`reason=grid`). The grid never takes the whole budget: it is thinned
+       uniformly to `max_frames - 1` frames, so a recording of any length keeps a slot
+       for step 3. The held-back frame returns to the grid when no peak can use it.
     3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
        never closer than `min_interval` to another selected frame (`reason=motion`).
        Segments where nearly every frame changes (rain or snow in IR) get the grid only.
@@ -741,11 +739,9 @@ async def extract_video_frames(
     **Frame selection:**
     1. The first frame is always taken (`reason=first`).
     2. A grid frame is taken every `max_gap` seconds, or `min_interval` if that is
-       larger (`reason=grid`). The grid has priority over step 3: once it fills
-       `max_frames`, no budget is left for peaks, so a video longer than
-       `(max_frames - 1)` grid steps (about 20 s at the defaults) yields grid frames
-       only. Past `max_frames` grid steps (about 24 s) the grid itself is thinned
-       uniformly.
+       larger (`reason=grid`). The grid never takes the whole budget: it is thinned
+       uniformly to `max_frames - 1` frames, so a recording of any length keeps a slot
+       for step 3. The held-back frame returns to the grid when no peak can use it.
     3. The strongest motion peaks above `motion_threshold` fill the remaining budget,
        never closer than `min_interval` to another selected frame (`reason=motion`).
        Segments where nearly every frame changes (rain or snow in IR) get the grid only.

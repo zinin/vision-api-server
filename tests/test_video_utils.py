@@ -1,56 +1,91 @@
+import asyncio
 import json
+import os
 import subprocess
+import tempfile
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import video_utils
 from frame_selection import SelectionParams
 from video_utils import (
     ShowinfoFrame,
     VideoFrameExtractor,
     VideoInfo,
+    extract_frames_from_video,
     parse_probe_output,
     parse_showinfo,
     parse_showinfo_line,
 )
 
 
+def _probe_run(payload: dict) -> MagicMock:
+    return MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+
 class TestExtractFramesNoVideoStream:
-    """Verify that files without a video stream raise ValueError early."""
+    """Verify that files without a video stream raise ValueError early: the check
+    lives in ``get_video_info``, so the probe output is what the test drives."""
 
     @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
-    @patch.object(VideoFrameExtractor, "get_video_info")
-    def test_audio_only_file_raises_value_error(self, mock_info, mock_verify):
-        mock_info.return_value = VideoInfo(
-            duration=0.15, width=0, height=0, fps=30.0, codec="unknown"
-        )
+    @patch("video_utils.subprocess.run")
+    def test_audio_only_file_raises_value_error(self, mock_run, mock_verify):
+        mock_run.return_value = _probe_run({"streams": [], "format": {"duration": "0.15"}})
 
         extractor = VideoFrameExtractor()
         with pytest.raises(ValueError, match="no video stream"):
             extractor.extract_frames("/tmp/fake.mp4", SelectionParams())
 
     @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
-    @patch.object(VideoFrameExtractor, "get_video_info")
-    def test_zero_width_raises_value_error(self, mock_info, mock_verify):
-        mock_info.return_value = VideoInfo(
-            duration=10.0, width=0, height=720, fps=30.0, codec="h264"
-        )
+    @patch("video_utils.subprocess.run")
+    def test_zero_width_raises_value_error(self, mock_run, mock_verify):
+        mock_run.return_value = _probe_run({
+            "streams": [{"codec_name": "h264", "width": 0, "height": 720, "avg_frame_rate": "30/1"}],
+            "format": {"duration": "10.0"},
+        })
 
         extractor = VideoFrameExtractor()
         with pytest.raises(ValueError, match="no video stream"):
             extractor.extract_frames("/tmp/fake.mp4", SelectionParams())
 
     @patch.object(VideoFrameExtractor, "_verify_ffmpeg")
-    @patch.object(VideoFrameExtractor, "get_video_info")
-    def test_zero_height_raises_value_error(self, mock_info, mock_verify):
-        mock_info.return_value = VideoInfo(
-            duration=10.0, width=1280, height=0, fps=30.0, codec="h264"
-        )
+    @patch("video_utils.subprocess.run")
+    def test_zero_height_raises_value_error(self, mock_run, mock_verify):
+        mock_run.return_value = _probe_run({
+            "streams": [{"codec_name": "h264", "width": 1280, "height": 0, "avg_frame_rate": "30/1"}],
+            "format": {"duration": "10.0"},
+        })
 
         extractor = VideoFrameExtractor()
         with pytest.raises(ValueError, match="no video stream"):
             extractor.extract_frames("/tmp/fake.mp4", SelectionParams())
+
+
+class TestExtractFramesFromVideoTempFile:
+    def test_temp_file_is_removed_when_the_write_fails(self, tmp_path, monkeypatch):
+        """A failing write (ENOSPC/EIO) must not leak the delete=False temp file."""
+        created: list[str] = []
+        real_named_temp_file = tempfile.NamedTemporaryFile
+
+        def failing_temp_file(*args, **kwargs):
+            tmp = real_named_temp_file(*args, **{**kwargs, "dir": str(tmp_path)})
+            created.append(tmp.name)
+
+            def _write(_data):
+                raise OSError("disk full")
+
+            tmp.write = _write
+            return tmp
+
+        monkeypatch.setattr(video_utils.tempfile, "NamedTemporaryFile", failing_temp_file)
+
+        with pytest.raises(OSError, match="disk full"):
+            asyncio.run(extract_frames_from_video(b"x", SelectionParams()))
+
+        assert created
+        assert not os.path.exists(created[0])
 
 
 class TestScanMotionGuards:
@@ -186,21 +221,30 @@ Stream mapping:
 [Parsed_showinfo_1 @ 0x5581] n:   0 pts:      0 pts_time:0       duration:   1024 duration_time:0.08 fmt:gray cl:unspecified sar:1/1 s:640x360 i:P iskey:1 type:I checksum:0848BE85 plane_checksum:[0848BE85] mean:[128] stdev:[0.0]
 [Parsed_showinfo_1 @ 0x5581] n:   1 pts:   1024 pts_time:0.08    duration:   1024 duration_time:0.08 fmt:gray cl:unspecified sar:1/1 s:640x360 i:P iskey:0 type:P checksum:0848BE85 plane_checksum:[0848BE85] mean:[128] stdev:[0.0]
 [Parsed_showinfo_1 @ 0x5581] n:   2 pts:   -512 pts_time:-0.04   duration:   1024 duration_time:0.08 fmt:gray cl:unspecified sar:1/1 s:640x360 i:P iskey:0 type:P checksum:0848BE85 plane_checksum:[0848BE85] mean:[128] stdev:[0.0]
+[Parsed_showinfo_1 @ 0x5581] n:   3 pts:      2 pts_time:2.22222e-05 duration:   1024 duration_time:0.08 fmt:gray cl:unspecified sar:1/1 s:640x360 i:P iskey:0 type:P checksum:0848BE85 plane_checksum:[0848BE85] mean:[128] stdev:[0.0]
 [out#0/rawvideo @ 0x5582] video:54000KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.000000%
 """
 
 
 class TestParseShowinfo:
     def test_parses_frames_and_ignores_other_lines(self):
-        assert parse_showinfo(SHOWINFO_SAMPLE) == [
+        frames = parse_showinfo(SHOWINFO_SAMPLE)
+        assert frames[:3] == [
             ShowinfoFrame(pts=0.0, width=640, height=360),
             ShowinfoFrame(pts=0.08, width=640, height=360),
             ShowinfoFrame(pts=-0.04, width=640, height=360),
         ]
+        assert len(frames) == 4
+        assert frames[3].pts == pytest.approx(2.22222e-05)
+        assert (frames[3].width, frames[3].height) == (640, 360)
 
     def test_line_without_frame_data_is_none(self):
         assert parse_showinfo_line("  Stream #0:0 -> #0:0 (hevc (native) -> rawvideo (native))") is None
         assert parse_showinfo_line("[Parsed_showinfo_1 @ 0x1] config in time_base: 1/12800, frame_rate: 25/2") is None
+
+    def test_positive_exponent_parses_as_a_float(self):
+        line = "[Parsed_showinfo_0 @ 0x1] n:   9 pts:  1280000 pts_time:1e+02 duration: 1024 duration_time:0.08 fmt:gray s:640x360 i:P iskey:0 type:P"
+        assert parse_showinfo_line(line) == ShowinfoFrame(pts=100.0, width=640, height=360)
 
     def test_pts_field_of_the_line_is_not_taken_for_size(self):
         line = "[Parsed_showinfo_0 @ 0x1] n:   5 pts:   5120 pts_time:0.4 duration: 1024 duration_time:0.08 fmt:bgr24 s:2880x1620 i:P iskey:0 type:P"

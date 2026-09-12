@@ -112,6 +112,10 @@ curl http://localhost:3001/jobs/$JOB/download -o annotated.mp4
 | `classes` | string | — | — | Comma-separated class filter (`person,car`) |
 | `detect_every` | int | 5 | 1–300 | YOLO every N frames (video annotation) |
 
+### Upgrading from 2.x
+
+Clients should send `max_frames=6` (frigate-analyzer: `DETECT_MAX_FRAMES=6`) and drop `scene_threshold`; with the old `max_frames=50` a 16-second segment with motion returns up to 16 frames where 2.x returned 2, roughly 8× the inferences on `/detect/video` until the client is updated. `/detect/video` now hands YOLO frames in BGR (2.x passed RGB by mistake), so detections on the same recordings differ from 2.x.
+
 ## Models
 
 YOLO26 models are downloaded automatically on first use:
@@ -180,7 +184,7 @@ flowchart TB
 - **Async inference** — YOLO runs in `ThreadPoolExecutor` via `run_in_executor()` to keep the event loop responsive
 - **Two-tier model cache** — preloaded models (configured at startup, never evicted) + cached models (loaded on demand, TTL-based eviction)
 - **Video annotation pipeline** — async job API with single background worker; YOLO every Nth frame with "hold mode" (reuse last detections for intermediate frames)
-- **Motion-based frame selection** — two FFmpeg passes: a gray 640 px scan measures the largest changed region between neighbouring frames, then the selected frames are read out at full resolution; the selection is frame 0, a grid every `max_gap` (or `min_interval`, whichever is larger) thinned to `max_frames - 1`, and the strongest motion peaks above `motion_threshold`, no closer than `min_interval` and capped at `max_frames` — so a recording of any length keeps at least one motion frame
+- **Motion-based frame selection** — two FFmpeg passes: a gray 640 px scan measures the largest changed region between neighbouring frames, then the selected frames are read out at full resolution; the selection is frame 0, a grid every `max_gap` (or `min_interval`, whichever is larger) thinned to `max_frames - 1`, and the strongest motion peaks above `motion_threshold`, no closer than `min_interval` and capped at `max_frames` — so a recording of any length keeps a slot for the strongest motion peak (the slot returns to the grid when no peak qualifies)
 - **Process watchdog** — `supervisor.py` runs uvicorn as a child and polls `/health` from outside the Python process; a GPU hang that freezes the interpreter (GIL held) ends in a SIGKILL and a container restart instead of an indefinite outage
 
 ## Limits

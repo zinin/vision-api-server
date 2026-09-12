@@ -14,12 +14,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import main
+import video_utils
 from config import Settings, get_settings
 from dependencies import get_job_manager, get_model_manager
 from frame_selection import SelectionParams
 from job_manager import JobManager
 from main import app
-from video_utils import VideoFrameExtractor, extract_frames_from_video
+from video_utils import VideoFrameExtractor, VideoInfo, extract_frames_from_video
 
 pytestmark = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
@@ -38,6 +40,14 @@ STORM_SRC = "nullsrc=s=320x240:r=10:d=10,geq=lum='random(1)*255':cb=128:cr=128"
 LONG_SRC = "color=c=gray:s=320x240:r=10:d=40"
 # a saturated colour: the only clip that tells BGR from RGB
 RED_SRC = "color=c=red:s=320x240:r=10:d=3"
+# the moving box of MOTION_SRC on a 40 s recording: the grid alone fills the budget
+LONG_MOTION_SRC = (
+    "color=c=black:s=320x240:r=10:d=40[bg];"
+    "color=c=white:s=30x30:r=10:d=40[box];"
+    "[bg][box]overlay=x='20+60*t':y=100:eval=frame:enable='between(t,1,3)'"
+)
+# every third frame of a 10 fps source, timestamps kept: irregular pts 0, 0.3, 0.6, …
+VFR_SRC = "testsrc=size=320x240:rate=10:duration=10"
 
 
 def _make_clip(path: Path, source: str) -> Path:
@@ -77,6 +87,41 @@ def long_clip(clips_dir):
 @pytest.fixture(scope="module")
 def red_clip(clips_dir):
     return _make_clip(clips_dir / "red.mp4", RED_SRC)
+
+
+@pytest.fixture(scope="module")
+def long_motion_clip(clips_dir):
+    return _make_clip(clips_dir / "long_motion.mp4", LONG_MOTION_SRC)
+
+
+@pytest.fixture(scope="module")
+def vfr_clip(clips_dir):
+    """Variable frame rate: ``select`` drops two frames out of three and
+    ``-fps_mode passthrough`` keeps the original timestamps."""
+    out = clips_dir / "vfr.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", VFR_SRC,
+         "-vf", "select='not(mod(n\\,3))'", "-fps_mode", "passthrough",
+         "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", str(out)],
+        check=True, timeout=120,
+    )
+    return out
+
+
+@pytest.fixture(scope="module")
+def multi_track_clip(clips_dir):
+    """Two video tracks of different sizes; the first one is what ffprobe reports."""
+    out = clips_dir / "multi_track.mp4"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "color=c=gray:s=160x120:r=10:d=1",
+         "-f", "lavfi", "-i", "color=c=gray:s=320x240:r=10:d=1",
+         "-map", "0:v", "-map", "1:v",
+         "-disposition:v:0", "0", "-disposition:v:1", "default",
+         "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", str(out)],
+        check=True, timeout=120,
+    )
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -124,15 +169,19 @@ def mock_model_manager():
 
 @pytest.fixture
 def client(tmp_path, mock_model_manager):
+    original_lifespan = app.router.lifespan_context
     app.router.lifespan_context = _noop_lifespan
     app.dependency_overrides[get_settings] = lambda: Settings(yolo_models="{}", video_jobs_dir=str(tmp_path))
     app.dependency_overrides[get_job_manager] = lambda: JobManager(
         jobs_dir=str(tmp_path), ttl_seconds=3600, max_queued=10
     )
     app.dependency_overrides[get_model_manager] = lambda: mock_model_manager
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as c:
+            yield c
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.dependency_overrides.clear()
 
 
 def _upload(path: Path):
@@ -261,12 +310,81 @@ class TestExtractFrames:
         assert [f.frame_number for f in result.frames] == [0, 80]
         assert result.info.duration == pytest.approx(10.0, abs=0.1)
 
+    def test_vfr_clip_timestamps_are_the_scanned_pts(self, extractor, vfr_clip):
+        """Irregular timestamps: the frames come back with the pts of pass 1,
+        never a frame index times a nominal frame rate."""
+        scan = extractor.scan(str(vfr_clip), SelectionParams())
+        result = extractor.extract_frames(str(vfr_clip), SelectionParams())
+
+        assert result.frames
+        assert [f.frame_number for f in result.frames] == [f.index for f in scan.selected]
+        assert [f.timestamp for f in result.frames] == [scan.pts[f.frame_number] for f in result.frames]
+
+    def test_multi_track_clip_decodes_the_probed_stream(self, extractor, multi_track_clip):
+        """ffprobe reads v:0, so ffmpeg must decode v:0 too — not the default-disposition track."""
+        result = extractor.extract_frames(str(multi_track_clip), SelectionParams())
+
+        assert result.frames
+        for frame in result.frames:
+            assert frame.image.shape == (120, 160, 3)
+
+    def test_long_motion_clip_keeps_one_motion_frame(self, extractor, long_motion_clip):
+        """40 s of grid would fill the budget on its own; the held-back slot still
+        buys the strongest peak, which lies inside the [1, 3] s movement window."""
+        result = extractor.extract_frames(str(long_motion_clip), SelectionParams())
+
+        assert len(result.frames) == 6
+        assert result.stats.counts["motion"] == 1
+        motion = [f for f in result.frames if f.reason == "motion"]
+        assert 1.0 <= motion[0].timestamp <= 3.0, motion[0].timestamp
+
     def test_frame_grab_mismatch_raises_runtime_error(self, extractor, static_clip, monkeypatch):
         """If the second pass returns frames that do not match the scan, fail loudly."""
         scan = extractor.scan(str(static_clip), SelectionParams())
         wrong_pts = [t + 0.5 for t in scan.pts]  # every pts off by half a second
         with pytest.raises(RuntimeError, match="does not match"):
             extractor._grab_frames(str(static_clip), scan.info, scan.selected, wrong_pts,
+                                   deadline=time.monotonic() + extractor.timeout)
+
+
+class TestPipelineGuards:
+    """The failure branches of both passes, exercised on real ffmpeg output."""
+
+    def test_wrong_frame_dimensions_raise_runtime_error(self, extractor, static_clip):
+        scan = extractor.scan(str(static_clip), SelectionParams())
+        swapped = VideoInfo(
+            duration=scan.info.duration, width=scan.info.height, height=scan.info.width,
+            fps=scan.info.fps, codec=scan.info.codec,
+        )
+        with pytest.raises(RuntimeError, match="differs from the expected"):
+            extractor._grab_frames(str(static_clip), swapped, scan.selected, scan.pts,
+                                   deadline=time.monotonic() + extractor.timeout)
+
+    def test_missing_showinfo_lines_truncate_the_scan(self, extractor, static_clip, monkeypatch):
+        """Fewer timestamps than decoded frames: both lists are cut to the shorter one."""
+        real_parse = video_utils.parse_showinfo_line
+        kept: list[int] = []
+
+        def every_other_line(line):
+            parsed = real_parse(line)
+            if parsed is None:
+                return None
+            kept.append(len(kept))
+            return parsed if len(kept) % 2 else None
+
+        info = extractor.get_video_info(str(static_clip))
+        monkeypatch.setattr(video_utils, "parse_showinfo_line", every_other_line)
+        pts, blob = extractor._scan_motion(str(static_clip), info,
+                                           deadline=time.monotonic() + extractor.timeout)
+
+        assert len(pts) == len(blob) == (len(kept) + 1) // 2
+
+    def test_no_showinfo_lines_raise_runtime_error(self, extractor, static_clip, monkeypatch):
+        info = extractor.get_video_info(str(static_clip))
+        monkeypatch.setattr(video_utils, "parse_showinfo_line", lambda line: None)
+
+        with pytest.raises(RuntimeError, match="without showinfo timestamps"):
+            extractor._scan_motion(str(static_clip), info,
                                    deadline=time.monotonic() + extractor.timeout)
 
 
@@ -324,6 +442,14 @@ class TestExtractFramesEndpoint:
         response = client.post("/extract/frames?max_gap=0.1", files=_upload(static_clip))
         assert response.status_code == 422
 
+    def test_extraction_failure_returns_500(self, client, static_clip, monkeypatch):
+        monkeypatch.setattr(main, "extract_frames_from_video", AsyncMock(side_effect=RuntimeError("boom")))
+
+        response = client.post("/extract/frames", files=_upload(static_clip))
+
+        assert response.status_code == 500
+        assert response.json()["detail"].startswith("Failed to extract frames")
+
     def test_audio_only_file_rejected_with_422(self, client, tmp_path):
         audio = tmp_path / "audio.mp4"
         subprocess.run(
@@ -354,3 +480,11 @@ class TestDetectVideoEndpoint:
         response = client.post("/detect/video?max_gap=2&max_frames=3", files=_upload(static_clip))
         assert response.status_code == 200, response.text
         assert [f["frame_number"] for f in response.json()["frames"]] == [0, 40, 80]
+
+    def test_extraction_failure_returns_500(self, client, static_clip, monkeypatch):
+        monkeypatch.setattr(main, "extract_frames_from_video", AsyncMock(side_effect=RuntimeError("boom")))
+
+        response = client.post("/detect/video", files=_upload(static_clip))
+
+        assert response.status_code == 500
+        assert response.json()["detail"].startswith("Failed to extract frames")

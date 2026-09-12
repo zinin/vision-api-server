@@ -30,6 +30,14 @@ class SelectionParams:
     min_interval: float = 1.0       # minimum distance between any two selected frames, seconds
     max_frames: int = 6             # cap on the number of selected frames
 
+    def __post_init__(self) -> None:
+        if self.max_frames < 1:
+            raise ValueError("max_frames must be at least 1")
+        if self.max_gap <= 0 or self.min_interval <= 0:
+            raise ValueError("max_gap and min_interval must be positive")
+        if self.motion_threshold < 0:
+            raise ValueError("motion_threshold must not be negative")
+
 
 @dataclass(frozen=True)
 class SelectedFrame:
@@ -63,14 +71,20 @@ def _round_half_up(value: float) -> int:
     return int(value + 0.5)
 
 
-def _thin(grid: list[SelectedFrame], cap: int) -> list[SelectedFrame]:
-    """Thin a grid down to `cap` frames, uniformly, keeping the first and the last."""
-    if len(grid) <= cap:
-        return grid
+def _thin(frames: list[SelectedFrame], cap: int) -> list[SelectedFrame]:
+    """Thin `frames` (frame 0 plus the grid) down to `cap`, uniformly, keeping the first
+    and, when at least two remain, the last; cap 1 keeps only frame 0."""
+    if len(frames) <= cap:
+        return frames
     if cap == 1:
-        return [grid[0]]
-    positions = [_round_half_up(k * (len(grid) - 1) / (cap - 1)) for k in range(cap)]
-    return [grid[p] for p in positions]
+        return [frames[0]]
+    positions = [_round_half_up(k * (len(frames) - 1) / (cap - 1)) for k in range(cap)]
+    return [frames[p] for p in positions]
+
+
+def is_storm(median_blob_value: float) -> bool:
+    """Nearly every frame changes (rain, snow in IR): the metric is blind, keep the grid only."""
+    return median_blob_value > STORM_MEDIAN_BLOB
 
 
 def median_blob(blob: Sequence[float]) -> float:
@@ -92,7 +106,7 @@ def select_frames(
     thinned uniformly to ``max_frames``. Otherwise the grid is thinned one frame
     short of ``max_frames`` and the remaining budget is filled with the strongest
     motion peaks at least ``min_interval`` away from every selected frame, so a
-    recording of any length keeps at least one motion frame. The held-back frame
+    recording of any length keeps a slot for a motion frame. The held-back frame
     returns to the grid when no peak can use it. Deterministic; the result is
     sorted by index.
     """
@@ -114,7 +128,7 @@ def select_frames(
     # 3: storm — nearly every frame changes, the metric is blind, keep the grid only
     cap = params.max_frames
     full_grid = _thin(base, cap)
-    if median_blob(blob) > STORM_MEDIAN_BLOB:
+    if is_storm(median_blob(blob)):
         return full_grid
 
     # 4: hold one slot back, so a grid that fills the budget cannot crowd motion out entirely

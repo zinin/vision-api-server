@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -11,14 +12,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ffmpeg_pipe import _rc_to_str
+from ffmpeg_pipe import rc_to_str
 from frame_selection import (
     PTS_TOLERANCE,
     SCAN_WIDTH,
-    STORM_MEDIAN_BLOB,
+    Reason,
     SelectedFrame,
     SelectionParams,
     blob_area,
+    is_storm,
     median_blob,
     prepare_frame,
     select_frames,
@@ -34,7 +36,7 @@ UNREADABLE_VIDEO_MESSAGE = (
     "The file may be corrupted or not a supported video format."
 )
 
-_PTS_RE = re.compile(r"pts_time:\s*(-?[0-9.]+)")
+_PTS_RE = re.compile(r"pts_time:\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
 _SIZE_RE = re.compile(r"\bs:(\d+)x(\d+)")
 
 
@@ -57,7 +59,7 @@ class ExtractedFrame:
     image: np.ndarray           # BGR uint8, H×W×3
     timestamp: float
     frame_number: int
-    reason: str
+    reason: Reason
 
 
 @dataclass(frozen=True)
@@ -277,14 +279,16 @@ class VideoFrameExtractor:
             subprocess.run(
                 [self.ffmpeg_path, "-version"],
                 capture_output=True,
-                check=True
+                check=True,
+                timeout=self.PROBE_TIMEOUT
             )
             subprocess.run(
                 [self.ffprobe_path, "-version"],
                 capture_output=True,
-                check=True
+                check=True,
+                timeout=self.PROBE_TIMEOUT
             )
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
             raise RuntimeError(
                 f"ffmpeg/ffprobe not found or not working. "
                 f"Please install ffmpeg: apt install ffmpeg"
@@ -328,8 +332,6 @@ class VideoFrameExtractor:
 
     def _scan(self, video_path: str, params: SelectionParams, deadline: float) -> ScanResult:
         info = self.get_video_info(video_path)
-        if info.width == 0 or info.height == 0:
-            raise ValueError(NO_VIDEO_STREAM_MESSAGE)
         logger.info(
             f"Video: duration={info.duration:.2f}s, resolution={info.width}x{info.height}, "
             f"fps={info.fps:.2f}, codec={info.codec}"
@@ -340,8 +342,8 @@ class VideoFrameExtractor:
         pass1_seconds = time.monotonic() - started
 
         if info.duration <= 0.0:
-            logger.warning(f"ffprobe gave no duration; using the last frame pts {pts[-1]:.3f}s")
-            info.duration = pts[-1]
+            logger.warning(f"ffprobe gave no duration; using the last frame pts {max(pts):.3f}s")
+            info.duration = max(pts)
         if any(later < earlier for earlier, later in zip(pts, pts[1:])):
             logger.warning("Frame pts are not monotonic; selection uses them as reported")
 
@@ -350,7 +352,7 @@ class VideoFrameExtractor:
         stats = SelectionStats(
             total_frames=len(pts),
             median_blob=median_blob_value,
-            storm=median_blob_value > STORM_MEDIAN_BLOB,
+            storm=is_storm(median_blob_value),
             counts=dict(Counter(f.reason for f in selected)),
             pass1_seconds=pass1_seconds,
         )
@@ -369,14 +371,17 @@ class VideoFrameExtractor:
             raise ValueError(f"Video aspect ratio {info.width}x{info.height} scales to a zero-height frame")
         frame_size = SCAN_WIDTH * scaled_h
         cmd = [
-            self.ffmpeg_path, "-hide_banner", "-nostats", "-loglevel", "info",
+            self.ffmpeg_path, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info",
             "-an", "-i", video_path,
+            "-map", "0:v:0",
             "-vf", f"scale={SCAN_WIDTH}:{scaled_h},showinfo",
             "-fps_mode", "passthrough",
             "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
         ]
         logger.debug(f"Motion scan command: {' '.join(cmd)}")
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         collector = _StderrCollector(process.stderr)
         killer = _Deadline(process, deadline)
         blob: list[float] = []
@@ -402,11 +407,11 @@ class VideoFrameExtractor:
             )
         if not blob:
             raise RuntimeError(
-                f"FFmpeg produced no frames ({_rc_to_str(returncode)}): {collector.tail_text()}"
+                f"FFmpeg produced no frames ({rc_to_str(returncode)}): {collector.tail_text()}"
             )
         if returncode != 0:
             logger.warning(
-                f"FFmpeg motion scan exited with {_rc_to_str(returncode)} after {len(blob)} frames: "
+                f"FFmpeg motion scan exited with {rc_to_str(returncode)} after {len(blob)} frames: "
                 f"{collector.tail_text()}"
             )
 
@@ -436,7 +441,8 @@ class VideoFrameExtractor:
             f"Frame selection: {len(frames)} frames (first {counts.get('first', 0)}, "
             f"grid {counts.get('grid', 0)}, motion {counts.get('motion', 0)}) of {scan.stats.total_frames}, "
             f"storm={scan.stats.storm}, median_blob={scan.stats.median_blob:.4f}, "
-            f"pass1={scan.stats.pass1_seconds:.2f}s, pass2={scan.stats.pass2_seconds:.2f}s"
+            f"pass1={scan.stats.pass1_seconds:.2f}s, pass2={scan.stats.pass2_seconds:.2f}s, "
+            f"last_pts={max(scan.pts):.2f}s"
         )
         return ExtractionResult(frames=frames, info=scan.info, stats=scan.stats)
 
@@ -458,15 +464,18 @@ class VideoFrameExtractor:
             raise RuntimeError("No frames selected")
         expr = "+".join(f"eq(n\\,{f.index})" for f in selected)
         cmd = [
-            self.ffmpeg_path, "-hide_banner", "-nostats", "-loglevel", "info",
+            self.ffmpeg_path, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "info",
             "-an", "-i", video_path,
+            "-map", "0:v:0",
             "-vf", f"select='{expr}',showinfo",
             "-fps_mode", "passthrough",
             "-frames:v", str(len(selected)),
             "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
         ]
         logger.debug(f"Frame grab command: {' '.join(cmd)}")
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         try:
             out, err = process.communicate(timeout=max(1.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
@@ -484,7 +493,7 @@ class VideoFrameExtractor:
         tail = "\n".join(
             line for line in stderr_text.splitlines() if parse_showinfo_line(line) is None
         )[-2000:]
-        rc = _rc_to_str(process.returncode)
+        rc = rc_to_str(process.returncode)
 
         frame_size = info.width * info.height * 3
         if len(out) % frame_size != 0:
@@ -536,16 +545,15 @@ class VideoFrameExtractor:
 
 async def extract_frames_from_video(video_data: bytes, params: SelectionParams) -> ExtractionResult:
     """Async wrapper: write the upload to a temp file and run both passes in the default executor."""
-    import asyncio
 
     def _extract() -> ExtractionResult:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            tmp_path = tmp.name
-            tmp.write(video_data)
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         try:
-            return VideoFrameExtractor().extract_frames(tmp_path, params)
+            with tmp:
+                tmp.write(video_data)
+            return VideoFrameExtractor().extract_frames(tmp.name, params)
         finally:
-            os.unlink(tmp_path)
+            os.unlink(tmp.name)
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _extract)

@@ -57,10 +57,12 @@ Video analysis on motion-selected frames.
 
 **Frame selection** (`app/frame_selection.py`):
 1. Frame 0 is always taken (`reason: first`).
-2. A grid frame every `max_gap` seconds, or `min_interval` if that is larger (`reason: grid`), counted from the previous grid frame — a motion peak never shifts the grid. The grid is thinned uniformly to `max_frames − 1` frames, keeping the first and the last, so one slot is always left for step 3 and a recording of any length keeps at least one motion frame. The held-back frame returns to the grid when no peak can use it — nothing above `motion_threshold`, or every candidate closer than `min_interval` to a selected frame — and a storm segment keeps the full grid of `max_frames`.
+2. A grid frame every `max_gap` seconds, or `min_interval` if that is larger (`reason: grid`), counted from the previous grid frame — a motion peak never shifts the grid. The grid is thinned uniformly to `max_frames − 1` frames, keeping the first and, when at least two remain, the last, so one slot is left for step 3 (with `max_frames=2` the slot replaces the last grid frame; `max_frames=1` returns frame 0 only). The held-back frame returns to the grid when no peak can use it — nothing above `motion_threshold`, or every candidate closer than `min_interval` to a selected frame — and a storm segment keeps the full grid of `max_frames`.
 3. Motion peaks fill the remaining budget: frames are ranked by `blob`, the area of the largest changed region between neighbouring frames (gray, 640 px wide) as a fraction of the frame, taken while above `motion_threshold` and at least `min_interval` from every selected frame (`reason: motion`). If the median `blob` over the segment exceeds 0.02 (rain, snow in IR), peaks are skipped and only the grid remains.
 
 `frame_number` is the frame index in the source video (0-based), `timestamp` its presentation time, `video_duration` comes from ffprobe. Unknown query parameters (e.g. the removed `scene_threshold`) are ignored.
+
+**Upgrading from 2.x.** Clients should send `max_frames=6` (frigate-analyzer: `DETECT_MAX_FRAMES=6`) and drop `scene_threshold`; with the old `max_frames=50` a 16-second segment with motion returns up to 16 frames where 2.x returned 2, roughly 8× the inferences on `/detect/video` until the client is updated. `/detect/video` now hands YOLO frames in BGR (2.x passed RGB by mistake), so detections on the same recordings differ from 2.x.
 
 ### POST /detect/visualize
 

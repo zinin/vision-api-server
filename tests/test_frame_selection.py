@@ -27,6 +27,16 @@ def _reasons(selected):
     return [f.reason for f in selected]
 
 
+class TestSelectionParams:
+    def test_max_frames_below_one_raises(self):
+        with pytest.raises(ValueError):
+            SelectionParams(max_frames=0)
+
+    def test_zero_min_interval_raises(self):
+        with pytest.raises(ValueError):
+            SelectionParams(min_interval=0)
+
+
 class TestFirstAndGrid:
     def test_single_frame(self):
         assert select_frames([0.0], [0.0], SelectionParams()) == [SelectedFrame(0, "first")]

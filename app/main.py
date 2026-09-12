@@ -48,6 +48,8 @@ from frame_selection import SelectionParams
 from inference_utils import get_executor
 from video_utils import extract_frames_from_video, VideoFrameExtractor
 
+API_VERSION = "3.0.0"
+
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, _log_level, logging.INFO),
@@ -346,7 +348,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
 app = FastAPI(
     title="YOLO Detection API",
     description="REST API for image and video analysis using Ultralytics YOLO",
-    version="3.0.0",
+    version=API_VERSION,
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc"
@@ -392,6 +394,21 @@ MaxFramesQuery = Annotated[
 ]
 
 
+def selection_params(
+        max_gap: MaxGapQuery = 4.0,
+        motion_threshold: MotionThresholdQuery = 0.001,
+        min_interval: MinIntervalQuery = 1.0,
+        max_frames: MaxFramesQuery = 6,
+) -> SelectionParams:
+    """Frame selection query parameters, shared by /detect/video and /extract/frames."""
+    return SelectionParams(
+        max_gap=max_gap,
+        motion_threshold=motion_threshold,
+        min_interval=min_interval,
+        max_frames=max_frames,
+    )
+
+
 @app.get("/", tags=["Health"])
 async def root(
         settings: Settings = Depends(get_settings),
@@ -401,7 +418,7 @@ async def root(
     preloaded = list(model_manager._preloaded.keys())
     return {
         "service": "YOLO Detection API",
-        "version": "3.0.0",
+        "version": API_VERSION,
         "preloaded_models": preloaded,
         "default_device": model_manager.default_device,
         "status": "ready",
@@ -545,10 +562,7 @@ async def detect_objects_in_video(
         conf: ConfidenceQuery = 0.5,
         imgsz: ImageSizeQuery = 640,
         max_det: MaxDetQuery = 100,
-        max_gap: MaxGapQuery = 4.0,
-        motion_threshold: MotionThresholdQuery = 0.001,
-        min_interval: MinIntervalQuery = 1.0,
-        max_frames: MaxFramesQuery = 6,
+        params: SelectionParams = Depends(selection_params),
         model: ModelQuery = None,
         model_manager: ModelManager = Depends(get_model_manager),
         settings: Settings = Depends(get_settings)
@@ -599,8 +613,8 @@ async def detect_objects_in_video(
 
     logger.info(
         f"Processing video: {file.filename}, conf={conf}, model={model_name}, "
-        f"max_gap={max_gap}, motion_threshold={motion_threshold}, "
-        f"min_interval={min_interval}, max_frames={max_frames}"
+        f"max_gap={params.max_gap}, motion_threshold={params.motion_threshold}, "
+        f"min_interval={params.min_interval}, max_frames={params.max_frames}"
     )
 
     # Read video data with size check
@@ -612,12 +626,6 @@ async def detect_objects_in_video(
         )
 
     # Extract frames
-    params = SelectionParams(
-        max_gap=max_gap,
-        motion_threshold=motion_threshold,
-        min_interval=min_interval,
-        max_frames=max_frames,
-    )
     try:
         extraction = await extract_frames_from_video(video_data=video_data, params=params)
     except ValueError as e:
@@ -725,10 +733,7 @@ async def detect_objects_in_video(
 @app.post("/extract/frames", response_model=FrameExtractionResponse, tags=["Frame Extraction"])
 async def extract_video_frames(
         file: UploadFile = File(..., description="Video file for frame extraction"),
-        max_gap: MaxGapQuery = 4.0,
-        motion_threshold: MotionThresholdQuery = 0.001,
-        min_interval: MinIntervalQuery = 1.0,
-        max_frames: MaxFramesQuery = 6,
+        params: SelectionParams = Depends(selection_params),
         quality: Annotated[int, Query(ge=1, le=100, description="JPEG quality")] = 85
 ):
     """
@@ -766,8 +771,9 @@ async def extract_video_frames(
             )
 
     logger.info(
-        f"Extracting frames from video: {file.filename}, max_gap={max_gap}, "
-        f"motion_threshold={motion_threshold}, min_interval={min_interval}, max_frames={max_frames}"
+        f"Extracting frames from video: {file.filename}, max_gap={params.max_gap}, "
+        f"motion_threshold={params.motion_threshold}, min_interval={params.min_interval}, "
+        f"max_frames={params.max_frames}"
     )
 
     # Read video data with size check
@@ -779,12 +785,6 @@ async def extract_video_frames(
         )
 
     # Extract frames
-    params = SelectionParams(
-        max_gap=max_gap,
-        motion_threshold=motion_threshold,
-        min_interval=min_interval,
-        max_frames=max_frames,
-    )
     try:
         extraction = await extract_frames_from_video(video_data=video_data, params=params)
     except ValueError as e:
@@ -808,8 +808,8 @@ async def extract_video_frames(
         success, jpeg_data = cv2.imencode('.jpg', frame.image, encode_params)
 
         if not success:
-            logger.warning(f"Failed to encode frame {frame.frame_number}")
-            continue
+            logger.error(f"Failed to encode frame {frame.frame_number} as JPEG")
+            raise HTTPException(status_code=500, detail=f"Failed to encode frame {frame.frame_number} as JPEG")
 
         image_base64 = base64.b64encode(jpeg_data.tobytes()).decode('utf-8')
 

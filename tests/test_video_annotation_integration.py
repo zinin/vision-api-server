@@ -5,8 +5,10 @@ real pipes, the reader and writer threads, yuv420p frames drawn in place,
 libx264 encoding and the audio merge.
 """
 import json
+import logging
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +16,7 @@ import pytest
 
 from detection_stabilizer import StabilizerConfig
 from hw_accel import HWAccelConfig, HWAccelType
-from video_annotator import AnnotationParams, VideoAnnotator
+from video_annotator import AnnotationParams, AnnotationStats, VideoAnnotator
 from visualization import DetectionVisualizer
 
 pytestmark = pytest.mark.skipif(
@@ -25,6 +27,11 @@ pytestmark = pytest.mark.skipif(
 WIDTH, HEIGHT, FPS, SECONDS = 320, 240, 10, 2
 BOX = (40, 60, 200, 180)  # x1, y1, x2, y2 in full-frame pixels
 BLUE = (255, 0, 0)  # BGR colour of class 0 in DetectionVisualizer's palette
+# Video length of the short-audio clip. The encoder's pipe and queues take in about
+# 40 frames before ffmpeg stops, so 2 s of video would be written in full.
+LONG_SECONDS = 10
+# Source frames the vfr clip keeps, at their original times: gaps of 0.1 s to 0.8 s.
+VFR_FRAMES = (0, 1, 2, 6, 7, 15, 19)
 
 
 class _Tensor:
@@ -71,16 +78,17 @@ class _StubModel:
         return results
 
 
-def _make_clip(path: Path, *, audio_seconds: float | None = SECONDS, pix_fmt: str = "yuv420p",
-               vfr: bool = False) -> Path:
+def _make_clip(path: Path, *, seconds: int = SECONDS, audio_seconds: float | None = SECONDS,
+               pix_fmt: str = "yuv420p", vfr: bool = False) -> Path:
     """A gray lavfi clip. ``audio_seconds=None`` leaves the audio out; ``vfr``
-    keeps every third frame with its original timestamp (0, 0.3, 0.6 s, ...)."""
+    keeps only VFR_FRAMES, each with its original timestamp (0, 0.1, 0.2, 0.6 s, ...)."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "lavfi", "-i", f"color=c=gray:s={WIDTH}x{HEIGHT}:r={FPS}:d={SECONDS}"]
+           "-f", "lavfi", "-i", f"color=c=gray:s={WIDTH}x{HEIGHT}:r={FPS}:d={seconds}"]
     if audio_seconds is not None:
         cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={audio_seconds}"]
     if vfr:
-        cmd += ["-vf", "select='not(mod(n\\,3))'", "-fps_mode", "passthrough"]
+        keep = "+".join(f"eq(n\\,{n})" for n in VFR_FRAMES)
+        cmd += ["-vf", f"select='{keep}'", "-fps_mode", "passthrough"]
     cmd += ["-c:v", "libx264", "-pix_fmt", pix_fmt]
     if audio_seconds is not None:
         cmd += ["-c:a", "aac"]
@@ -96,8 +104,8 @@ def clips(tmp_path_factory) -> dict[str, Path]:
         "no_audio": _make_clip(root / "no_audio.mp4", audio_seconds=None),
         # IP cameras often record full-range yuvj420p; pass 2 asks ffmpeg for yuv420p
         "full_range": _make_clip(root / "full_range.mp4", pix_fmt="yuvj420p"),
-        # -shortest ends the encoder before the last frames are written
-        "short_audio": _make_clip(root / "short_audio.mp4", audio_seconds=1),
+        # -shortest ends the encoder and closes its pipe while frames are still coming
+        "short_audio": _make_clip(root / "short_audio.mp4", seconds=LONG_SECONDS, audio_seconds=1),
         "vfr": _make_clip(root / "vfr.mp4", audio_seconds=None, vfr=True),
     }
 
@@ -108,6 +116,26 @@ def _annotator(model: "_StubModel", batch_size: int) -> VideoAnnotator:
         HWAccelConfig(accel_type=HWAccelType.CPU), codec="h264", crf=18,
         stabilizer_config=StabilizerConfig(), batch_size=batch_size,
     )
+
+
+def _annotate_within(annotator: VideoAnnotator, clip: Path, output: Path,
+                     params: AnnotationParams, timeout: float = 120.0) -> AnnotationStats:
+    """annotate() on a daemon thread, so that a hang fails the test instead of blocking the suite."""
+    outcome: dict = {}
+
+    def run() -> None:
+        try:
+            outcome["stats"] = annotator.annotate(clip, output, params)
+        except BaseException as exc:  # re-raised on the test's thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, name="annotate", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), f"annotate() still running after {timeout:.0f} s"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["stats"]
 
 
 def _probe(path: Path) -> dict:
@@ -173,14 +201,18 @@ def test_full_range_source(clips, tmp_path):
     _assert_box_drawn(_frame(output, 5))
 
 
-def test_audio_shorter_than_video_ends_the_output_early(clips, tmp_path):
+def test_audio_shorter_than_video_ends_the_output_early(clips, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="ffmpeg_pipe")
     output = tmp_path / "annotated.mp4"
-    stats = _annotator(_StubModel(), 4).annotate(
-        clips["short_audio"], output, AnnotationParams(conf=0.5, imgsz=320, line_width=6),
+    stats = _annotate_within(
+        _annotator(_StubModel(), 4), clips["short_audio"], output,
+        AnnotationParams(conf=0.5, imgsz=320, line_width=6),
     )
     written = int(_probe(output)["video"]["nb_read_frames"])
-    assert stats.total_frames == FPS * SECONDS
-    assert FPS // 2 <= written < stats.total_frames  # cut near the 1 s of audio
+    assert stats.total_frames == FPS * LONG_SECONDS
+    assert FPS // 2 <= written <= 2 * FPS  # cut near the 1 s of audio, long before the video ends
+    # the encoder exited while frames were still coming; both early-EOF branches log this
+    assert "FFmpegEncoder: clean exit" in caplog.text
     _assert_box_drawn(_frame(output, 2))
 
 
@@ -190,5 +222,8 @@ def test_variable_frame_rate_keeps_passes_aligned(clips, tmp_path):
         clips["vfr"], output, AnnotationParams(conf=0.5, imgsz=320, line_width=6),
     )
     written = int(_probe(output)["video"]["nb_read_frames"])
+    # the pipe decoders resample the irregular frames to a constant rate: a pass that
+    # decoded them as stored (-fps_mode passthrough) would count differently
+    assert stats.total_frames != int(_probe(clips["vfr"])["video"]["nb_read_frames"])
     assert written == stats.total_frames
     _assert_box_drawn(_frame(output, written - 1))  # boxes reach the last frame

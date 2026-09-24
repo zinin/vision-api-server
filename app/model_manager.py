@@ -62,6 +62,8 @@ class ModelManager:
 
         self._preloaded: dict[str, ModelEntry] = {}
         self._cached: dict[str, CachedModelEntry] = {}
+        # Instances of their own for video annotation jobs, see get_video_model()
+        self._video_models: dict[str, CachedModelEntry] = {}
         self._loading_locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
 
@@ -262,6 +264,55 @@ class ModelManager:
                 async with self._global_lock:
                     self._loading_locks.pop(model_name, None)
 
+    async def get_video_model(self, model_name: str | None = None) -> ModelEntry:
+        """A model instance of its own for video annotation jobs.
+
+        Ultralytics converts a model's weights between FP16 and FP32 in place
+        and rebuilds its predictor whenever ``quantize`` changes, so the video
+        pipeline must not share the instance ``/detect`` uses. The instance is
+        loaded from the same file onto the same device as ``get_model`` would
+        use, cached, and evicted after ``ttl_seconds`` without a job.
+
+        Raises:
+            ValueError: If no model name provided and no default model available.
+            RuntimeError: If model loading fails.
+        """
+        if model_name is None:
+            if not self._preloaded:
+                raise ValueError("No model specified and no default model available")
+            model_name = next(iter(self._preloaded))
+
+        cached = self._video_models.get(model_name)
+        if cached is not None:
+            cached.touch()
+            return cached.entry
+
+        lock_key = f"video:{model_name}"
+        async with self._global_lock:
+            if lock_key not in self._loading_locks:
+                self._loading_locks[lock_key] = asyncio.Lock()
+            lock = self._loading_locks[lock_key]
+
+        async with lock:
+            cached = self._video_models.get(model_name)
+            if cached is not None:
+                cached.touch()
+                return cached.entry
+
+            preloaded = self._preloaded.get(model_name)
+            device = preloaded.device if preloaded is not None else self.default_device
+            try:
+                entry = await self._load_model_async(model_name, device)
+                self._video_models[model_name] = CachedModelEntry(entry=entry)
+                logger.info(f"Video model {model_name} loaded on {device} (TTL: {self.ttl_seconds}s)")
+                return entry
+            except Exception as e:
+                logger.error(f"Failed to load video model {model_name}: {e}")
+                raise RuntimeError(f"Failed to load model {model_name}: {e}") from e
+            finally:
+                async with self._global_lock:
+                    self._loading_locks.pop(lock_key, None)
+
     async def cleanup_expired(self) -> int:
         """Remove expired models from cache. Returns count of evicted models."""
         evicted = 0
@@ -275,6 +326,20 @@ class ModelManager:
             if cached:
                 logger.info(f"Evicting expired model from cache: {model_name}")
                 # Help garbage collector
+                del cached.entry.model
+                del cached.entry.visualizer
+                evicted += 1
+
+        # A job longer than the TTL keeps its own reference to the model, so
+        # evicting the entry mid-job only means the next job loads it again.
+        expired_video = [
+            name for name, cached in self._video_models.items()
+            if cached.is_expired(self.ttl_seconds)
+        ]
+        for model_name in expired_video:
+            cached = self._video_models.pop(model_name, None)
+            if cached:
+                logger.info(f"Evicting idle video model: {model_name}")
                 del cached.entry.model
                 del cached.entry.visualizer
                 evicted += 1
@@ -332,6 +397,12 @@ class ModelManager:
             del cached.entry.model
             del cached.entry.visualizer
         self._cached.clear()
+
+        for model_name, cached in list(self._video_models.items()):
+            logger.debug(f"Unloading video model: {model_name}")
+            del cached.entry.model
+            del cached.entry.visualizer
+        self._video_models.clear()
 
         # Clear preloaded models
         for model_name, entry in list(self._preloaded.items()):

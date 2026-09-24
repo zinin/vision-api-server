@@ -1,4 +1,8 @@
 import asyncio
+import gc
+import weakref
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -6,7 +10,7 @@ import pytest
 from config import Settings
 from hw_accel import HWAccelConfig, HWAccelType
 from job_manager import JobManager, JobStatus
-from video_annotator import AnnotationStats
+from video_annotator import AnnotationStats, JobCancelledError
 
 
 @pytest.fixture
@@ -474,3 +478,88 @@ class TestAnnotationWorkerCancellation:
         final = worker_job_manager.get_job(job.job_id)
         assert final.status == JobStatus.CANCELLED
         assert final.error is None
+
+
+class TestAnnotationWorkerModelRelease:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "final_status"),
+        [
+            ("completed", JobStatus.COMPLETED),
+            ("failed", JobStatus.FAILED),
+            ("cancelled", JobStatus.CANCELLED),
+            ("setup_error", JobStatus.FAILED),
+        ],
+    )
+    async def test_idle_worker_holds_no_reference_to_the_model(
+        self, worker_app, worker_settings, worker_job_manager, caplog, outcome, final_status
+    ):
+        """Between jobs the worker holds no reference to the last job's model,
+        so evicting the video model from the cache frees it."""
+        from main import _annotation_worker
+
+        # pytest keeps a test's log records, and the traceback of an exc_info
+        # record would keep the model alive through its frames.
+        caplog.set_level("CRITICAL", logger="main")
+
+        class FakeModel:
+            names = {0: "person"}
+
+        class FakeAnnotator:
+            def __init__(self, model, **kwargs):
+                if outcome == "setup_error":
+                    raise RuntimeError("boom during setup")
+                self.model = model  # VideoAnnotator keeps its model as well
+
+            def annotate(self, **kwargs):
+                if outcome == "failed":
+                    raise RuntimeError("ffmpeg crashed")
+                if outcome == "cancelled":
+                    raise JobCancelledError()
+                return AnnotationStats(total_frames=1)
+
+        model = FakeModel()
+        model_ref = weakref.ref(model)
+        cache = {"entry": SimpleNamespace(model=model, visualizer=MagicMock(), device="cpu")}
+        del model
+
+        async def get_video_model(model_name=None):
+            return cache["entry"]
+
+        worker_app.state.model_manager.get_video_model = get_video_model
+
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        # One thread: a no-op submitted after the job runs only once that thread
+        # has dropped the job's work item and the exception annotate() raised.
+        executor = ThreadPoolExecutor(max_workers=1)
+        mock_executor = MagicMock()
+        mock_executor.executor = executor
+        loop = asyncio.get_running_loop()
+
+        with (
+            patch("main.VideoAnnotator", FakeAnnotator),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            task = asyncio.create_task(_annotation_worker(worker_app, worker_settings))
+            try:
+                deadline = loop.time() + 5.0
+                while job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                    assert loop.time() < deadline, f"job stuck in {job.status}"
+                    await asyncio.sleep(0.01)
+                assert job.status == final_status
+                await loop.run_in_executor(executor, lambda: None)
+
+                cache.clear()  # TTL eviction: the cache lets go of the model
+                gc.collect()
+                assert not task.done()  # the worker is waiting for the next job
+                assert model_ref() is None, "the idle worker still refers to the model"
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                executor.shutdown()

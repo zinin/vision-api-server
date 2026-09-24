@@ -336,6 +336,10 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     job_manager.mark_failed(job_id, str(e))
 
             finally:
+                # Drop the job's model before waiting for the next job: TTL
+                # eviction frees the video model only if nothing here refers to it.
+                annotator = None
+                model_entry = None
                 # Always clean up input file (per-job finally)
                 try:
                     if job.input_path and job.input_path.exists():

@@ -35,6 +35,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/frame_threads.py` | Reader/writer threads that overlap ffmpeg pipe I/O with inference and drawing |
 | `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
 | `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
+| `app/batch_inference.py` | Video pass 1: LetterBox-exact pre-resize, batched predict, FP16/batch mode per device |
 | `app/detection_stabilizer.py` | Detection track stabilizer, IoU matching, class voting |
 | `app/supervisor.py` | Process watchdog: runs uvicorn as a child, restarts the container when `/health` hangs |
 

@@ -31,7 +31,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/models.py` | Request/response Pydantic models |
 | `app/dependencies.py` | FastAPI dependency injection |
 | `app/hw_accel.py` | Hardware acceleration detection (NVIDIA/AMD/CPU) |
-| `app/ffmpeg_pipe.py` | FFmpeg pipe-based video decoder/encoder |
+| `app/ffmpeg_pipe.py` | FFmpeg pipe-based video decoder/encoder (bgr24 or yuv420p frames) |
 | `app/frame_threads.py` | Reader/writer threads that overlap ffmpeg pipe I/O with inference and drawing |
 | `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
 | `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
@@ -131,7 +131,7 @@ Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFm
 
 **Motion Frames**: Two ffmpeg passes. Pass 1 streams gray 640 px frames through a pipe and computes `blob`, the area of the largest changed region between neighbouring frames; pass 2 decodes again and reads out the selected frames with `select`, which drops the other frames after decoding. Selection: frame 0, a grid every `max_gap` (4 s, or `min_interval` when that is larger) thinned to `max_frames − 1` so one slot always stays free, then the strongest motion peaks above `motion_threshold` (0.001) at least `min_interval` (1 s) apart, capped at `max_frames` (6); the held-back frame returns to the grid when no peak can use it. A segment whose median `blob` exceeds 0.02 (rain, snow in IR) gets the grid only. Real pts from `showinfo`; `video_duration` from ffprobe. Tests use lavfi-generated clips, no binary fixtures.
 
-**Video Annotation**: Async job API — YOLO every Nth frame + hold mode (reuse detections) for intermediate frames. Single worker, in-memory job state (requires `workers=1`).
+**Video Annotation**: Async job API — YOLO every Nth frame + hold mode (reuse detections) for intermediate frames. Single worker, in-memory job state (requires `workers=1`). The worker gets its own model instance (`ModelManager.get_video_model`): Ultralytics flips a model between FP16 and FP32 in place, which would break a concurrent `/detect` on a shared one. Pass 1 decodes BGR on a `ThreadedFrameReader` thread that shrinks detection frames to the inference size exactly like Ultralytics' LetterBox (cv2 INTER_LINEAR; ffmpeg's scalers change detections), and the main thread runs YOLO in batches (`BatchDetector`: `VIDEO_BATCH_SIZE`, `VIDEO_FP16`, the batch halves on GPU out-of-memory). Pass 2 keeps frames in yuv420p from decoder to encoder, draws boxes on the Y/U/V planes (BT.601, the matrix the old BGR→yuv420p conversion used) and writes on a `ThreadedFrameWriter` thread. RTX 3090, yolo26x@1024, 2560×1920, 1601 frames: 77 s → 33 s, pass 2 at the NVENC ceiling.
 
 **Detection Stabilizer**: Two-pass decode pipeline. Pass 1 decodes video + collects YOLO detections with lowered conf (no disk cache). DetectionStabilizer links detections into tracks via IoU, votes on stable class, fills gaps bidirectionally with position-aware grace periods. Pass 2 decodes video again + renders stabilized boxes. Class filtering applied after stabilization.
 

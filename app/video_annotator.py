@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import torch
 
+from batch_inference import BatchDetector, inference_size, model_stride, resize_for_inference
 from detection_stabilizer import (
     DetectionStabilizer,
     RawDetection,
@@ -16,6 +18,7 @@ from detection_stabilizer import (
     StabilizerConfig,
 )
 from ffmpeg_pipe import FFmpegDecoder, FFmpegEncoder
+from frame_threads import ThreadedFrameReader, ThreadedFrameWriter
 from hw_accel import HWAccelConfig, HWAccelType
 from visualization import DetectionVisualizer, DetectionBox
 
@@ -148,6 +151,8 @@ class VideoAnnotator:
         codec: str = "h264",
         crf: int = 18,
         stabilizer_config: StabilizerConfig | None = None,
+        fp16: bool = False,
+        batch_size: int = 1,
     ):
         self.model = model
         self.visualizer = visualizer
@@ -156,6 +161,8 @@ class VideoAnnotator:
         self.codec = codec
         self.crf = crf
         self.stabilizer_config = stabilizer_config or StabilizerConfig()
+        self.fp16 = fp16
+        self.batch_size = batch_size
 
     def annotate(
         self,
@@ -196,7 +203,8 @@ class VideoAnnotator:
             f"Starting annotation: {input_path.name}, "
             f"{metadata.width}x{metadata.height} @ {metadata.fps:.1f}fps, ~{metadata.total_frames} frames, "
             f"model={model_name}, device={model_device}, "
-            f"detect_every={params.detect_every}, conf={params.conf}"
+            f"detect_every={params.detect_every}, conf={params.conf}, "
+            f"fp16={self.fp16}, batch={self.batch_size}"
         )
 
         stats = AnnotationStats(total_frames=metadata.total_frames)
@@ -210,6 +218,10 @@ class VideoAnnotator:
             cancel_event=cancel_event,
         )
         stats.total_frames = actual_frames
+        pass1_seconds = time.perf_counter() - start_time
+        # Pass 1 leaves its activations in PyTorch's cache; NVDEC and NVENC need
+        # that memory in pass 2. A no-op when CUDA was never initialised.
+        torch.cuda.empty_cache()
 
         # Guard after pass 1, before stabilize — avoids CPU cost of track
         # stabilization when cancel arrived at the tail of pass 1.
@@ -259,6 +271,7 @@ class VideoAnnotator:
         # on CPU with the same codec via libx264/libx265/libsvtav1 and CRF
         # mode. Non-NVENC RuntimeErrors propagate untouched.
         font_scale = self.visualizer.calculate_adaptive_font_scale(metadata.height)
+        pass2_start = time.perf_counter()
         try:
             self._pass2_render(
                 input_path, output_path, metadata, params, stabilized,
@@ -305,11 +318,14 @@ class VideoAnnotator:
                 f"(codec={effective_codec}, crf={retry_crf})"
             )
 
+        pass2_seconds = time.perf_counter() - pass2_start
         stats.processing_time_ms = int((time.perf_counter() - start_time) * 1000)
         fps_actual = actual_frames / max(stats.processing_time_ms / 1000, 0.001)
         logger.info(
             f"Frame processing complete: {actual_frames} frames in {stats.processing_time_ms}ms "
-            f"({fps_actual:.1f} fps), detected={stats.detected_frames}, "
+            f"({fps_actual:.1f} fps; pass1 {pass1_seconds:.1f}s "
+            f"{actual_frames / max(pass1_seconds, 0.001):.1f} fps, pass2 {pass2_seconds:.1f}s "
+            f"{actual_frames / max(pass2_seconds, 0.001):.1f} fps), detected={stats.detected_frames}, "
             f"tracked={stats.tracked_frames}, total_detections={stats.total_detections}"
         )
         return stats
@@ -341,39 +357,49 @@ class VideoAnnotator:
         stats: AnnotationStats,
         cancel_event: threading.Event | None = None,
     ) -> tuple[dict[int, list[RawDetection]], int]:
-        """Pass 1: decode frames, run YOLO, collect raw detections (no disk cache)."""
-        raw_detections: dict[int, list[RawDetection]] = {}
-        frame_num = 0
+        """Pass 1: decode on a reader thread, run YOLO in batches (no disk cache).
+
+        The reader thread shrinks every detection frame to the inference size
+        exactly as Ultralytics would, so the model input is unchanged while
+        the main thread only waits for the GPU.
+        """
+        size = inference_size(metadata.width, metadata.height, params.imgsz, model_stride(self.model))
+        detect_every = params.detect_every
+
+        def transform(frame_num: int, frame: np.ndarray) -> np.ndarray | None:
+            if frame_num % detect_every:
+                return None
+            return resize_for_inference(frame, size)
+
+        detector = BatchDetector(
+            self.model, self.class_names,
+            conf=yolo_conf, imgsz=params.imgsz, max_det=params.max_det,
+            fp16=self.fp16, batch_size=self.batch_size,
+            scale=(metadata.width / size[0], metadata.height / size[1]),
+        )
+        frame_count = 0
 
         with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder:
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise JobCancelledError()
-                frame = decoder.read_frame()
-                if frame is None:
-                    break
+            if cancel_event is not None and cancel_event.is_set():
+                raise JobCancelledError()
+            with ThreadedFrameReader(decoder, transform, queue_size=2 * self.batch_size) as frames:
+                for frame_num, small in frames:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise JobCancelledError()
+                    if small is not None:
+                        detector.add(frame_num, small)
+                    frame_count = frame_num + 1
 
-                if frame_num % params.detect_every == 0:
-                    results = self.model.predict(
-                        source=frame,
-                        conf=yolo_conf,
-                        imgsz=params.imgsz,
-                        max_det=params.max_det,
-                        verbose=False,
-                    )
-                    # No class filter here — all classes go to stabilizer
-                    dets = self._extract_raw_detections(results, frame_num, class_filter=None)
-                    if dets:
-                        raw_detections[frame_num] = dets
-                    stats.detected_frames += 1
+                    if progress_callback and metadata.total_frames > 0 and frame_count % 10 == 0:
+                        progress = int((frame_count / metadata.total_frames) * 80)
+                        progress_callback(min(progress, 80))
 
-                frame_num += 1
+            if cancel_event is not None and cancel_event.is_set():
+                raise JobCancelledError()
+            detector.flush()
 
-                if progress_callback and metadata.total_frames > 0 and frame_num % 10 == 0:
-                    progress = int((frame_num / metadata.total_frames) * 80)
-                    progress_callback(min(progress, 80))
-
-        return raw_detections, frame_num
+        stats.detected_frames = detector.detected_frames
+        return detector.detections, frame_count
 
     @staticmethod
     def _get_video_metadata(video_path: Path) -> VideoMetadata:
@@ -455,31 +481,6 @@ class VideoAnnotator:
             f"for {video_path}"
         )
 
-    def _extract_raw_detections(
-        self, results: list, frame_num: int, class_filter: list[str] | None
-    ) -> list[RawDetection]:
-        """Extract RawDetection list from YOLO results with optional class filter."""
-        detections = []
-        for result in results:
-            if result.boxes is None or len(result.boxes) == 0:
-                continue
-            xyxy = result.boxes.xyxy.cpu().numpy()
-            cls = result.boxes.cls.cpu().numpy()
-            conf = result.boxes.conf.cpu().numpy()
-            for i in range(len(cls)):
-                class_id = int(cls[i])
-                class_name = self.class_names.get(class_id, f"class_{class_id}")
-                if class_filter and class_name not in class_filter:
-                    continue
-                detections.append(RawDetection(
-                    frame_num=frame_num,
-                    x1=int(xyxy[i][0]), y1=int(xyxy[i][1]),
-                    x2=int(xyxy[i][2]), y2=int(xyxy[i][3]),
-                    class_id=class_id, class_name=class_name,
-                    confidence=float(conf[i]),
-                ))
-        return detections
-
     def _pass2_render(
         self,
         input_path: Path,
@@ -496,31 +497,38 @@ class VideoAnnotator:
         cancel_event: threading.Event | None = None,
         hw_config: HWAccelConfig | None = None,
     ) -> None:
-        """Pass 2: decode video again, draw stabilized detections, encode.
+        """Pass 2: decode yuv420p again, draw on the planes, encode on a writer thread.
+
+        Frames stay in yuv420p from decoder to encoder, so neither ffmpeg
+        converts colours and only the pixels under the boxes change.
 
         ``hw_config`` defaults to ``self.hw_config``; it's overridable so
         ``annotate()`` can retry this pass on CPU when NVENC init fails.
         """
         frame_num = 0
         config = hw_config if hw_config is not None else self.hw_config
+        width, height = metadata.width, metadata.height
 
-        with FFmpegDecoder(input_path, metadata.width, metadata.height, config) as decoder, \
-             FFmpegEncoder(input_path, output_path, metadata.width, metadata.height,
+        with FFmpegDecoder(input_path, width, height, config, pix_fmt="yuv420p") as decoder, \
+             FFmpegEncoder(input_path, output_path, width, height,
                            metadata.fps, config, effective_codec,
-                           crf=effective_crf, bitrate=effective_bitrate) as encoder:
+                           crf=effective_crf, bitrate=effective_bitrate,
+                           pix_fmt="yuv420p") as encoder, \
+             ThreadedFrameWriter(encoder, decoder.frame_shape) as writer:
 
             while True:
                 if cancel_event is not None and cancel_event.is_set():
                     raise JobCancelledError()
-                frame = decoder.read_frame()
-                if frame is None:
+                frame = writer.acquire()
+                if not decoder.read_into(frame):
+                    writer.release(frame)
                     break
 
                 if frame_num in stabilized:
-                    self._draw_detections(frame, stabilized[frame_num].detections,
-                                          params, font_scale)
+                    self._draw_detections(frame, width, height,
+                                          stabilized[frame_num].detections, params, font_scale)
 
-                if not encoder.write_frame(frame):
+                if not writer.submit(frame):
                     # Encoder finished early (e.g. -shortest finalised the
                     # output); further frames would be decoded and drawn in
                     # vain. Break out instead of feeding dead iterations.
@@ -534,13 +542,17 @@ class VideoAnnotator:
     def _draw_detections(
         self,
         frame: np.ndarray,
+        width: int,
+        height: int,
         detections: list[DetectionBox],
         params: AnnotationParams,
         font_scale: float,
     ) -> None:
         for det in detections:
-            self.visualizer.draw_detection(
-                image=frame,
+            self.visualizer.draw_detection_yuv420(
+                frame=frame,
+                width=width,
+                height=height,
                 det=det,
                 line_width=params.line_width,
                 show_labels=params.show_labels,

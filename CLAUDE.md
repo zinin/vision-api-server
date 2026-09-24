@@ -32,6 +32,7 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/dependencies.py` | FastAPI dependency injection |
 | `app/hw_accel.py` | Hardware acceleration detection (NVIDIA/AMD/CPU) |
 | `app/ffmpeg_pipe.py` | FFmpeg pipe-based video decoder/encoder |
+| `app/frame_threads.py` | Reader/writer threads that overlap ffmpeg pipe I/O with inference and drawing |
 | `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
 | `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
 | `app/detection_stabilizer.py` | Detection track stabilizer, IoU matching, class voting |

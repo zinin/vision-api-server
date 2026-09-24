@@ -43,6 +43,7 @@ from models import (
 from visualization import encode_image_to_bytes
 from job_manager import JobManager, JobStatus
 from video_annotator import VideoAnnotator, AnnotationParams, JobCancelledError
+from batch_inference import resolve_inference_mode
 from detection_stabilizer import StabilizerConfig
 from frame_selection import SelectionParams
 from inference_utils import get_executor
@@ -210,7 +211,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                 model_name = job.params.get("model")
                 logger.debug(f"Job {job_id}: loading model '{model_name or 'default'}'")
                 try:
-                    model_entry = await model_manager.get_model(model_name)
+                    model_entry = await model_manager.get_video_model(model_name)
                 except (RuntimeError, ValueError) as e:
                     if job.cancel_event.is_set():
                         logger.info(
@@ -240,6 +241,9 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                         center_zone=settings.stabilizer_center_zone,
                         max_staleness_sec=settings.stabilizer_max_staleness,
                     )
+                    mode = resolve_inference_mode(
+                        settings.video_fp16, settings.video_batch_size, model_entry.device
+                    )
                     annotator = VideoAnnotator(
                         model=model_entry.model,
                         visualizer=model_entry.visualizer,
@@ -248,6 +252,8 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                         codec=settings.video_codec,
                         crf=settings.video_crf,
                         stabilizer_config=stabilizer_config,
+                        fp16=mode.fp16,
+                        batch_size=mode.batch_size,
                     )
 
                     params = AnnotationParams(

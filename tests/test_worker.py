@@ -25,13 +25,14 @@ def mock_model_entry():
     entry.model = MagicMock()
     entry.model.names = {0: "person"}
     entry.visualizer = MagicMock()
+    entry.device = "cpu"
     return entry
 
 
 @pytest.fixture
 def worker_model_manager(mock_model_entry):
     mm = MagicMock()
-    mm.get_model = AsyncMock(return_value=mock_model_entry)
+    mm.get_video_model = AsyncMock(return_value=mock_model_entry)
     return mm
 
 
@@ -99,7 +100,7 @@ class TestAnnotationWorker:
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
         job.input_path.touch()
 
-        worker_app.state.model_manager.get_model = AsyncMock(
+        worker_app.state.model_manager.get_video_model = AsyncMock(
             side_effect=RuntimeError("model not found")
         )
 
@@ -159,7 +160,7 @@ class TestAnnotationWorker:
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
         job.input_path.touch()
 
-        worker_app.state.model_manager.get_model = AsyncMock(
+        worker_app.state.model_manager.get_video_model = AsyncMock(
             side_effect=RuntimeError("model error")
         )
 
@@ -193,21 +194,22 @@ class TestAnnotationWorker:
 
         call_count = 0
 
-        async def get_model_side_effect(name):
+        async def get_video_model_side_effect(name):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise RuntimeError("model error")
-            return worker_app.state.model_manager.get_model.return_value
+            return worker_app.state.model_manager.get_video_model.return_value
 
         # Reset to allow first call to fail, second to succeed
         original_entry = MagicMock()
         original_entry.model = MagicMock()
         original_entry.model.names = {0: "person"}
         original_entry.visualizer = MagicMock()
+        original_entry.device = "cpu"
 
-        worker_app.state.model_manager.get_model = AsyncMock(side_effect=get_model_side_effect)
-        worker_app.state.model_manager.get_model.return_value = original_entry
+        worker_app.state.model_manager.get_video_model = AsyncMock(side_effect=get_video_model_side_effect)
+        worker_app.state.model_manager.get_video_model.return_value = original_entry
 
         mock_stats = AnnotationStats(total_frames=10)
         mock_annotator_cls = MagicMock()
@@ -224,6 +226,60 @@ class TestAnnotationWorker:
 
         assert worker_job_manager.get_job(job1.job_id).status == JobStatus.FAILED
         assert worker_job_manager.get_job(job2.job_id).status == JobStatus.COMPLETED
+
+
+    @pytest.mark.asyncio
+    async def test_passes_configured_inference_mode(
+        self, worker_app, worker_job_manager, tmp_path
+    ):
+        """VIDEO_FP16 / VIDEO_BATCH_SIZE reach VideoAnnotator as fp16 / batch_size."""
+        settings = Settings(
+            yolo_models="{}", video_jobs_dir=str(tmp_path), max_executor_workers=1,
+            video_fp16="false", video_batch_size="4",
+        )
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        mock_annotator_cls = MagicMock()
+        mock_annotator_cls.return_value.annotate.return_value = AnnotationStats(total_frames=1)
+        mock_executor = MagicMock()
+        mock_executor.executor = None
+
+        with (
+            patch("main.VideoAnnotator", mock_annotator_cls),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            await _run_worker_until_job_done(worker_app, settings, worker_job_manager)
+
+        kwargs = mock_annotator_cls.call_args.kwargs
+        assert kwargs["fp16"] is False
+        assert kwargs["batch_size"] == 4
+
+    @pytest.mark.asyncio
+    async def test_auto_inference_mode_on_cpu_is_fp32_batch_1(
+        self, worker_app, worker_settings, worker_job_manager
+    ):
+        """With the defaults (auto) a model on CPU keeps today's behaviour."""
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        mock_annotator_cls = MagicMock()
+        mock_annotator_cls.return_value.annotate.return_value = AnnotationStats(total_frames=1)
+        mock_executor = MagicMock()
+        mock_executor.executor = None
+
+        with (
+            patch("main.VideoAnnotator", mock_annotator_cls),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            await _run_worker_until_job_done(worker_app, worker_settings, worker_job_manager)
+
+        kwargs = mock_annotator_cls.call_args.kwargs
+        assert kwargs["fp16"] is False
+        assert kwargs["batch_size"] == 1
+        worker_app.state.model_manager.get_video_model.assert_awaited()
 
 
 class TestAnnotationWorkerCancellation:
@@ -300,20 +356,20 @@ class TestAnnotationWorkerCancellation:
     async def test_cancel_during_model_load(
         self, worker_app, worker_settings, worker_job_manager, tmp_path
     ):
-        """If cancel arrives while get_model() is in flight, worker must
+        """If cancel arrives while get_video_model() is in flight, worker must
         observe the event right after and never construct the annotator."""
         job = worker_job_manager.create_job(params={})
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
         job.input_path.touch()
 
-        real_get_model = worker_app.state.model_manager.get_model
+        real_get_video_model = worker_app.state.model_manager.get_video_model
 
-        async def slow_get_model(name=None):
+        async def slow_get_video_model(name=None):
             # Simulate /cancel arriving during model load.
             worker_job_manager.request_cancel(job.job_id)
-            return await real_get_model(name)
+            return await real_get_video_model(name)
 
-        worker_app.state.model_manager.get_model = AsyncMock(side_effect=slow_get_model)
+        worker_app.state.model_manager.get_video_model = AsyncMock(side_effect=slow_get_video_model)
 
         mock_annotator_cls = MagicMock()
         mock_executor = MagicMock()
@@ -334,7 +390,7 @@ class TestAnnotationWorkerCancellation:
     async def test_cancel_precedence_over_model_load_failure(
         self, worker_app, worker_settings, worker_job_manager, tmp_path
     ):
-        """If cancel is set and get_model() also fails, status must be
+        """If cancel is set and get_video_model() also fails, status must be
         CANCELLED (cancel wins over pre-annotate failure)."""
         job = worker_job_manager.create_job(params={})
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,7 +400,7 @@ class TestAnnotationWorkerCancellation:
             worker_job_manager.request_cancel(job.job_id)
             raise RuntimeError("model not found")
 
-        worker_app.state.model_manager.get_model = AsyncMock(side_effect=cancel_then_fail)
+        worker_app.state.model_manager.get_video_model = AsyncMock(side_effect=cancel_then_fail)
 
         mock_annotator_cls = MagicMock()
         mock_executor = MagicMock()

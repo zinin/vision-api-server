@@ -1,6 +1,7 @@
 import logging
 import os
 import subprocess
+import sys
 from unittest.mock import patch, MagicMock, call
 from io import BytesIO
 
@@ -763,6 +764,33 @@ class TestFFmpegEncoder:
 
         # stdin.write was never called because poll() short-circuited first.
         mock_proc.stdin.write.assert_not_called()
+
+    def test_close_after_a_clean_early_exit_drops_the_unwritten_tail(self, caplog):
+        """A real pipe to a child that exits rc=0 without reading, as ffmpeg does after -shortest.
+
+        Frames smaller than the stdin buffer (4096 bytes) wait in it until
+        flush(). The child exits while flush() is blocked on the full pipe,
+        so the last frame stays buffered and close() flushes it into the
+        closed pipe again: that BrokenPipeError must not escape a clean exit.
+        """
+        caplog.set_level(logging.DEBUG, logger="ffmpeg_pipe")
+        real_popen = subprocess.Popen
+
+        def child_that_never_reads(cmd, **kwargs):
+            return real_popen([sys.executable, "-c", "import time; time.sleep(0.5)"], **kwargs)
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros(1024, dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", side_effect=child_that_never_reads):
+            with FFmpegEncoder("input.mp4", "output.mp4", 320, 240, 10.0, config, "h264", crf=18) as encoder:
+                for _ in range(10_000):  # a 1 MiB pipe is full after 1024 frames
+                    if not encoder.write_frame(frame):
+                        break
+                else:
+                    pytest.fail("write_frame never reported the early exit")
+
+        assert "clean exit after BrokenPipe" in caplog.text  # the pipe broke inside flush()
 
     def test_bitrate_mode_command(self):
         """When bitrate is passed, command uses -b:v instead of -crf."""

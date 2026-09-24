@@ -248,9 +248,9 @@ class FFmpegEncoder:
         # the BufferedWriter "write all bytes" contract — raw unbuffered
         # mode can short-write under EINTR / backpressure and misalign
         # the rawvideo stream. write_frame() calls flush() after each
-        # frame, which keeps the buffer empty so close()'s implicit
-        # flush cannot push residual bytes into a pipe that ffmpeg has
-        # already closed (e.g. after -shortest).
+        # frame, which keeps the buffer empty between frames. Only a
+        # flush that hits a pipe ffmpeg already closed (e.g. after
+        # -shortest) leaves bytes behind; close() deals with those.
         self._process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False,
         )
@@ -294,10 +294,11 @@ class FFmpegEncoder:
         try:
             # A memoryview hands the array's own memory to write(): no copy.
             self._process.stdin.write(memoryview(np.ascontiguousarray(frame)).cast("B"))
-            # Flush after every frame so the Python-side buffer never holds
-            # residual bytes: close()'s implicit flush would otherwise push
-            # them into a pipe ffmpeg already closed (e.g. after -shortest)
-            # and raise a spurious BrokenPipeError despite a clean rc=0.
+            # Flush after every frame so the Python-side buffer holds no
+            # residual bytes for close()'s implicit flush to push into a
+            # pipe ffmpeg already closed (e.g. after -shortest). If this
+            # flush itself hits the closed pipe, the unwritten tail stays
+            # buffered; close() drops it after a clean exit.
             self._process.stdin.flush()
         except OSError as e:  # BrokenPipeError is a subclass of OSError.
             # The pipe closed mid-write. Most often this means the
@@ -337,7 +338,16 @@ class FFmpegEncoder:
     def close(self) -> None:
         """Close stdin, wait for FFmpeg to finish, check return code."""
         if self._process.stdin:
-            self._process.stdin.close()
+            try:
+                self._process.stdin.close()
+            except BrokenPipeError:
+                # After a clean early exit (-shortest) the flush in write_frame
+                # can fail with the tail of a frame still buffered, and closing
+                # flushes it into the closed pipe again. ffmpeg finished with
+                # rc=0, so the tail is dropped; any other state still raises.
+                if not self._eof:
+                    raise
+                logger.debug("FFmpegEncoder: dropped the unwritten tail of a frame after clean exit")
         self._stderr_thread.join(timeout=10)
         if self._process.stderr:
             self._process.stderr.close()

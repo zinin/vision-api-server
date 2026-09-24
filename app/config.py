@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     video_crf: int = Field(default=18, ge=0, le=63)
     video_hw_accel: str = "auto"  # auto | nvidia | amd | cpu
     vaapi_device: str = "/dev/dri/renderD128"  # VAAPI render device path
+    # Video annotation inference; "auto" picks by the model's device (see batch_inference)
+    video_fp16: str = "auto"  # auto | true | false
+    video_batch_size: str = "auto"  # auto | 1..64 frames per YOLO call
 
     # Detection stabilizer settings
     stabilizer_conf_factor: float = Field(default=0.4, gt=0, le=1)
@@ -101,6 +104,24 @@ class Settings(BaseSettings):
         if v not in allowed:
             raise ValueError(f"video_hw_accel must be one of: {allowed}")
         return v
+
+    @field_validator("video_fp16", mode="before")
+    @classmethod
+    def validate_video_fp16(cls, v) -> str:
+        value = str(v).strip().lower() or "auto"
+        if value not in ("auto", "true", "false"):
+            raise ValueError("video_fp16 must be one of: auto, true, false")
+        return value
+
+    @field_validator("video_batch_size", mode="before")
+    @classmethod
+    def validate_video_batch_size(cls, v) -> str:
+        value = str(v).strip().lower() or "auto"
+        if value == "auto":
+            return value
+        if not value.isdigit() or not 1 <= int(value) <= 64:
+            raise ValueError("video_batch_size must be auto or an integer from 1 to 64")
+        return str(int(value))
 
     @field_validator("yolo_model_ttl")
     @classmethod

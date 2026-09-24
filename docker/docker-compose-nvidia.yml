@@ -12,6 +12,9 @@ services:
       VIDEO_CODEC: ${VIDEO_CODEC:-auto}
       VIDEO_CRF: ${VIDEO_CRF:-18}
       VIDEO_HW_ACCEL: ${VIDEO_HW_ACCEL:-nvidia}
+      # Video annotation inference; empty = auto (FP16 + batch 8 on NVIDIA, FP32 + batch 1 elsewhere)
+      VIDEO_FP16: ${VIDEO_FP16:-}
+      VIDEO_BATCH_SIZE: ${VIDEO_BATCH_SIZE:-}
       YOLO_DEVICE: 'cuda:0'
       MODELS_DIR: /models
       NVIDIA_VISIBLE_DEVICES: all

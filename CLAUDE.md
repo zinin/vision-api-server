@@ -74,6 +74,9 @@ VIDEO_CODEC=auto                        # auto (match source) | h264 | h265 | av
 VIDEO_CRF=18                            # Quality: 0=lossless, 18=near-lossless, 23=default
 VIDEO_HW_ACCEL=auto                     # auto | nvidia | amd | cpu
 VAAPI_DEVICE=/dev/dri/renderD128        # VAAPI render device path
+VIDEO_FP16=auto                         # auto | true | false: FP16 YOLO in video annotation
+VIDEO_BATCH_SIZE=auto                   # auto | 1-64 frames per YOLO call in video annotation
+                                        # auto = FP16 + batch 8 on NVIDIA, FP32 + batch 1 on AMD/CPU
 STABILIZER_CONF_FACTOR=0.4      # YOLO conf multiplier for stabilizer (0-1]
 STABILIZER_IOU_THRESHOLD=0.3    # IoU threshold for track matching (0-1]
 STABILIZER_MIN_VOTE_CONF=0.3    # Min conf for class voting [0-1]

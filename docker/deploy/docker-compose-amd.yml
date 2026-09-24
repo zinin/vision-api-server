@@ -15,6 +15,9 @@ services:
       VIDEO_CODEC: ${VIDEO_CODEC:-auto}
       VIDEO_CRF: ${VIDEO_CRF:-18}
       VIDEO_HW_ACCEL: ${VIDEO_HW_ACCEL:-amd}
+      # Video annotation inference; empty = auto (FP16 + batch 8 on NVIDIA, FP32 + batch 1 elsewhere)
+      VIDEO_FP16: ${VIDEO_FP16:-}
+      VIDEO_BATCH_SIZE: ${VIDEO_BATCH_SIZE:-}
       HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION:-}
       # Emergency lever against the MIOpen fd leak: fewer kernel compiles, at inference-perf cost.
       # MIOPEN_FIND_MODE: FAST

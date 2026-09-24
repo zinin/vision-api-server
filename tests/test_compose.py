@@ -37,6 +37,8 @@ WATCHDOG_PASSTHROUGH = (
     "WATCHDOG_SMTP_USER",
     "WATCHDOG_SMTP_PASSWORD",
 )
+# Video annotation inference knobs; every compose file forwards them so .env reaches the app.
+VIDEO_INFERENCE_PASSTHROUGH = ("VIDEO_FP16", "VIDEO_BATCH_SIZE")
 SUPERVISOR_CMD = 'CMD ["python3", "supervisor.py", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]'
 
 
@@ -107,3 +109,11 @@ def test_every_compose_forwards_the_watchdog_kill_switch(path):
 def test_dockerfile_runs_supervisor(path):
     cmd_lines = [line.strip() for line in path.read_text().splitlines() if line.strip().startswith("CMD")]
     assert cmd_lines == [SUPERVISOR_CMD], path
+
+
+@pytest.mark.parametrize("path", COMPOSE_FILES, ids=lambda p: f"{p.parent.name}/{p.name}")
+def test_every_compose_forwards_the_video_inference_settings(path):
+    # empty value = auto in app/config.py, so the defaults stay per-device
+    env = _environment(_service(yaml.safe_load(path.read_text())))
+    for key in VIDEO_INFERENCE_PASSTHROUGH:
+        assert env.get(key) == "${%s:-}" % key, (path, key)

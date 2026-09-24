@@ -27,9 +27,9 @@ pytestmark = pytest.mark.skipif(
 WIDTH, HEIGHT, FPS, SECONDS = 320, 240, 10, 2
 BOX = (40, 60, 200, 180)  # x1, y1, x2, y2 in full-frame pixels
 BLUE = (255, 0, 0)  # BGR colour of class 0 in DetectionVisualizer's palette
-# Video length of the short-audio clip. The encoder's pipe and queues take in about
-# 40 frames before ffmpeg stops, so 2 s of video would be written in full.
-LONG_SECONDS = 10
+# Video length of the short-audio clip. ffmpeg keeps taking frames until it acts on
+# the end of the audio: about 40 on an idle host, up to about 250 on two CPUs.
+LONG_SECONDS = 60
 # Source frames the vfr clip keeps, at their original times: gaps of 0.1 s to 0.8 s.
 VFR_FRAMES = (0, 1, 2, 6, 7, 15, 19)
 
@@ -210,7 +210,7 @@ def test_audio_shorter_than_video_ends_the_output_early(clips, tmp_path, caplog)
     )
     written = int(_probe(output)["video"]["nb_read_frames"])
     assert stats.total_frames == FPS * LONG_SECONDS
-    assert FPS // 2 <= written <= 2 * FPS  # cut near the 1 s of audio, long before the video ends
+    assert FPS // 2 <= written < stats.total_frames  # cut after the audio, long before the video ends
     # the encoder exited while frames were still coming; both early-EOF branches log this
     assert "FFmpegEncoder: clean exit" in caplog.text
     _assert_box_drawn(_frame(output, 2))

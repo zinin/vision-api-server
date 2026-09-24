@@ -121,7 +121,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`), motion frame selection (`tests/test_frame_selection.py`: the rule and the metric on arrays; `tests/test_video_extraction_integration.py`: both ffmpeg passes and both video endpoints on lavfi clips).
+Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`), motion frame selection (`tests/test_frame_selection.py`: the rule and the metric on arrays; `tests/test_video_extraction_integration.py`: both ffmpeg passes and both video endpoints on lavfi clips), and the annotation pipeline pieces (`tests/test_frame_threads.py`, `tests/test_batch_inference.py` incl. a byte-exact check against Ultralytics' LetterBox, `tests/test_model_manager.py`; `tests/test_video_annotation_integration.py`: `annotate()` with real ffmpeg on lavfi clips).
 
 ## Key Patterns
 

@@ -78,6 +78,8 @@ class FFmpegDecoder:
     ``pix_fmt`` is ``bgr24`` (frames shaped (h, w, 3)) or ``yuv420p`` (flat
     frames: the Y, U and V planes back to back, limited range even for a
     full-range source). ``frame_shape`` and ``frame_size`` describe one frame.
+    ``fps`` puts the frames on a constant grid of that rate; without it ffmpeg
+    picks the rate itself.
 
     Usage:
         with FFmpegDecoder(path, w, h, config) as decoder:
@@ -92,6 +94,7 @@ class FFmpegDecoder:
         height: int,
         hw_config: HWAccelConfig,
         pix_fmt: str = "bgr24",
+        fps: float | None = None,
     ):
         self._input_path = str(input_path)
         self._width = width
@@ -104,6 +107,11 @@ class FFmpegDecoder:
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
         cmd += hw_config.decode_args
         cmd += ["-i", str(input_path), "-f", "rawvideo", "-pix_fmt", pix_fmt]
+        if fps is not None:
+            # ffmpeg's own choice follows r_frame_rate, which a camera's
+            # timestamp jitter can push to several times the real rate (50
+            # for a 12.5 fps recording): every frame would come out repeated.
+            cmd += ["-fps_mode", "cfr", "-r", str(fps)]
         if pix_fmt == "yuv420p":
             # The encoder reads these planes as limited range. Newer ffmpeg
             # (8.0 does, 6.1 does not) passes a full-range source (yuvj420p,

@@ -379,7 +379,10 @@ class VideoAnnotator:
         )
         frame_count = 0
 
-        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config) as decoder:
+        # Both passes decode on the grid the encoder plays the frames at, so frame n
+        # of pass 1, of pass 2 and of the result is the same moment of the source.
+        with FFmpegDecoder(input_path, metadata.width, metadata.height, self.hw_config,
+                           fps=metadata.fps) as decoder:
             if cancel_event is not None and cancel_event.is_set():
                 raise JobCancelledError()
             with ThreadedFrameReader(decoder, transform, queue_size=2 * self.batch_size) as frames:
@@ -509,7 +512,8 @@ class VideoAnnotator:
         config = hw_config if hw_config is not None else self.hw_config
         width, height = metadata.width, metadata.height
 
-        with FFmpegDecoder(input_path, width, height, config, pix_fmt="yuv420p") as decoder, \
+        with FFmpegDecoder(input_path, width, height, config, pix_fmt="yuv420p",
+                           fps=metadata.fps) as decoder, \
              FFmpegEncoder(input_path, output_path, width, height,
                            metadata.fps, config, effective_codec,
                            crf=effective_crf, bitrate=effective_bitrate,

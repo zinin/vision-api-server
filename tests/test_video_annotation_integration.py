@@ -9,6 +9,7 @@ import logging
 import shutil
 import subprocess
 import threading
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -79,10 +80,13 @@ class _StubModel:
 
 
 def _make_clip(path: Path, *, seconds: int = SECONDS, audio_seconds: float | None = SECONDS,
-               pix_fmt: str = "yuv420p", vfr: bool = False, ramp: bool = False) -> Path:
+               pix_fmt: str = "yuv420p", vfr: bool = False, ramp: bool = False,
+               jitter: bool = False) -> Path:
     """A gray lavfi clip. ``audio_seconds=None`` leaves the audio out; ``vfr``
     keeps only VFR_FRAMES, each with its original timestamp (0, 0.1, 0.2, 0.6 s, ...);
-    ``ramp`` replaces the gray with a horizontal luma ramp from 0 to 255."""
+    ``ramp`` replaces the gray with a horizontal luma ramp from 0 to 255; ``jitter``
+    stamps frame 1 80 ms early, as a camera's clock may, so that ffmpeg reads
+    r_frame_rate as 50 while the clip keeps its FPS frames a second."""
     if ramp:
         # ffmpeg treats gray as full range, so a full-range pix_fmt stores the ramp unchanged
         video = f"nullsrc=s={WIDTH}x{HEIGHT}:r={FPS}:d={seconds},format=gray,geq=lum='X*255/{WIDTH - 1}'"
@@ -94,6 +98,10 @@ def _make_clip(path: Path, *, seconds: int = SECONDS, audio_seconds: float | Non
     if vfr:
         keep = "+".join(f"eq(n\\,{n})" for n in VFR_FRAMES)
         cmd += ["-vf", f"select='{keep}'", "-fps_mode", "passthrough"]
+    if jitter:
+        # millisecond time bases, or the encoder rounds the early stamp back onto the grid
+        cmd += ["-vf", f"settb=1/1000,setpts='(N/{FPS} - if(eq(N\\,1)\\,0.08\\,0))/TB'",
+                "-fps_mode", "passthrough", "-enc_time_base", "1/1000", "-video_track_timescale", "1000"]
     cmd += ["-c:v", "libx264", "-pix_fmt", pix_fmt]
     if audio_seconds is not None:
         cmd += ["-c:a", "aac"]
@@ -112,6 +120,8 @@ def clips(tmp_path_factory) -> dict[str, Path]:
         # -shortest ends the encoder and closes its pipe while frames are still coming
         "short_audio": _make_clip(root / "short_audio.mp4", seconds=LONG_SECONDS, audio_seconds=1),
         "vfr": _make_clip(root / "vfr.mp4", audio_seconds=None, vfr=True),
+        # r_frame_rate reads as 50; the audio outlasts the video, so -shortest keeps every frame
+        "jitter": _make_clip(root / "jitter.mp4", audio_seconds=SECONDS + 1, jitter=True),
     }
 
 
@@ -146,7 +156,7 @@ def _annotate_within(annotator: VideoAnnotator, clip: Path, output: Path,
 def _probe(path: Path) -> dict:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-count_frames", "-show_entries",
-         "stream=codec_type,nb_read_frames", "-of", "json", str(path)],
+         "stream=codec_type,nb_read_frames,r_frame_rate", "-of", "json", str(path)],
         check=True, capture_output=True, text=True, timeout=60,
     ).stdout
     return {s["codec_type"]: s for s in json.loads(out)["streams"]}
@@ -246,3 +256,23 @@ def test_variable_frame_rate_keeps_passes_aligned(clips, tmp_path):
     assert stats.total_frames != int(_probe(clips["vfr"])["video"]["nb_read_frames"])
     assert written == stats.total_frames
     _assert_box_drawn(_frame(output, written - 1))  # boxes reach the last frame
+
+
+def test_misread_frame_rate_decodes_each_frame_once(clips, tmp_path):
+    """With r_frame_rate misread as 50, decoders left to pick their own rate made five
+    frames of each, YOLO ran on all of them, and the encoder, playing them at the real
+    10 fps, cut the slow-motion result at the end of the audio."""
+    source = _probe(clips["jitter"])
+    assert Fraction(source["video"]["r_frame_rate"]) > 2 * FPS  # the clip is what it claims
+    stored = int(source["video"]["nb_read_frames"])
+    assert stored == FPS * SECONDS
+    output = tmp_path / "annotated.mp4"
+    stats = _annotator(_StubModel(), 4).annotate(
+        clips["jitter"], output, AnnotationParams(conf=0.5, imgsz=320, line_width=6),
+    )
+    result = _probe(output)
+    # ffmpeg 8 repeats the last of these millisecond-stamped frames once where 6.1 stops
+    assert stored <= stats.total_frames <= stored + 1
+    assert int(result["video"]["nb_read_frames"]) == stats.total_frames  # nothing cut
+    assert "audio" in result
+    _assert_box_drawn(_frame(output, stats.total_frames - 1))

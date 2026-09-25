@@ -237,6 +237,22 @@ class TestFFmpegDecoder:
         assert frame.shape == (size,)
         assert frame[:3].tolist() == [0, 1, 2]
 
+    def test_fps_puts_the_output_on_a_constant_grid(self):
+        """Left alone, ffmpeg resamples a pipe decode to r_frame_rate, which a camera's
+        timestamp jitter can push far above the real rate; fps pins the grid instead."""
+        mock_proc = self._make_mock_process([])
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with FFmpegDecoder("input.mp4", 640, 480, config, pix_fmt="yuv420p", fps=12.457):
+                pass
+
+        cmd = mock_popen.call_args[0][0]
+        output_options = cmd[cmd.index("input.mp4") + 1:]  # after -i: options of the output
+        assert output_options[output_options.index("-fps_mode") + 1] == "cfr"
+        assert output_options[output_options.index("-r") + 1] == "12.457"
+        assert cmd[-3:] == ["-color_range", "tv", "pipe:1"]
+
     def test_read_into_fills_the_buffer_in_place(self):
         frames = [np.full((4, 6, 3), i, dtype=np.uint8) for i in (7, 9)]
         mock_proc = self._make_mock_process(frames)

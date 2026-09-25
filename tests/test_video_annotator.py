@@ -76,7 +76,7 @@ def _decoder_cls(*decoders):
     """
     pending = list(decoders)
 
-    def construct(input_path, width, height, hw_config, pix_fmt="bgr24"):
+    def construct(input_path, width, height, hw_config, pix_fmt="bgr24", fps=None):
         decoder = pending.pop(0)
         decoder.frame_shape = frame_shape(width, height, pix_fmt)
         return decoder
@@ -454,6 +454,37 @@ class TestAnnotatePipeline:
         # 4 stabilized frames (0,1,2,3) × 1 detection each
         assert stats.total_detections == 4
         assert mock_encoder.write_frame.call_count == num_frames
+
+    def test_both_passes_decode_on_the_encoders_frame_grid(
+        self, mock_model, mock_visualizer, hw_config, tmp_path,
+    ):
+        """ffmpeg left to itself resamples a pipe decode to r_frame_rate, which a camera's
+        timestamp jitter can push far above the real rate (50 against 12.46 fps here):
+        YOLO then runs on duplicated frames, and the encoder, playing them at the real
+        rate, turns the result into slow motion cut short by -shortest."""
+        frames = self._make_frames(3)
+        mock_decoder_cls, mock_encoder_cls, _ = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+        ffprobe_result = MagicMock()
+        ffprobe_result.returncode = 0
+        ffprobe_result.stdout = json.dumps({"streams": [{
+            "avg_frame_rate": "72000000/5779837", "r_frame_rate": "50/1",
+            "width": 640, "height": 480, "nb_frames": "3",
+        }]})
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe_result),
+        ):
+            annotator.annotate(input_path, tmp_path / "output.mp4", AnnotationParams())
+
+        encoder_fps = mock_encoder_cls.call_args.args[4]
+        assert encoder_fps == pytest.approx(72000000 / 5779837)
+        assert [c.kwargs.get("fps") for c in mock_decoder_cls.call_args_list] == [encoder_fps] * 2
 
     def test_detect_every_1(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """When detect_every=1, every frame gets YOLO detection, no hold frames."""

@@ -268,11 +268,15 @@ class ModelManager:
     async def get_video_model(self, model_name: str | None = None) -> ModelEntry:
         """A model instance of its own for video annotation jobs.
 
-        Ultralytics converts a model's weights between FP16 and FP32 in place
-        and rebuilds its predictor whenever ``quantize`` changes, so the video
-        pipeline must not share the instance ``/detect`` uses. The instance is
-        loaded from the same file onto the same device as ``get_model`` would
-        use, cached, and evicted after ``ttl_seconds`` without a job.
+        An Ultralytics model predicts through one cached predictor that holds
+        its own copy of the weights (FP16 under ``quantize=16``) and the
+        arguments of the latest call. On the instance ``/detect`` uses, the
+        two would rebuild that predictor (deep copy, fuse, warm-up) whenever
+        ``quantize`` alternates between their calls, and a call on one thread
+        would replace the ``conf`` and ``imgsz`` that a run on the other
+        reads. The instance is loaded from the same file onto the same device
+        as ``get_model`` would use, cached, and evicted after ``ttl_seconds``
+        without a job.
 
         Raises:
             ValueError: If no model name provided and no default model available.

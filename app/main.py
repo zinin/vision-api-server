@@ -1,3 +1,4 @@
+import gc
 import os
 import shutil
 try:
@@ -340,6 +341,13 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                 # eviction frees the video model only if nothing here refers to it.
                 annotator = None
                 model_entry = None
+                # A model evicted mid-job (a job longer than the TTL) and the
+                # tensors of a failed or cancelled pass 1 sit in reference
+                # cycles: collect them now that the job has let go, then hand
+                # PyTorch's cache back so NVDEC/NVENC and other processes get it.
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 # Always clean up input file (per-job finally)
                 try:
                     if job.input_path and job.input_path.exists():

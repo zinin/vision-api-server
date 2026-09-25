@@ -336,7 +336,8 @@ class ModelManager:
                 evicted += 1
 
         # A job longer than the TTL keeps its own reference to the model, so
-        # evicting the entry mid-job only means the next job loads it again.
+        # evicting the entry mid-job frees nothing here: the annotation worker
+        # collects the instance once the job lets go of it.
         expired_video = [
             name for name, cached in self._video_models.items()
             if cached.is_expired(self.ttl_seconds)

@@ -563,3 +563,73 @@ class TestAnnotationWorkerModelRelease:
                 except asyncio.CancelledError:
                     pass
                 executor.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_model_evicted_during_the_job_is_freed_when_it_ends(
+        self, worker_app, worker_settings, worker_job_manager, caplog
+    ):
+        """A job longer than the TTL outlives the cache entry of its model. The
+        model sits in reference cycles, so the worker collects it, and empties
+        PyTorch's cache, once the job has let go of it."""
+        from main import _annotation_worker
+
+        caplog.set_level("CRITICAL", logger="main")  # log records must not keep the model alive
+
+        class FakeModel:
+            names = {0: "person"}
+
+            def __init__(self):
+                self.me = self  # a reference cycle, as in a YOLO object that has run predict()
+
+        class FakeAnnotator:
+            def __init__(self, model, **kwargs):
+                self.model = model
+
+            def annotate(self, **kwargs):
+                cache.clear()  # the TTL evicts the video model while the job runs
+                return AnnotationStats(total_frames=1)
+
+        model = FakeModel()
+        model_ref = weakref.ref(model)
+        cache = {"entry": SimpleNamespace(model=model, visualizer=MagicMock(), device="cpu")}
+        del model
+
+        async def get_video_model(model_name=None):
+            return cache["entry"]
+
+        worker_app.state.model_manager.get_video_model = get_video_model
+
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        mock_executor = MagicMock()
+        mock_executor.executor = executor
+        empty_cache = MagicMock()
+        loop = asyncio.get_running_loop()
+
+        with (
+            patch("main.VideoAnnotator", FakeAnnotator),
+            patch("main.get_executor", return_value=mock_executor),
+            patch("main.torch.cuda.is_available", return_value=True),
+            patch("main.torch.cuda.empty_cache", empty_cache),
+        ):
+            task = asyncio.create_task(_annotation_worker(worker_app, worker_settings))
+            try:
+                gc.disable()  # only the worker's gc.collect() may free the model's cycle
+                deadline = loop.time() + 5.0
+                while job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                    assert loop.time() < deadline, f"job stuck in {job.status}"
+                    await asyncio.sleep(0.01)
+                assert job.status == JobStatus.COMPLETED
+                assert model_ref() is None, "the evicted model outlived its job"
+                empty_cache.assert_called_once()
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                executor.shutdown()
+                gc.enable()

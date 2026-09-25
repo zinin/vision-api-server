@@ -97,8 +97,6 @@ class FFmpegDecoder:
         fps: float | None = None,
     ):
         self._input_path = str(input_path)
-        self._width = width
-        self._height = height
         self.frame_shape = frame_shape(width, height, pix_fmt)
         self.frame_size = math.prod(self.frame_shape)
         self._stderr_lines: deque[bytes] = deque(maxlen=100)

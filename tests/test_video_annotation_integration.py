@@ -11,13 +11,14 @@ import subprocess
 import threading
 from fractions import Fraction
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pytest
 
 from detection_stabilizer import StabilizerConfig
 from hw_accel import HWAccelConfig, HWAccelType
-from video_annotator import AnnotationParams, AnnotationStats, VideoAnnotator
+from video_annotator import AnnotationParams, AnnotationStats, JobCancelledError, VideoAnnotator
 from visualization import DetectionVisualizer
 
 pytestmark = pytest.mark.skipif(
@@ -33,6 +34,10 @@ BLUE = (255, 0, 0)  # BGR colour of class 0 in DetectionVisualizer's palette
 LONG_SECONDS = 60
 # Source frames the vfr clip keeps, at their original times: gaps of 0.1 s to 0.8 s.
 VFR_FRAMES = (0, 1, 2, 6, 7, 15, 19)
+# Frames of the clip the cancel tests stop part way. Pass 1 reports progress every 10
+# frames and reaches 80, the first value of pass 2, only on a last frame that is a
+# multiple of 10; this one is not.
+CANCEL_FRAMES = 205
 
 
 class _Tensor:
@@ -79,7 +84,7 @@ class _StubModel:
         return results
 
 
-def _make_clip(path: Path, *, seconds: int = SECONDS, audio_seconds: float | None = SECONDS,
+def _make_clip(path: Path, *, seconds: float = SECONDS, audio_seconds: float | None = SECONDS,
                pix_fmt: str = "yuv420p", vfr: bool = False, ramp: bool = False,
                jitter: bool = False) -> Path:
     """A gray lavfi clip. ``audio_seconds=None`` leaves the audio out; ``vfr``
@@ -122,6 +127,8 @@ def clips(tmp_path_factory) -> dict[str, Path]:
         "vfr": _make_clip(root / "vfr.mp4", audio_seconds=None, vfr=True),
         # r_frame_rate reads as 50; the audio outlasts the video, so -shortest keeps every frame
         "jitter": _make_clip(root / "jitter.mp4", audio_seconds=SECONDS + 1, jitter=True),
+        # long enough that a cancel finds ffmpeg still decoding
+        "cancel": _make_clip(root / "cancel.mp4", seconds=CANCEL_FRAMES / FPS, audio_seconds=None),
     }
 
 
@@ -134,13 +141,17 @@ def _annotator(model: "_StubModel", batch_size: int) -> VideoAnnotator:
 
 
 def _annotate_within(annotator: VideoAnnotator, clip: Path, output: Path,
-                     params: AnnotationParams, timeout: float = 120.0) -> AnnotationStats:
+                     params: AnnotationParams, timeout: float = 120.0, *,
+                     progress_callback: Callable[[int], None] | None = None,
+                     cancel_event: threading.Event | None = None) -> AnnotationStats:
     """annotate() on a daemon thread, so that a hang fails the test instead of blocking the suite."""
     outcome: dict = {}
 
     def run() -> None:
         try:
-            outcome["stats"] = annotator.annotate(clip, output, params)
+            outcome["stats"] = annotator.annotate(
+                clip, output, params, progress_callback=progress_callback, cancel_event=cancel_event,
+            )
         except BaseException as exc:  # re-raised on the test's thread
             outcome["error"] = exc
 
@@ -151,6 +162,11 @@ def _annotate_within(annotator: VideoAnnotator, clip: Path, output: Path,
     if "error" in outcome:
         raise outcome["error"]
     return outcome["stats"]
+
+
+def _frame_threads() -> list[str]:
+    """Names of the reader and writer threads still alive."""
+    return [t.name for t in threading.enumerate() if t.name in ("frame-reader", "frame-writer")]
 
 
 def _probe(path: Path) -> dict:
@@ -276,3 +292,40 @@ def test_misread_frame_rate_decodes_each_frame_once(clips, tmp_path):
     assert int(result["video"]["nb_read_frames"]) == stats.total_frames  # nothing cut
     assert "audio" in result
     _assert_box_drawn(_frame(output, stats.total_frames - 1))
+
+
+def test_cancel_in_pass_1_stops_the_reader(clips, tmp_path):
+    """Cancelling pass 1 kills the decoder's ffmpeg, which ends a pipe read the
+    reader thread may be blocked in."""
+    cancel, running = threading.Event(), []
+
+    def progress(value: int) -> None:  # the first report comes from pass 1, below 80
+        if not cancel.is_set():
+            running.extend(_frame_threads())
+            cancel.set()
+
+    with pytest.raises(JobCancelledError):
+        _annotate_within(
+            _annotator(_StubModel(), 4), clips["cancel"], tmp_path / "annotated.mp4",
+            AnnotationParams(conf=0.5, imgsz=320), progress_callback=progress, cancel_event=cancel,
+        )
+    assert running == ["frame-reader"]  # cancelled while pass 1 was reading
+    assert _frame_threads() == []
+
+
+def test_cancel_in_pass_2_stops_the_writer(clips, tmp_path):
+    """Cancelling pass 2 drops the frames the writer thread still has queued."""
+    cancel, running = threading.Event(), []
+
+    def progress(value: int) -> None:  # pass 2 reports from 80 up
+        if value >= 80 and not cancel.is_set():
+            running.extend(_frame_threads())
+            cancel.set()
+
+    with pytest.raises(JobCancelledError):
+        _annotate_within(
+            _annotator(_StubModel(), 4), clips["cancel"], tmp_path / "annotated.mp4",
+            AnnotationParams(conf=0.5, imgsz=320), progress_callback=progress, cancel_event=cancel,
+        )
+    assert running == ["frame-writer"]  # cancelled while pass 2 was writing
+    assert _frame_threads() == []

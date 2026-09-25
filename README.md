@@ -150,6 +150,8 @@ All settings via environment variables or `.env` file:
 | `VIDEO_CRF` | `18` | Quality: 0=lossless, 18=near-lossless, 23=default |
 | `VIDEO_HW_ACCEL` | `auto` | `auto` / `nvidia` / `amd` / `cpu` |
 | `VAAPI_DEVICE` | `/dev/dri/renderD128` | AMD VAAPI render device |
+| `VIDEO_FP16` | `auto` | `auto` / `true` / `false`: FP16 YOLO in video annotation; `auto` = FP16 on NVIDIA, FP32 on AMD and CPU (FP16 on CPU is ignored) |
+| `VIDEO_BATCH_SIZE` | `auto` | `auto` / `1`–`64` frames per YOLO call in video annotation; `auto` = 8 on NVIDIA, 1 on AMD and CPU; halved automatically on GPU out-of-memory |
 | `WATCHDOG_ENABLED` | `true` | Process watchdog; `false` runs uvicorn without it |
 | `WATCHDOG_INTERVAL` / `WATCHDOG_TIMEOUT` | `30` / `10` | `/health` probe period and HTTP timeout (seconds) |
 | `WATCHDOG_FAILURES` | `3` | Consecutive failures before the container is restarted |
@@ -207,6 +209,8 @@ app/
 ├── model_manager.py     # YOLO model lifecycle, two-tier cache
 ├── job_manager.py       # Video annotation job queue, TTL cleanup
 ├── video_annotator.py   # YOLO + hold mode video annotation
+├── batch_inference.py   # Video pass 1: LetterBox-exact pre-resize, batched YOLO
+├── frame_threads.py     # Reader/writer threads for the ffmpeg pipes
 ├── ffmpeg_pipe.py       # FFmpeg subprocess pipe decoder/encoder
 ├── hw_accel.py          # Hardware acceleration detection
 ├── video_utils.py       # Two-pass frame extraction: motion scan + frame fetch

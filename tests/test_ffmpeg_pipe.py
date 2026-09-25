@@ -795,6 +795,31 @@ class TestFFmpegEncoder:
 
         assert "clean exit after BrokenPipe" in caplog.text  # the pipe broke inside flush()
 
+    def test_close_after_a_crash_keeps_the_crash_error(self):
+        """A real pipe to a child that exits rc=1 without reading, as ffmpeg does when NVENC fails to start.
+
+        As after a clean exit, the pipe breaks inside flush() with the last
+        frame still buffered, and close() flushes it into the closed pipe
+        again. The block must still end with the crash's RuntimeError, which
+        annotate()'s NVENC fallback catches, and not with that BrokenPipeError.
+        """
+        real_popen = subprocess.Popen
+
+        def child_that_fails_without_reading(cmd, **kwargs):
+            return real_popen(
+                [sys.executable, "-c", "import sys, time; time.sleep(0.5); sys.exit(1)"], **kwargs
+            )
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros(1024, dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", side_effect=child_that_fails_without_reading):
+            # "mid-write": the pipe broke inside flush(), so a frame was left buffered
+            with pytest.raises(RuntimeError, match="crashed mid-write"):
+                with FFmpegEncoder("input.mp4", "output.mp4", 320, 240, 10.0, config, "h264", crf=18) as encoder:
+                    for _ in range(10_000):  # a 1 MiB pipe is full after 1024 frames
+                        encoder.write_frame(frame)
+
     def test_bitrate_mode_command(self):
         """When bitrate is passed, command uses -b:v instead of -crf."""
         mock_proc = self._make_mock_process()

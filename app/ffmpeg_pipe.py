@@ -307,7 +307,7 @@ class FFmpegEncoder:
             # residual bytes for close()'s implicit flush to push into a
             # pipe ffmpeg already closed (e.g. after -shortest). If this
             # flush itself hits the closed pipe, the unwritten tail stays
-            # buffered; close() drops it after a clean exit.
+            # buffered; close() drops it.
             self._process.stdin.flush()
         except OSError as e:  # BrokenPipeError is a subclass of OSError.
             # The pipe closed mid-write. Most often this means the
@@ -350,13 +350,12 @@ class FFmpegEncoder:
             try:
                 self._process.stdin.close()
             except BrokenPipeError:
-                # After a clean early exit (-shortest) the flush in write_frame
-                # can fail with the tail of a frame still buffered, and closing
-                # flushes it into the closed pipe again. ffmpeg finished with
-                # rc=0, so the tail is dropped; any other state still raises.
-                if not self._eof:
-                    raise
-                logger.debug("FFmpegEncoder: dropped the unwritten tail of a frame after clean exit")
+                # ffmpeg closed its input while the flush in write_frame still
+                # had the tail of a frame buffered, and closing flushes it into
+                # the closed pipe again. The tail is dropped either way: the
+                # return code below tells a clean early exit (-shortest) from
+                # a crash, whose RuntimeError the NVENC fallback relies on.
+                logger.debug("FFmpegEncoder: dropped the unwritten tail of a frame, ffmpeg closed its input")
         self._stderr_thread.join(timeout=10)
         if self._process.stderr:
             self._process.stderr.close()

@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import time
@@ -344,9 +345,15 @@ class ModelManager:
                 del cached.entry.visualizer
                 evicted += 1
 
-        if evicted > 0 and self.default_device.startswith("cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.debug("CUDA cache cleared after model eviction")
+        if evicted > 0:
+            # A YOLO object that has run predict() sits in reference cycles:
+            # the dels above free nothing until the cyclic GC runs, and a full
+            # collection may not come for a long time. Collect first, so that
+            # empty_cache() can hand the evicted models' memory back.
+            gc.collect()
+            if self.default_device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.debug("CUDA cache cleared after model eviction")
 
         return evicted
 

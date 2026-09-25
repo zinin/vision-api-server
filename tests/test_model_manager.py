@@ -1,10 +1,12 @@
 import asyncio
+import gc
 import time
+import weakref
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from model_manager import ModelEntry, ModelManager
+from model_manager import CachedModelEntry, ModelEntry, ModelManager
 
 
 def _entry(name: str, device: str) -> ModelEntry:
@@ -100,3 +102,44 @@ class TestGetVideoModel:
             await manager.get_video_model("yolo26x.pt")
         await manager.shutdown()
         assert manager._video_models == {}
+
+
+class TestCleanupExpired:
+    @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+    @pytest.mark.parametrize("tier", ["_cached", "_video_models"])
+    async def test_eviction_frees_a_model_in_a_reference_cycle(self, tier, device):
+        """A YOLO object that has run predict() sits in reference cycles, so
+        dropping it frees nothing until the cyclic GC runs. The CUDA cache
+        can only give the memory back after that collection."""
+        mm = ModelManager(default_device=device, ttl_seconds=60)
+
+        class CyclicModel:
+            def __init__(self):
+                self.itself = self
+
+        model = CyclicModel()
+        model_ref = weakref.ref(model)
+        getattr(mm, tier)["yolo26x.pt"] = CachedModelEntry(
+            entry=ModelEntry(model=model, visualizer=MagicMock(), model_name="yolo26x.pt", device=device),
+            last_used_at=time.time() - 120,
+        )
+        del model
+        freed_when_emptied = []
+
+        gc.disable()  # no automatic collection: only cleanup_expired() may free the cycle
+        try:
+            with (
+                patch("model_manager.torch.cuda.is_available", return_value=True),
+                patch("model_manager.torch.cuda.empty_cache",
+                      side_effect=lambda: freed_when_emptied.append(model_ref() is None)),
+            ):
+                assert await mm.cleanup_expired() == 1
+            assert model_ref() is None, "the evicted model is still alive"
+        finally:
+            gc.enable()
+        assert freed_when_emptied == ([True] if device.startswith("cuda") else [])
+
+    async def test_no_collection_without_an_eviction(self, manager):
+        with patch("gc.collect") as collect:
+            assert await manager.cleanup_expired() == 0
+        collect.assert_not_called()

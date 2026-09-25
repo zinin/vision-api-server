@@ -104,6 +104,20 @@ class TestGetVideoModel:
         assert manager._video_models == {}
 
 
+class TestGetStatus:
+    def test_lists_video_models_with_their_ttl(self, manager):
+        """A video model holds its own copy of the weights until eviction; /models shows it."""
+        manager._video_models["yolo26x.pt"] = CachedModelEntry(
+            entry=_entry("yolo26x.pt", "cuda:0"), last_used_at=980.0,
+        )
+        with patch("model_manager.time.time", return_value=1000.0):
+            status = manager.get_status()
+
+        assert status["video"] == [{"name": "yolo26x.pt", "device": "cuda:0", "expires_in_seconds": 40}]
+        assert [m["name"] for m in status["preloaded"]] == ["yolo26s.pt", "yolo26x.pt"]
+        assert status["cached"] == []
+
+
 class TestCleanupExpired:
     @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
     @pytest.mark.parametrize("tier", ["_cached", "_video_models"])

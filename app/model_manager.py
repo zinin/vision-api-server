@@ -443,18 +443,21 @@ class ModelManager:
             for name, entry in self._preloaded.items()
         ]
 
-        cached_info = [
-            {
-                "name": name,
-                "device": cached.entry.device,
-                "expires_in_seconds": int(max(0, self.ttl_seconds - (now - cached.last_used_at)))
-            }
-            for name, cached in self._cached.items()
-        ]
+        def with_ttl(entries: dict[str, CachedModelEntry]) -> list[dict]:
+            return [
+                {
+                    "name": name,
+                    "device": cached.entry.device,
+                    "expires_in_seconds": int(max(0, self.ttl_seconds - (now - cached.last_used_at)))
+                }
+                for name, cached in entries.items()
+            ]
 
         return {
             "preloaded": preloaded_info,
-            "cached": cached_info,
+            "cached": with_ttl(self._cached),
+            # Video jobs' own instances: a second copy of the weights until eviction
+            "video": with_ttl(self._video_models),
             "default_device": self.default_device,
             "ttl_seconds": self.ttl_seconds
         }

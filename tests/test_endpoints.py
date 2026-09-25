@@ -379,6 +379,25 @@ class TestHealthFdStats:
         assert data["fd_soft_limit"] == 1000
 
 
+class TestHealthModelCounts:
+    def test_video_models_count_as_loaded(self, client):
+        from model_manager import CachedModelEntry, ModelEntry, ModelManager
+
+        def entry(name):
+            return ModelEntry(model=MagicMock(), visualizer=MagicMock(), model_name=name, device="cuda:0")
+
+        mm = ModelManager(default_device="cuda:0")
+        mm._preloaded = {"yolo26s.pt": entry("yolo26s.pt"), "yolo26x.pt": entry("yolo26x.pt")}
+        mm._video_models = {"yolo26x.pt": CachedModelEntry(entry=entry("yolo26x.pt"))}
+        app.dependency_overrides[get_model_manager] = lambda: mm
+
+        data = client.get("/health").json()
+        assert data["models_loaded"] == 3
+        assert data["preloaded_count"] == 2
+        assert data["cached_count"] == 0
+        assert data["video_models_count"] == 1
+
+
 class TestFdStatsHelper:
     """Direct unit tests for the _fd_stats() degradation branches."""
 

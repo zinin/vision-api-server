@@ -171,10 +171,15 @@ List loaded models with status.
 {
   "preloaded": [{"name": "yolo26s.pt", "device": "cuda:0"}],
   "cached": [{"name": "yolo26m.pt", "device": "cuda:0", "expires_in_seconds": 800}],
+  "video": [{"name": "yolo26x.pt", "device": "cuda:0", "expires_in_seconds": 812}],
   "default_device": "cuda:0",
   "ttl_seconds": 900
 }
 ```
+
+`video` lists the separate instances video annotation jobs load: one per model, on the device of the
+preloaded model of that name, otherwise on `default_device`. Like `cached` ones they are evicted after
+`ttl_seconds`, counted from the start of the last job that used them.
 
 ### GET /health
 
@@ -184,9 +189,10 @@ Health check.
 ```json
 {
   "status": "healthy",
-  "models_loaded": 2,
+  "models_loaded": 3,
   "preloaded_count": 1,
   "cached_count": 1,
+  "video_models_count": 1,
   "default_device": "cuda:0",
   "video_processing": true,
   "open_fds": 123,
@@ -194,6 +200,8 @@ Health check.
   "fd_soft_limit": 65536
 }
 ```
+
+`models_loaded` counts every model instance in memory: `preloaded_count + cached_count + video_models_count`.
 
 `open_fds` counts `/proc/self/fd` entries; `fd_deleted` counts those pointing at deleted files —
 the exact signature of the ROCm/MIOpen leak (`fd_deleted` growing = compile-path leak;

@@ -487,9 +487,12 @@ async def health(model_manager: ModelManager = Depends(get_model_manager)):
 
     return {
         "status": "healthy",
-        "models_loaded": len(model_manager._preloaded) + len(model_manager._cached),
+        "models_loaded": (
+            len(model_manager._preloaded) + len(model_manager._cached) + len(model_manager._video_models)
+        ),
         "preloaded_count": len(model_manager._preloaded),
         "cached_count": len(model_manager._cached),
+        "video_models_count": len(model_manager._video_models),
         "default_device": model_manager.default_device,
         "video_processing": ffmpeg_available,
         "open_fds": open_fds,
@@ -1214,6 +1217,7 @@ async def list_models(model_manager: ModelManager = Depends(get_model_manager)):
     - **default_model**: The default model used when no model is specified
     - **preloaded**: List of models loaded at startup (never evicted)
     - **cached**: List of on-demand loaded models with TTL info
+    - **video**: Separate instances video annotation jobs use, with TTL info
     - **ttl_seconds**: Time-to-live for cached models
     - **device**: Device used for inference
     """

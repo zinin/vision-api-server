@@ -235,8 +235,9 @@ class FFmpegEncoder:
         # frames to write — e.g. FFmpeg's -shortest closes pipe:0 when the
         # audio stream ends before the piped raw video. Subsequent
         # write_frame() calls become silent no-ops. Single-writer invariant:
-        # callers must serialise write_frame() from one thread (the Pass 2
-        # loop in VideoAnnotator is single-threaded by design).
+        # callers must serialise write_frame() from one thread (in Pass 2 of
+        # VideoAnnotator that is the ThreadedFrameWriter thread, joined
+        # before close()).
         self._eof = False
 
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]

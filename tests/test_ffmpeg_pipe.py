@@ -204,6 +204,7 @@ class TestFFmpegDecoder:
         assert "-pix_fmt" in cmd
         assert "bgr24" in cmd
         assert "pipe:1" in cmd
+        assert "-color_range" not in cmd  # bgr24 honours the source range by itself
 
     def test_amd_decode_args(self):
         mock_proc = self._make_mock_process([])
@@ -231,6 +232,8 @@ class TestFFmpegDecoder:
 
         cmd = mock_popen.call_args[0][0]
         assert cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+        # An output option, so ffmpeg converts a full-range source instead of relabelling it
+        assert cmd[-3:] == ["-color_range", "tv", "pipe:1"]
         assert frame.shape == (size,)
         assert frame[:3].tolist() == [0, 1, 2]
 

@@ -76,8 +76,8 @@ class FFmpegDecoder:
     """Decode video frames via FFmpeg subprocess pipe.
 
     ``pix_fmt`` is ``bgr24`` (frames shaped (h, w, 3)) or ``yuv420p`` (flat
-    frames: the Y, U and V planes back to back). ``frame_shape`` and
-    ``frame_size`` describe one frame.
+    frames: the Y, U and V planes back to back, limited range even for a
+    full-range source). ``frame_shape`` and ``frame_size`` describe one frame.
 
     Usage:
         with FFmpegDecoder(path, w, h, config) as decoder:
@@ -103,7 +103,16 @@ class FFmpegDecoder:
 
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
         cmd += hw_config.decode_args
-        cmd += ["-i", str(input_path), "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"]
+        cmd += ["-i", str(input_path), "-f", "rawvideo", "-pix_fmt", pix_fmt]
+        if pix_fmt == "yuv420p":
+            # The encoder reads these planes as limited range. Newer ffmpeg
+            # (8.0 does, 6.1 does not) passes a full-range source (yuvj420p,
+            # common on IP cameras) through unconverted unless the output
+            # range is set, which clips the result's shadows and highlights.
+            # As an output option it converts; before -i it would only
+            # relabel the source. bgr24 always honours the source range.
+            cmd += ["-color_range", "tv"]
+        cmd += ["pipe:1"]
 
         logger.debug(f"FFmpegDecoder command: {' '.join(cmd)}")
         self._process = subprocess.Popen(

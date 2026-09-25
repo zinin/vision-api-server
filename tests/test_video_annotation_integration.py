@@ -79,11 +79,16 @@ class _StubModel:
 
 
 def _make_clip(path: Path, *, seconds: int = SECONDS, audio_seconds: float | None = SECONDS,
-               pix_fmt: str = "yuv420p", vfr: bool = False) -> Path:
+               pix_fmt: str = "yuv420p", vfr: bool = False, ramp: bool = False) -> Path:
     """A gray lavfi clip. ``audio_seconds=None`` leaves the audio out; ``vfr``
-    keeps only VFR_FRAMES, each with its original timestamp (0, 0.1, 0.2, 0.6 s, ...)."""
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "lavfi", "-i", f"color=c=gray:s={WIDTH}x{HEIGHT}:r={FPS}:d={seconds}"]
+    keeps only VFR_FRAMES, each with its original timestamp (0, 0.1, 0.2, 0.6 s, ...);
+    ``ramp`` replaces the gray with a horizontal luma ramp from 0 to 255."""
+    if ramp:
+        # ffmpeg treats gray as full range, so a full-range pix_fmt stores the ramp unchanged
+        video = f"nullsrc=s={WIDTH}x{HEIGHT}:r={FPS}:d={seconds},format=gray,geq=lum='X*255/{WIDTH - 1}'"
+    else:
+        video = f"color=c=gray:s={WIDTH}x{HEIGHT}:r={FPS}:d={seconds}"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", video]
     if audio_seconds is not None:
         cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={audio_seconds}"]
     if vfr:
@@ -103,7 +108,7 @@ def clips(tmp_path_factory) -> dict[str, Path]:
         "audio": _make_clip(root / "audio.mp4"),
         "no_audio": _make_clip(root / "no_audio.mp4", audio_seconds=None),
         # IP cameras often record full-range yuvj420p; pass 2 asks ffmpeg for yuv420p
-        "full_range": _make_clip(root / "full_range.mp4", pix_fmt="yuvj420p"),
+        "full_range": _make_clip(root / "full_range.mp4", pix_fmt="yuvj420p", ramp=True),
         # -shortest ends the encoder and closes its pipe while frames are still coming
         "short_audio": _make_clip(root / "short_audio.mp4", seconds=LONG_SECONDS, audio_seconds=1),
         "vfr": _make_clip(root / "vfr.mp4", audio_seconds=None, vfr=True),
@@ -147,21 +152,27 @@ def _probe(path: Path) -> dict:
     return {s["codec_type"]: s for s in json.loads(out)["streams"]}
 
 
-def _frame(path: Path, index: int) -> np.ndarray:
+def _frame(path: Path, index: int, pix_fmt: str = "bgr24") -> np.ndarray:
+    """Frame ``index`` as ffmpeg decodes it: BGR, or with ``pix_fmt="gray"``
+    its luma alone, full range whatever the range of the video."""
     raw = subprocess.run(
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
          "-vf", f"select=eq(n\\,{index})", "-frames:v", "1",
-         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+         "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"],
         check=True, capture_output=True, timeout=60,
     ).stdout
-    return np.frombuffer(raw, np.uint8).reshape(HEIGHT, WIDTH, 3)
+    shape = (HEIGHT, WIDTH) if pix_fmt == "gray" else (HEIGHT, WIDTH, 3)
+    return np.frombuffer(raw, np.uint8).reshape(shape)
+
+
+def _assert_box_colour(frame: np.ndarray) -> None:
+    left_edge = frame[100:140, BOX[0] - 1:BOX[0] + 2].astype(int).reshape(-1, 3).mean(axis=0)
+    assert np.abs(left_edge - BLUE).max() < 50, left_edge  # the box, in its class colour
 
 
 def _assert_box_drawn(frame: np.ndarray) -> None:
-    frame = frame.astype(int)
-    left_edge = frame[100:140, BOX[0] - 1:BOX[0] + 2].reshape(-1, 3).mean(axis=0)
-    assert np.abs(left_edge - BLUE).max() < 50, left_edge  # the box, in its class colour
-    assert np.abs(frame[10:30, 260:300] - 128).max() < 12  # gray far from the box
+    _assert_box_colour(frame)
+    assert np.abs(frame[10:30, 260:300].astype(int) - 128).max() < 12  # gray far from the box
 
 
 @pytest.mark.parametrize("batch_size,imgsz", [(1, 320), (4, 160)])
@@ -198,7 +209,15 @@ def test_full_range_source(clips, tmp_path):
         clips["full_range"], output, AnnotationParams(conf=0.5, imgsz=320, line_width=6),
     )
     assert int(_probe(output)["video"]["nb_read_frames"]) == stats.total_frames
-    _assert_box_drawn(_frame(output, 5))
+    _assert_box_colour(_frame(output, 5))
+    # Below the box the output shows the source's ramp at its brightness: full-range
+    # levels passed on as limited range would clip the dark and bright ends of it.
+    below_box = slice(BOX[3] + 20, HEIGHT)
+    source = _frame(clips["full_range"], 5, pix_fmt="gray")[below_box].astype(int)
+    result = _frame(output, 5, pix_fmt="gray")[below_box].astype(int)
+    assert source.min() < 5 and source.max() > 250  # the ramp covers the whole range
+    diff = np.abs(result - source)
+    assert diff.max() <= 3, f"{diff.max()} levels off, in {(diff.max(axis=0) > 3).sum()} of {WIDTH} columns"
 
 
 def test_audio_shorter_than_video_ends_the_output_early(clips, tmp_path, caplog):

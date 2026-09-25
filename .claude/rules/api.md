@@ -179,7 +179,10 @@ List loaded models with status.
 
 `video` lists the separate instances video annotation jobs load: one per model, on the device of the
 preloaded model of that name, otherwise on `default_device`. Like `cached` ones they are evicted after
-`ttl_seconds`, counted from the start of the last job that used them.
+`ttl_seconds`, counted from the start of the last job that used them; for a model outside `YOLO_MODELS`
+submitting a job restarts the count too, because the submit request checks the model by loading that
+instance. A job that outlasts the TTL keeps its instance, which then drops out of this list and is freed
+when the job ends.
 
 ### GET /health
 

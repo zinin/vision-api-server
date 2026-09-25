@@ -31,9 +31,11 @@ cd docker && ./docker-up-cpu.sh      # CPU only
 | `app/models.py` | Request/response Pydantic models |
 | `app/dependencies.py` | FastAPI dependency injection |
 | `app/hw_accel.py` | Hardware acceleration detection (NVIDIA/AMD/CPU) |
-| `app/ffmpeg_pipe.py` | FFmpeg pipe-based video decoder/encoder |
+| `app/ffmpeg_pipe.py` | FFmpeg pipe-based video decoder/encoder (bgr24 or yuv420p frames) |
+| `app/frame_threads.py` | Reader/writer threads that overlap ffmpeg pipe I/O with inference and drawing |
 | `app/job_manager.py` | Video annotation job lifecycle, async queue, TTL cleanup |
 | `app/video_annotator.py` | YOLO detection + hold mode video annotation pipeline |
+| `app/batch_inference.py` | Video pass 1: LetterBox-exact pre-resize, batched predict, FP16/batch mode per device |
 | `app/detection_stabilizer.py` | Detection track stabilizer, IoU matching, class voting |
 | `app/supervisor.py` | Process watchdog: runs uvicorn as a child, restarts the container when `/health` hangs |
 
@@ -74,6 +76,9 @@ VIDEO_CODEC=auto                        # auto (match source) | h264 | h265 | av
 VIDEO_CRF=18                            # Quality: 0=lossless, 18=near-lossless, 23=default
 VIDEO_HW_ACCEL=auto                     # auto | nvidia | amd | cpu
 VAAPI_DEVICE=/dev/dri/renderD128        # VAAPI render device path
+VIDEO_FP16=auto                         # auto | true | false: FP16 YOLO in video annotation
+VIDEO_BATCH_SIZE=auto                   # auto | 1-64 frames per YOLO call in video annotation
+                                        # auto = FP16 + batch 8 on NVIDIA, FP32 + batch 1 on AMD/CPU
 STABILIZER_CONF_FACTOR=0.4      # YOLO conf multiplier for stabilizer (0-1]
 STABILIZER_IOU_THRESHOLD=0.3    # IoU threshold for track matching (0-1]
 STABILIZER_MIN_VOTE_CONF=0.3    # Min conf for class voting [0-1]
@@ -116,7 +121,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`), motion frame selection (`tests/test_frame_selection.py`: the rule and the metric on arrays; `tests/test_video_extraction_integration.py`: both ffmpeg passes and both video endpoints on lavfi clips).
+Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`), motion frame selection (`tests/test_frame_selection.py`: the rule and the metric on arrays; `tests/test_video_extraction_integration.py`: both ffmpeg passes and both video endpoints on lavfi clips), and the annotation pipeline pieces (`tests/test_frame_threads.py`, `tests/test_batch_inference.py` incl. a byte-exact check against Ultralytics' LetterBox, `tests/test_model_manager.py`; `tests/test_video_annotation_integration.py`: `annotate()` with real ffmpeg on lavfi clips).
 
 ## Key Patterns
 
@@ -126,7 +131,7 @@ Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFm
 
 **Motion Frames**: Two ffmpeg passes. Pass 1 streams gray 640 px frames through a pipe and computes `blob`, the area of the largest changed region between neighbouring frames; pass 2 decodes again and reads out the selected frames with `select`, which drops the other frames after decoding. Selection: frame 0, a grid every `max_gap` (4 s, or `min_interval` when that is larger) thinned to `max_frames − 1` so one slot always stays free, then the strongest motion peaks above `motion_threshold` (0.001) at least `min_interval` (1 s) apart, capped at `max_frames` (6); the held-back frame returns to the grid when no peak can use it. A segment whose median `blob` exceeds 0.02 (rain, snow in IR) gets the grid only. Real pts from `showinfo`; `video_duration` from ffprobe. Tests use lavfi-generated clips, no binary fixtures.
 
-**Video Annotation**: Async job API — YOLO every Nth frame + hold mode (reuse detections) for intermediate frames. Single worker, in-memory job state (requires `workers=1`).
+**Video Annotation**: Async job API — YOLO every Nth frame + hold mode (reuse detections) for intermediate frames. Single worker, in-memory job state (requires `workers=1`). The worker gets its own model instance (`ModelManager.get_video_model`): an Ultralytics model predicts through one cached predictor that holds a copy of the weights and the latest call's arguments, so on a shared instance `/detect` and a video job would rebuild it (deep copy, fuse, warm-up) whenever `quantize` alternates between their calls, and each call would replace the `conf`/`imgsz` that the other thread's run reads. Pass 1 decodes BGR on a `ThreadedFrameReader` thread that shrinks detection frames to the inference size exactly like Ultralytics' LetterBox (cv2 INTER_LINEAR; ffmpeg's scalers change detections), and the main thread runs YOLO in batches (`BatchDetector`: `VIDEO_BATCH_SIZE`, `VIDEO_FP16`, the batch halves on GPU out-of-memory). Pass 2 keeps frames in yuv420p from decoder to encoder, draws boxes on the Y/U/V planes (BT.601, the matrix the old BGR→yuv420p conversion used) and writes on a `ThreadedFrameWriter` thread. Both decoders and the encoder share one constant frame grid, the rate from `_parse_fps` (avg_frame_rate): left alone, ffmpeg resamples a pipe decode to r_frame_rate, which camera timestamp jitter can push to several times the real rate (every frame repeated, a slow-motion result cut by `-shortest`). Measured on a frigate-analyzer request (yolo26x@1024, 2560×1920 HEVC full range, 1606 frames): RTX 3090 76.8 s → 37.3 s in the production container; pass 2 runs about 2 s above the NVENC ceiling on full-range sources, where swscale converts the range on the CPU. Radeon 680M in `auto` gains 3 % (inference-bound), a 6-vCPU CPU 1.21×.
 
 **Detection Stabilizer**: Two-pass decode pipeline. Pass 1 decodes video + collects YOLO detections with lowered conf (no disk cache). DetectionStabilizer links detections into tracks via IoU, votes on stable class, fills gaps bidirectionally with position-aware grace periods. Pass 2 decodes video again + renders stabilized boxes. Class filtering applied after stabilization.
 

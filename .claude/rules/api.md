@@ -116,7 +116,7 @@ Cooperative cancellation. The immediate response to `/cancel` on a PROCESSING jo
 
 **Latency has two parts:**
 
-- **Checkpoint latency** — time from `/cancel` to the worker raising `JobCancelledError` inside `annotate`. Bounded by one frame's work (one YOLO inference in pass 1, or one decode+encode frame in pass 2). Typically sub-second on GPU; a few seconds on CPU / large models.
+- **Checkpoint latency** — time from `/cancel` to the worker raising `JobCancelledError` inside `annotate`. Bounded by one batch of YOLO inference in pass 1 (`VIDEO_BATCH_SIZE` frames, 8 on NVIDIA by default) or one decode+encode frame in pass 2. Typically sub-second on GPU; a few seconds on CPU / large models.
 - **Terminal-transition latency** — time from `JobCancelledError` until `status` flips to `cancelled`. The exception must propagate through the FFmpeg context managers, which wait for the subprocesses to exit (decoder up to ~10 s, encoder up to ~300 s — encoders normally need to flush buffers and rewrite the MP4 `moov` atom). GPU path is typically 1–2 s; CPU / 4K encode may take tens of seconds to a few minutes in the worst case. Hard-killing FFmpeg is a non-goal.
 
 **Completion race.** If `/cancel` arrives while the annotator is finalising the last frame, the job may have already transitioned to `completed` by the time the event would have been observed. In that case the follow-up `GET /jobs/{job_id}` returns `completed`, not `cancelled`. Clients must treat `completed` after a `/cancel` call as "work finished before cancellation took effect" and use `/jobs/{job_id}/download` as normal.
@@ -171,10 +171,18 @@ List loaded models with status.
 {
   "preloaded": [{"name": "yolo26s.pt", "device": "cuda:0"}],
   "cached": [{"name": "yolo26m.pt", "device": "cuda:0", "expires_in_seconds": 800}],
+  "video": [{"name": "yolo26x.pt", "device": "cuda:0", "expires_in_seconds": 812}],
   "default_device": "cuda:0",
   "ttl_seconds": 900
 }
 ```
+
+`video` lists the separate instances video annotation jobs load: one per model, on the device of the
+preloaded model of that name, otherwise on `default_device`. Like `cached` ones they are evicted after
+`ttl_seconds`, counted from the start of the last job that used them; for a model outside `YOLO_MODELS`
+submitting a job restarts the count too, because the submit request checks the model by loading that
+instance. A job that outlasts the TTL keeps its instance, which then drops out of this list and is freed
+when the job ends.
 
 ### GET /health
 
@@ -184,9 +192,10 @@ Health check.
 ```json
 {
   "status": "healthy",
-  "models_loaded": 2,
+  "models_loaded": 3,
   "preloaded_count": 1,
   "cached_count": 1,
+  "video_models_count": 1,
   "default_device": "cuda:0",
   "video_processing": true,
   "open_fds": 123,
@@ -194,6 +203,8 @@ Health check.
   "fd_soft_limit": 65536
 }
 ```
+
+`models_loaded` counts every model instance in memory: `preloaded_count + cached_count + video_models_count`.
 
 `open_fds` counts `/proc/self/fd` entries; `fd_deleted` counts those pointing at deleted files —
 the exact signature of the ROCm/MIOpen leak (`fd_deleted` growing = compile-path leak;

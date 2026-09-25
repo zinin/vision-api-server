@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from detection_stabilizer import StabilizerConfig
+from ffmpeg_pipe import frame_shape
 from hw_accel import HWAccelConfig, HWAccelType
 from video_annotator import (
     VideoAnnotator,
@@ -45,6 +46,51 @@ def _make_yolo_result(boxes_data: list[tuple]):
     return result
 
 
+def _make_decoder_mock(frames: list[np.ndarray]):
+    """FFmpegDecoder double: read_into() succeeds once per frame, then reports EOF.
+
+    The frames only set the count; their content is irrelevant to these tests.
+    ``frame_shape`` is filled in by ``_decoder_cls`` from the requested pix_fmt.
+    """
+    remaining = [len(frames)]
+
+    def read_into(buf):
+        if remaining[0] == 0:
+            return False
+        remaining[0] -= 1
+        buf.fill(0)
+        return True
+
+    mock_decoder = MagicMock()
+    mock_decoder.read_into.side_effect = read_into
+    mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
+    mock_decoder.__exit__ = MagicMock(return_value=False)
+    return mock_decoder
+
+
+def _decoder_cls(*decoders):
+    """FFmpegDecoder stand-in handing out ``decoders`` in order.
+
+    Each one gets the ``frame_shape`` of the pix_fmt it is opened with, so a
+    decoder serves pass 1 (bgr24) or pass 2 (yuv420p) alike.
+    """
+    pending = list(decoders)
+
+    def construct(input_path, width, height, hw_config, pix_fmt="bgr24", fps=None):
+        decoder = pending.pop(0)
+        decoder.frame_shape = frame_shape(width, height, pix_fmt)
+        return decoder
+
+    return MagicMock(side_effect=construct)
+
+
+def _one_result_per_frame(boxes_data: list[tuple]):
+    """predict() side effect: the same boxes for every frame of the batch."""
+    def predict(source, **kwargs):
+        return [_make_yolo_result(boxes_data) for _ in source]
+    return predict
+
+
 # --- Fixtures ---
 
 @pytest.fixture
@@ -74,7 +120,7 @@ def annotator(mock_model, mock_visualizer, hw_config):
 
 @pytest.fixture
 def sample_frame():
-    return np.zeros((480, 640, 3), dtype=np.uint8)
+    return np.zeros(frame_shape(640, 480, "yuv420p"), dtype=np.uint8)
 
 
 @pytest.fixture
@@ -312,33 +358,6 @@ class TestParseFps:
         assert _parse_fps("90000/1", "90000/1") == 90000.0
 
 
-# --- _extract_raw_detections ---
-
-class TestExtractRawDetections:
-    def test_single_detection(self, annotator):
-        result = _make_yolo_result([(10, 20, 100, 200, 0, 0.9)])
-        dets = annotator._extract_raw_detections([result], frame_num=5, class_filter=None)
-        assert len(dets) == 1
-        assert dets[0].frame_num == 5
-        assert dets[0].class_name == "person"
-        assert dets[0].confidence == pytest.approx(0.9)
-        assert dets[0].bbox == (10, 20, 100, 200)
-
-    def test_class_filter(self, annotator):
-        result = _make_yolo_result([
-            (10, 20, 100, 200, 0, 0.9),
-            (50, 60, 150, 250, 1, 0.8),
-        ])
-        dets = annotator._extract_raw_detections([result], frame_num=0, class_filter=["person"])
-        assert len(dets) == 1
-        assert dets[0].class_name == "person"
-
-    def test_empty_boxes(self, annotator):
-        result = _make_yolo_result([])
-        dets = annotator._extract_raw_detections([result], frame_num=0, class_filter=None)
-        assert dets == []
-
-
 # --- _draw_detections ---
 
 class TestDrawDetections:
@@ -347,9 +366,11 @@ class TestDrawDetections:
             DetectionBox(x1=10, y1=20, x2=100, y2=200, class_id=0, class_name="person", confidence=0.9),
             DetectionBox(x1=50, y1=60, x2=150, y2=250, class_id=1, class_name="car", confidence=0.8),
         ]
-        annotator._draw_detections(sample_frame, dets, default_params, font_scale=0.5)
-        assert mock_visualizer.draw_detection.call_count == 2
-        for call in mock_visualizer.draw_detection.call_args_list:
+        annotator._draw_detections(sample_frame, 640, 480, dets, default_params, font_scale=0.5)
+        assert mock_visualizer.draw_detection_yuv420.call_count == 2
+        for call in mock_visualizer.draw_detection_yuv420.call_args_list:
+            assert call.kwargs["frame"] is sample_frame
+            assert (call.kwargs["width"], call.kwargs["height"]) == (640, 480)
             assert call.kwargs["font_scale"] == 0.5
 
 
@@ -362,12 +383,8 @@ class TestAnnotatePipeline:
         return frames
 
     def _make_decoder_mock(self, frames: list[np.ndarray]):
-        """Create a single decoder mock instance with its own frame sequence."""
-        mock_decoder = MagicMock()
-        mock_decoder.read_frame.side_effect = list(frames) + [None]
-        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
-        mock_decoder.__exit__ = MagicMock(return_value=False)
-        return mock_decoder
+        """Create a single decoder mock instance with its own frame count."""
+        return _make_decoder_mock(frames)
 
     def _setup_ffmpeg_mocks(self, frames: list[np.ndarray]):
         """Set up mock FFmpegDecoder and FFmpegEncoder for two-pass pipeline.
@@ -380,7 +397,7 @@ class TestAnnotatePipeline:
         # Pass 2 decoder (for rendering)
         decoder_pass2 = self._make_decoder_mock(frames)
 
-        mock_decoder_cls = MagicMock(side_effect=[decoder_pass1, decoder_pass2])
+        mock_decoder_cls = _decoder_cls(decoder_pass1, decoder_pass2)
 
         mock_encoder = MagicMock()
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
@@ -437,6 +454,37 @@ class TestAnnotatePipeline:
         # 4 stabilized frames (0,1,2,3) × 1 detection each
         assert stats.total_detections == 4
         assert mock_encoder.write_frame.call_count == num_frames
+
+    def test_both_passes_decode_on_the_encoders_frame_grid(
+        self, mock_model, mock_visualizer, hw_config, tmp_path,
+    ):
+        """ffmpeg left to itself resamples a pipe decode to r_frame_rate, which a camera's
+        timestamp jitter can push far above the real rate (50 against 12.46 fps here):
+        YOLO then runs on duplicated frames, and the encoder, playing them at the real
+        rate, turns the result into slow motion cut short by -shortest."""
+        frames = self._make_frames(3)
+        mock_decoder_cls, mock_encoder_cls, _ = self._setup_ffmpeg_mocks(frames)
+        mock_model.predict.return_value = [_make_yolo_result([(10, 20, 100, 200, 0, 0.9)])]
+        ffprobe_result = MagicMock()
+        ffprobe_result.returncode = 0
+        ffprobe_result.stdout = json.dumps({"streams": [{
+            "avg_frame_rate": "72000000/5779837", "r_frame_rate": "50/1",
+            "width": 640, "height": 480, "nb_frames": "3",
+        }]})
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        annotator = VideoAnnotator(mock_model, mock_visualizer, mock_model.names, hw_config)
+
+        with (
+            patch("video_annotator.FFmpegDecoder", mock_decoder_cls),
+            patch("video_annotator.FFmpegEncoder", mock_encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe_result),
+        ):
+            annotator.annotate(input_path, tmp_path / "output.mp4", AnnotationParams())
+
+        encoder_fps = mock_encoder_cls.call_args.args[4]
+        assert encoder_fps == pytest.approx(72000000 / 5779837)
+        assert [c.kwargs.get("fps") for c in mock_decoder_cls.call_args_list] == [encoder_fps] * 2
 
     def test_detect_every_1(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """When detect_every=1, every frame gets YOLO detection, no hold frames."""
@@ -528,7 +576,7 @@ class TestAnnotatePipeline:
         # No non-detection frames have stabilized output
         assert stats.tracked_frames == 0
         assert stats.total_detections == 1
-        assert mock_visualizer.draw_detection.call_count == 1
+        assert mock_visualizer.draw_detection_yuv420.call_count == 1
 
     def test_hold_clears_on_empty_detection(self, mock_model, mock_visualizer, hw_config, tmp_path):
         """When detection frame returns no objects, track only covers frame 0 (zero grace)."""
@@ -577,12 +625,12 @@ class TestAnnotatePipeline:
         assert stats.tracked_frames == 0
         assert mock_model.predict.call_count == 2
         assert stats.total_detections == 1
-        assert mock_visualizer.draw_detection.call_count == 1
+        assert mock_visualizer.draw_detection_yuv420.call_count == 1
 
     def test_decoder_failure_raises_error(self, mock_model, mock_visualizer, hw_config, tmp_path):
-        """When FFmpegDecoder.read_frame raises RuntimeError, annotate propagates it."""
+        """When FFmpegDecoder.read_into raises RuntimeError, annotate propagates it."""
         mock_decoder = MagicMock()
-        mock_decoder.read_frame.side_effect = RuntimeError("FFmpeg decoder crashed (rc=1)")
+        mock_decoder.read_into.side_effect = RuntimeError("FFmpeg decoder crashed (rc=1)")
         mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
         mock_decoder.__exit__ = MagicMock(return_value=False)
 
@@ -590,7 +638,7 @@ class TestAnnotatePipeline:
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
         mock_encoder.__exit__ = MagicMock(return_value=False)
 
-        mock_decoder_cls = MagicMock(return_value=mock_decoder)
+        mock_decoder_cls = _decoder_cls(mock_decoder)
         mock_encoder_cls = MagicMock(return_value=mock_encoder)
 
         ffprobe_stream = {
@@ -664,6 +712,100 @@ class TestAnnotatePipeline:
             assert call.args[0] <= 99
 
 
+class TestPass1Inference:
+    """Pass 1 batches detection frames and feeds YOLO frames already at inference size."""
+
+    def _run(self, mock_model, mock_visualizer, tmp_path, *, num_frames, width=640, height=480,
+             params=None, fp16=False, batch_size=1, boxes=((10, 20, 100, 200, 0, 0.9),)):
+        mock_model.predict.side_effect = _one_result_per_frame(list(boxes))
+        frames = [None] * num_frames
+        decoder_cls = _decoder_cls(_make_decoder_mock(frames), _make_decoder_mock(frames))
+        encoder = MagicMock()
+        encoder.__enter__ = MagicMock(return_value=encoder)
+        encoder.__exit__ = MagicMock(return_value=False)
+        encoder_cls = MagicMock(return_value=encoder)
+        ffprobe = MagicMock()
+        ffprobe.returncode = 0
+        ffprobe.stdout = json.dumps({"streams": [{
+            "r_frame_rate": "30/1", "width": width, "height": height, "nb_frames": str(num_frames),
+        }]})
+        input_path = tmp_path / "input.mp4"
+        input_path.touch()
+        annotator = VideoAnnotator(
+            mock_model, mock_visualizer, mock_model.names, HWAccelConfig(accel_type=HWAccelType.CPU),
+            stabilizer_config=StabilizerConfig(grace_center_sec=0.0, grace_edge_sec=0.0),
+            fp16=fp16, batch_size=batch_size,
+        )
+        with (
+            patch("video_annotator.FFmpegDecoder", decoder_cls),
+            patch("video_annotator.FFmpegEncoder", encoder_cls),
+            patch("video_annotator.subprocess.run", return_value=ffprobe),
+        ):
+            stats = annotator.annotate(input_path, tmp_path / "out.mp4", params or AnnotationParams(detect_every=1))
+        return stats, decoder_cls, encoder_cls, encoder
+
+    def test_detection_frames_go_to_predict_in_batches(self, mock_model, mock_visualizer, tmp_path):
+        stats, *_ = self._run(mock_model, mock_visualizer, tmp_path, num_frames=7, batch_size=3)
+        sizes = [len(c.kwargs["source"]) for c in mock_model.predict.call_args_list]
+        assert sizes == [3, 3, 1]
+        assert stats.detected_frames == 7
+
+    def test_clip_shorter_than_one_batch(self, mock_model, mock_visualizer, tmp_path):
+        stats, _, _, encoder = self._run(mock_model, mock_visualizer, tmp_path, num_frames=3, batch_size=8)
+        sizes = [len(c.kwargs["source"]) for c in mock_model.predict.call_args_list]
+        assert sizes == [3]
+        assert stats.detected_frames == 3
+        assert mock_visualizer.draw_detection_yuv420.call_count == 3
+        assert encoder.write_frame.call_count == 3
+
+    def test_detect_every_skips_frames_before_batching(self, mock_model, mock_visualizer, tmp_path):
+        stats, *_ = self._run(
+            mock_model, mock_visualizer, tmp_path, num_frames=10, batch_size=8,
+            params=AnnotationParams(detect_every=5),
+        )
+        sizes = [len(c.kwargs["source"]) for c in mock_model.predict.call_args_list]
+        assert sizes == [2]  # frames 0 and 5
+        assert stats.detected_frames == 2
+        assert stats.total_frames == 10
+
+    def test_fp16_reaches_predict(self, mock_model, mock_visualizer, tmp_path):
+        self._run(mock_model, mock_visualizer, tmp_path, num_frames=2, fp16=True)
+        assert all(c.kwargs["quantize"] == 16 for c in mock_model.predict.call_args_list)
+
+    def test_fp32_does_not_pass_quantize(self, mock_model, mock_visualizer, tmp_path):
+        self._run(mock_model, mock_visualizer, tmp_path, num_frames=2)
+        assert all("quantize" not in c.kwargs for c in mock_model.predict.call_args_list)
+
+    def test_frames_arrive_at_inference_size_and_boxes_are_scaled_back(
+        self, mock_model, mock_visualizer, tmp_path
+    ):
+        self._run(
+            mock_model, mock_visualizer, tmp_path, num_frames=1, width=1280, height=960,
+            params=AnnotationParams(detect_every=1, imgsz=640),
+        )
+        source = mock_model.predict.call_args.kwargs["source"]
+        assert source[0].shape == (480, 640, 3)
+        det = mock_visualizer.draw_detection_yuv420.call_args.kwargs["det"]
+        assert (det.x1, det.y1, det.x2, det.y2) == (20, 40, 200, 400)
+
+    def test_pass2_streams_yuv420p_both_ways(self, mock_model, mock_visualizer, tmp_path):
+        _, decoder_cls, encoder_cls, _ = self._run(mock_model, mock_visualizer, tmp_path, num_frames=2)
+        pass1, pass2 = decoder_cls.call_args_list
+        assert pass1.kwargs.get("pix_fmt", "bgr24") == "bgr24"
+        assert pass2.kwargs["pix_fmt"] == "yuv420p"
+        assert encoder_cls.call_args.kwargs["pix_fmt"] == "yuv420p"
+
+    def test_every_frame_reaches_the_encoder(self, mock_model, mock_visualizer, tmp_path):
+        _, _, _, encoder = self._run(mock_model, mock_visualizer, tmp_path, num_frames=12, batch_size=4)
+        assert encoder.write_frame.call_count == 12
+        assert encoder.write_frame.call_args.args[0].shape == (640 * 480 * 3 // 2,)
+
+    def test_gpu_cache_is_released_between_passes(self, mock_model, mock_visualizer, tmp_path):
+        with patch("video_annotator.torch.cuda.empty_cache") as empty_cache:
+            self._run(mock_model, mock_visualizer, tmp_path, num_frames=2)
+        empty_cache.assert_called_once()
+
+
 class TestAutoCodecResolve:
     """Test VIDEO_CODEC=auto resolution from input metadata."""
 
@@ -671,23 +813,19 @@ class TestAutoCodecResolve:
         return [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
 
     def _make_decoder_mock(self, frames: list[np.ndarray]):
-        mock_decoder = MagicMock()
-        mock_decoder.read_frame.side_effect = list(frames) + [None]
-        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
-        mock_decoder.__exit__ = MagicMock(return_value=False)
-        return mock_decoder
+        return _make_decoder_mock(frames)
 
     def _setup_ffmpeg_mocks(self, frames: list[np.ndarray]):
         decoder_pass1 = self._make_decoder_mock(frames)
         decoder_pass2 = self._make_decoder_mock(frames)
 
-        mock_decoder_cls = MagicMock(side_effect=[decoder_pass1, decoder_pass2])
+        mock_decoder_cls = _decoder_cls(decoder_pass1, decoder_pass2)
 
         mock_encoder = MagicMock()
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
         mock_encoder.__exit__ = MagicMock(return_value=False)
 
-        mock_decoder_cls = MagicMock(side_effect=[decoder_pass1, decoder_pass2])
+        mock_decoder_cls = _decoder_cls(decoder_pass1, decoder_pass2)
         mock_encoder_cls = MagicMock(return_value=mock_encoder)
 
         return mock_decoder_cls, mock_encoder_cls, mock_encoder
@@ -922,11 +1060,7 @@ class TestAnnotateCancellation:
         return [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
 
     def _make_decoder_mock(self, frames: list[np.ndarray]):
-        mock_decoder = MagicMock()
-        mock_decoder.read_frame.side_effect = list(frames) + [None]
-        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
-        mock_decoder.__exit__ = MagicMock(return_value=False)
-        return mock_decoder
+        return _make_decoder_mock(frames)
 
     def _ffprobe_result(self, num_frames: int) -> MagicMock:
         stream = {
@@ -945,7 +1079,7 @@ class TestAnnotateCancellation:
         frames = self._make_frames(num_frames)
         decoder1 = self._make_decoder_mock(frames)
         decoder2 = self._make_decoder_mock(frames)
-        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+        mock_decoder_cls = _decoder_cls(decoder1, decoder2)
 
         mock_encoder = MagicMock()
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
@@ -984,7 +1118,7 @@ class TestAnnotateCancellation:
                 )
 
         # Pass 2 must never start (second decoder never used).
-        assert decoder2.read_frame.call_count == 0
+        assert decoder2.read_into.call_count == 0
         # FFmpegDecoder __exit__ was invoked for pass 1.
         assert decoder1.__exit__.called
 
@@ -1033,7 +1167,7 @@ class TestAnnotateCancellation:
         num_frames = 5
         frames = self._make_frames(num_frames)
         decoder1 = self._make_decoder_mock(frames)
-        mock_decoder_cls = MagicMock(side_effect=[decoder1])
+        mock_decoder_cls = _decoder_cls(decoder1)
 
         mock_encoder_cls = MagicMock()
 
@@ -1071,7 +1205,7 @@ class TestAnnotateCancellation:
         # Pass 1 loop exits on the very first iteration: no predict call,
         # no decode call, pass 2 decoder/encoder never constructed.
         assert mock_model.predict.call_count == 0
-        assert decoder1.read_frame.call_count == 0
+        assert decoder1.read_into.call_count == 0
         assert mock_encoder_cls.call_count == 0
 
     def test_cancel_during_pass2_raises(self, mock_model, mock_visualizer, hw_config, tmp_path):
@@ -1081,7 +1215,7 @@ class TestAnnotateCancellation:
         frames = self._make_frames(num_frames)
         decoder1 = self._make_decoder_mock(frames)
         decoder2 = self._make_decoder_mock(frames)
-        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+        mock_decoder_cls = _decoder_cls(decoder1, decoder2)
 
         mock_encoder = MagicMock()
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
@@ -1135,7 +1269,7 @@ class TestAnnotateCancellation:
         num_frames = 5
         frames = self._make_frames(num_frames)
         decoder1 = self._make_decoder_mock(frames)
-        mock_decoder_cls = MagicMock(side_effect=[decoder1])
+        mock_decoder_cls = _decoder_cls(decoder1)
         mock_encoder_cls = MagicMock()
 
         cancel_event = threading.Event()
@@ -1195,7 +1329,7 @@ class TestAnnotateCancellation:
         frames = self._make_frames(num_frames)
         decoder1 = self._make_decoder_mock(frames)
         decoder2 = self._make_decoder_mock(frames)  # must never be used
-        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+        mock_decoder_cls = _decoder_cls(decoder1, decoder2)
 
         mock_encoder = MagicMock()
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
@@ -1250,7 +1384,7 @@ class TestAnnotateCancellation:
         frames = self._make_frames(num_frames)
         decoder1 = self._make_decoder_mock(frames)
         decoder2 = self._make_decoder_mock(frames)
-        mock_decoder_cls = MagicMock(side_effect=[decoder1, decoder2])
+        mock_decoder_cls = _decoder_cls(decoder1, decoder2)
 
         mock_encoder = MagicMock()
         mock_encoder.__enter__ = MagicMock(return_value=mock_encoder)
@@ -1338,11 +1472,7 @@ class TestNvencFallback:
         return [np.zeros((height, width, 3), dtype=np.uint8) for _ in range(num_frames)]
 
     def _make_decoder_mock(self, frames: list[np.ndarray]):
-        mock_decoder = MagicMock()
-        mock_decoder.read_frame.side_effect = list(frames) + [None]
-        mock_decoder.__enter__ = MagicMock(return_value=mock_decoder)
-        mock_decoder.__exit__ = MagicMock(return_value=False)
-        return mock_decoder
+        return _make_decoder_mock(frames)
 
     def _ffprobe_result(self, num_frames: int) -> MagicMock:
         stream = {
@@ -1362,7 +1492,7 @@ class TestNvencFallback:
         dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2_cpu = self._make_decoder_mock(self._make_frames(num_frames))
-        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu])
+        mock_decoder_cls = _decoder_cls(dec_p1, dec_p2_nvenc, dec_p2_cpu)
 
         failing_encoder = MagicMock()
         failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
@@ -1459,7 +1589,7 @@ class TestNvencFallback:
         num_frames = 3
         dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2 = self._make_decoder_mock(self._make_frames(num_frames))
-        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2])
+        mock_decoder_cls = _decoder_cls(dec_p1, dec_p2)
 
         failing_encoder = MagicMock()
         failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
@@ -1506,7 +1636,7 @@ class TestNvencFallback:
         dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2_cpu = self._make_decoder_mock(self._make_frames(num_frames))
-        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu])
+        mock_decoder_cls = _decoder_cls(dec_p1, dec_p2_nvenc, dec_p2_cpu)
 
         def _make_failing_encoder(msg: str) -> MagicMock:
             enc = MagicMock()
@@ -1565,7 +1695,7 @@ class TestNvencFallback:
         dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2_cpu = self._make_decoder_mock(self._make_frames(num_frames))
-        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu])
+        mock_decoder_cls = _decoder_cls(dec_p1, dec_p2_nvenc, dec_p2_cpu)
 
         failing_encoder = MagicMock()
         failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
@@ -1638,7 +1768,7 @@ class TestNvencFallback:
         dec_p1 = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2_nvenc = self._make_decoder_mock(self._make_frames(num_frames))
         dec_p2_cpu = self._make_decoder_mock(self._make_frames(num_frames))
-        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu])
+        mock_decoder_cls = _decoder_cls(dec_p1, dec_p2_nvenc, dec_p2_cpu)
 
         failing_encoder = MagicMock()
         failing_encoder.__enter__ = MagicMock(return_value=failing_encoder)
@@ -1699,7 +1829,7 @@ class TestNvencFallback:
         # Third decoder must never be constructed — cancel should preempt
         # the CPU retry entirely.
         dec_p2_cpu_unused = self._make_decoder_mock(self._make_frames(num_frames))
-        mock_decoder_cls = MagicMock(side_effect=[dec_p1, dec_p2_nvenc, dec_p2_cpu_unused])
+        mock_decoder_cls = _decoder_cls(dec_p1, dec_p2_nvenc, dec_p2_cpu_unused)
 
         # NVENC write_frame fails AND sets the cancel event. This simulates a
         # user-issued /cancel arriving while the annotator was blocked on the
@@ -1752,4 +1882,4 @@ class TestNvencFallback:
         # Only the NVENC encoder was constructed. CPU retry never started.
         assert mock_encoder_cls.call_count == 1
         # Third decoder (the would-be CPU retry) was never requested.
-        assert dec_p2_cpu_unused.read_frame.call_count == 0
+        assert dec_p2_cpu_unused.read_into.call_count == 0

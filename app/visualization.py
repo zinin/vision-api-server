@@ -34,6 +34,64 @@ class DetectionBox:
     confidence: float
 
 
+@dataclass(frozen=True, slots=True)
+class _LabelBox:
+    """Label background rectangle (inclusive corners) and the text origin."""
+
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    text_x: int
+    text_y: int
+
+
+# Limited-range BT.601, the matrix swscale applies when the encoder turns
+# untagged BGR frames into yuv420p. Rows give Y, U, V from R, G, B in 0..255.
+_BT601_FROM_RGB = np.array(
+    [
+        [65.481, 128.553, 24.966],
+        [-37.797, -74.203, 112.0],
+        [112.0, -93.786, -18.214],
+    ],
+    dtype=np.float32,
+) / 255.0
+_BT601_OFFSET = np.array([16.0, 128.0, 128.0], dtype=np.float32)
+
+
+def bgr_to_yuv601(bgr: tuple[int, int, int]) -> tuple[int, int, int]:
+    """One BGR colour as limited-range BT.601 (Y, U, V)."""
+    rgb = np.array(bgr[::-1], dtype=np.float32)
+    y, u, v = np.clip(np.rint(_BT601_FROM_RGB @ rgb + _BT601_OFFSET), 0, 255)
+    return int(y), int(u), int(v)
+
+
+def bgr_patch_to_yuv420(patch: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Y, U, V planes of a BGR patch with even sides; U and V are 2x2 means."""
+    yuv = patch[..., ::-1].astype(np.float32) @ _BT601_FROM_RGB.T + _BT601_OFFSET
+    h, w = patch.shape[:2]
+    chroma = yuv[..., 1:].reshape(h // 2, 2, w // 2, 2, 2).mean(axis=(1, 3))
+
+    def to_u8(plane: np.ndarray) -> np.ndarray:
+        return np.clip(np.rint(plane), 0, 255).astype(np.uint8)
+
+    return to_u8(yuv[..., 0]), to_u8(chroma[..., 0]), to_u8(chroma[..., 1])
+
+
+def yuv420_planes(
+    frame: np.ndarray, width: int, height: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Writable Y, U, V views into a flat yuv420p frame."""
+    chroma_w, chroma_h = (width + 1) // 2, (height + 1) // 2
+    y_end = width * height
+    u_end = y_end + chroma_w * chroma_h
+    return (
+        frame[:y_end].reshape(height, width),
+        frame[y_end:u_end].reshape(chroma_h, chroma_w),
+        frame[u_end:u_end + chroma_w * chroma_h].reshape(chroma_h, chroma_w),
+    )
+
+
 class DetectionVisualizer:
     """High-performance detection visualizer with adaptive styling."""
 
@@ -177,20 +235,101 @@ class DetectionVisualizer:
             line_width
         )
 
-        if not (show_labels or show_conf):
+        label = self._label_text(det, show_labels, show_conf)
+        if label is None:
             return
-
-        # Build label
-        label_parts = []
-        if show_labels:
-            label_parts.append(det.class_name)
-        if show_conf:
-            label_parts.append(f"{det.confidence:.2f}")
-
-        label = " ".join(label_parts)
         self._draw_label_with_background(
             image, label, det.x1, det.y1,
             color_tuple, font_scale, text_thickness
+        )
+
+    def draw_detection_yuv420(
+            self,
+            frame: np.ndarray,
+            width: int,
+            height: int,
+            det: DetectionBox,
+            line_width: int,
+            show_labels: bool,
+            show_conf: bool,
+            font_scale: float,
+            text_thickness: int
+    ) -> None:
+        """Draw a single detection onto a flat yuv420p frame, in place.
+
+        The box goes onto Y with ``line_width`` and onto U and V at half
+        resolution with ``(line_width + 1) // 2``. The label is drawn in BGR
+        on a patch aligned to even coordinates, converted with BT.601 and
+        pasted: luma exactly over the label rectangle, chroma over every 2x2
+        block the rectangle touches.
+        """
+        y_plane, u_plane, v_plane = yuv420_planes(frame, width, height)
+        bgr = self._get_class_color(det.class_id).as_tuple()
+        luma, cb, cr = bgr_to_yuv601(bgr)
+
+        cv2.rectangle(y_plane, (det.x1, det.y1), (det.x2, det.y2), luma, line_width)
+        chroma_width = (line_width + 1) // 2
+        corner1, corner2 = (det.x1 // 2, det.y1 // 2), (det.x2 // 2, det.y2 // 2)
+        cv2.rectangle(u_plane, corner1, corner2, cb, chroma_width)
+        cv2.rectangle(v_plane, corner1, corner2, cr, chroma_width)
+
+        label = self._label_text(det, show_labels, show_conf)
+        if label is None:
+            return
+        box = self._label_box(label, det.x1, det.y1, font_scale, text_thickness)
+
+        # Patch over the label rectangle, grown to even edges for 4:2:0 chroma.
+        px0, py0 = box.x0 - box.x0 % 2, box.y0 - box.y0 % 2
+        px1, py1 = box.x1 + 1 + (box.x1 + 1) % 2, box.y1 + 1 + (box.y1 + 1) % 2
+        patch = np.empty((py1 - py0, px1 - px0, 3), dtype=np.uint8)
+        patch[:] = bgr
+        cv2.putText(
+            patch, label, (box.text_x - px0, box.text_y - py0), self._font,
+            font_scale, (255, 255, 255), text_thickness, cv2.LINE_AA,
+        )
+        patch_y, patch_u, patch_v = bgr_patch_to_yuv420(patch)
+
+        # Luma: exactly the label rectangle, clipped to the frame.
+        x0, y0 = max(box.x0, 0), max(box.y0, 0)
+        x1, y1 = min(box.x1 + 1, width), min(box.y1 + 1, height)
+        if x0 < x1 and y0 < y1:
+            y_plane[y0:y1, x0:x1] = patch_y[y0 - py0:y1 - py0, x0 - px0:x1 - px0]
+
+        # Chroma: the 2x2 blocks under the patch, clipped to the planes.
+        cx0, cy0 = max(px0, 0) // 2, max(py0, 0) // 2
+        cx1, cy1 = min(px1 // 2, u_plane.shape[1]), min(py1 // 2, u_plane.shape[0])
+        if cx0 < cx1 and cy0 < cy1:
+            rows = slice(cy0 - py0 // 2, cy1 - py0 // 2)
+            cols = slice(cx0 - px0 // 2, cx1 - px0 // 2)
+            u_plane[cy0:cy1, cx0:cx1] = patch_u[rows, cols]
+            v_plane[cy0:cy1, cx0:cx1] = patch_v[rows, cols]
+
+    @staticmethod
+    def _label_text(det: DetectionBox, show_labels: bool, show_conf: bool) -> str | None:
+        """The label for a detection, or None when both parts are hidden."""
+        parts = []
+        if show_labels:
+            parts.append(det.class_name)
+        if show_conf:
+            parts.append(f"{det.confidence:.2f}")
+        return " ".join(parts) if parts else None
+
+    def _label_box(
+            self, label: str, x: int, y: int, font_scale: float, thickness: int
+    ) -> _LabelBox:
+        """Where the label background and text go for a box whose top-left is (x, y)."""
+        (text_w, text_h), baseline = cv2.getTextSize(
+            label, self._font, font_scale, thickness
+        )
+        padding = 4
+        label_y = max(text_h + baseline + padding, y)
+        return _LabelBox(
+            x0=x,
+            y0=label_y - text_h - baseline - padding,
+            x1=x + text_w + padding,
+            y1=label_y,
+            text_x=x + padding // 2,
+            text_y=label_y - baseline - padding // 2,
         )
 
     def _draw_label_with_background(
@@ -204,27 +343,16 @@ class DetectionVisualizer:
             thickness: int
     ) -> None:
         """Draw text label with background."""
-        (text_w, text_h), baseline = cv2.getTextSize(
-            label, self._font, font_scale, thickness
-        )
-
-        padding = 4
-        label_y = max(text_h + baseline + padding, y)
+        box = self._label_box(label, x, y, font_scale, thickness)
 
         # Background rectangle
-        cv2.rectangle(
-            image,
-            (x, label_y - text_h - baseline - padding),
-            (x + text_w + padding, label_y),
-            bg_color,
-            -1
-        )
+        cv2.rectangle(image, (box.x0, box.y0), (box.x1, box.y1), bg_color, -1)
 
         # Text
         cv2.putText(
             image,
             label,
-            (x + padding // 2, label_y - baseline - padding // 2),
+            (box.text_x, box.text_y),
             self._font,
             font_scale,
             (255, 255, 255),

@@ -1,14 +1,48 @@
 import logging
+import math
 import subprocess
 import threading
 from collections import deque
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # fcntl is Unix-only
+    fcntl = None
 
 import numpy as np
 
 from hw_accel import HWAccelConfig
 
 logger = logging.getLogger(__name__)
+
+# 1 MiB is the default /proc/sys/fs/pipe-max-size, so any process may ask for it.
+_PIPE_SIZE = 1 << 20
+
+
+def frame_shape(width: int, height: int, pix_fmt: str) -> tuple[int, ...]:
+    """numpy shape of one rawvideo frame: (h, w, 3) for bgr24, flat for yuv420p."""
+    if pix_fmt == "bgr24":
+        return (height, width, 3)
+    if pix_fmt == "yuv420p":
+        chroma = ((width + 1) // 2) * ((height + 1) // 2)
+        return (width * height + 2 * chroma,)
+    raise ValueError(f"Unsupported pix_fmt: {pix_fmt}")
+
+
+def _grow_pipe(stream) -> None:
+    """Best effort: enlarge a pipe's kernel buffer from 64 KiB to 1 MiB.
+
+    A bigger buffer lets ffmpeg and Python hand a frame over in fewer, larger
+    steps. Streams that are not pipes (test doubles, non-Linux) are skipped.
+    """
+    setpipe = getattr(fcntl, "F_SETPIPE_SZ", None)
+    if setpipe is None:
+        return
+    try:
+        fcntl.fcntl(stream.fileno(), setpipe, _PIPE_SIZE)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
 
 
 def _drain_stderr(process: subprocess.Popen, collected: deque[bytes]) -> None:
@@ -41,6 +75,12 @@ def rc_to_str(rc: int | None) -> str:
 class FFmpegDecoder:
     """Decode video frames via FFmpeg subprocess pipe.
 
+    ``pix_fmt`` is ``bgr24`` (frames shaped (h, w, 3)) or ``yuv420p`` (flat
+    frames: the Y, U and V planes back to back, limited range even for a
+    full-range source). ``frame_shape`` and ``frame_size`` describe one frame.
+    ``fps`` puts the frames on a constant grid of that rate; without it ffmpeg
+    picks the rate itself.
+
     Usage:
         with FFmpegDecoder(path, w, h, config) as decoder:
             while (frame := decoder.read_frame()) is not None:
@@ -53,41 +93,85 @@ class FFmpegDecoder:
         width: int,
         height: int,
         hw_config: HWAccelConfig,
+        pix_fmt: str = "bgr24",
+        fps: float | None = None,
     ):
         self._input_path = str(input_path)
-        self._width = width
-        self._height = height
-        self._frame_size = width * height * 3  # BGR24
+        self.frame_shape = frame_shape(width, height, pix_fmt)
+        self.frame_size = math.prod(self.frame_shape)
         self._stderr_lines: deque[bytes] = deque(maxlen=100)
+        self._aborted = False
 
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
         cmd += hw_config.decode_args
-        cmd += ["-i", str(input_path), "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+        cmd += ["-i", str(input_path), "-f", "rawvideo", "-pix_fmt", pix_fmt]
+        if fps is not None:
+            # ffmpeg's own choice follows r_frame_rate, which a camera's
+            # timestamp jitter can push to several times the real rate (50
+            # for a 12.5 fps recording): every frame would come out repeated.
+            cmd += ["-fps_mode", "cfr", "-r", str(fps)]
+        if pix_fmt == "yuv420p":
+            # The encoder reads these planes as limited range. Newer ffmpeg
+            # (8.0 does, 6.1 does not) passes a full-range source (yuvj420p,
+            # common on IP cameras) through unconverted unless the output
+            # range is set, which clips the result's shadows and highlights.
+            # As an output option it converts; before -i it would only
+            # relabel the source. bgr24 always honours the source range.
+            cmd += ["-color_range", "tv"]
+        cmd += ["pipe:1"]
 
         logger.debug(f"FFmpegDecoder command: {' '.join(cmd)}")
         self._process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False
         )
+        _grow_pipe(self._process.stdout)
         # Start daemon thread to drain stderr and prevent deadlock
         self._stderr_thread = threading.Thread(
             target=_drain_stderr, args=(self._process, self._stderr_lines), daemon=True
         )
         self._stderr_thread.start()
 
+    def read_into(self, buf: np.ndarray) -> bool:
+        """Read the next frame straight into ``buf``. Returns False on EOF.
+
+        ``buf`` must be a C-contiguous uint8 array of ``frame_size`` bytes.
+        Filling it in place skips the bytes object and the copy that
+        ``read_frame`` would make. Raises RuntimeError if ffmpeg crashed.
+        """
+        view = memoryview(buf).cast("B")
+        if len(view) != self.frame_size:
+            raise ValueError(
+                f"Buffer holds {len(view)} bytes, a frame needs {self.frame_size}"
+            )
+        got = 0
+        while got < self.frame_size:
+            n = self._process.stdout.readinto(view[got:])
+            if not n:
+                break
+            got += n
+        if got == self.frame_size:
+            return True
+        # Short read: normal EOF or a crash
+        if self._process.poll() is not None and self._process.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg decoder crashed ({rc_to_str(self._process.returncode)}): "
+                f"{_format_stderr(self._stderr_lines)}"
+            )
+        return False
+
     def read_frame(self) -> np.ndarray | None:
-        """Read one BGR24 frame (writable copy). Returns None on EOF."""
-        raw = self._process.stdout.read(self._frame_size)
-        if not raw or len(raw) < self._frame_size:
-            # Check if process crashed (vs normal EOF)
-            if self._process.poll() is not None and self._process.returncode != 0:
-                raise RuntimeError(
-                    f"FFmpeg decoder crashed ({rc_to_str(self._process.returncode)}): "
-                    f"{_format_stderr(self._stderr_lines)}"
-                )
-            return None
-        return np.frombuffer(raw, dtype=np.uint8).reshape(
-            (self._height, self._width, 3)
-        ).copy()  # .copy() makes array writable for OpenCV drawing
+        """Read one frame into a new writable array. Returns None on EOF."""
+        frame = np.empty(self.frame_shape, dtype=np.uint8)
+        return frame if self.read_into(frame) else None
+
+    def abort(self) -> None:
+        """Kill ffmpeg so that a read blocked in another thread returns.
+
+        ``close()`` cannot unblock such a read: closing the pipe waits for the
+        buffered reader's lock, which the reading thread holds.
+        """
+        self._aborted = True
+        self._process.kill()
 
     def close(self) -> None:
         if self._process.stdout:
@@ -114,6 +198,8 @@ class FFmpegDecoder:
             logger.warning(
                 "FFmpeg decoder did not exit after SIGKILL; process may be leaked"
             )
+        elif self._aborted:
+            logger.debug(f"FFmpeg decoder aborted ({rc_to_str(self._process.returncode)})")
         elif self._process.returncode != 0:
             logger.warning(f"FFmpeg decoder exited with code {self._process.returncode}")
 
@@ -125,7 +211,10 @@ class FFmpegDecoder:
 
 
 class FFmpegEncoder:
-    """Encode raw BGR24 frames via FFmpeg subprocess pipe with audio merge.
+    """Encode raw frames via FFmpeg subprocess pipe with audio merge.
+
+    ``pix_fmt`` names the layout of the frames written to the pipe:
+    ``bgr24`` or ``yuv420p`` (see ``frame_shape``).
 
     Usage:
         with FFmpegEncoder(original, output, w, h, fps, config, codec, crf) as enc:
@@ -144,20 +233,23 @@ class FFmpegEncoder:
         codec: str,
         crf: int | None = None,
         bitrate: int | None = None,
+        pix_fmt: str = "bgr24",
     ):
+        frame_shape(width, height, pix_fmt)  # rejects an unsupported pix_fmt early
         self._stderr_lines: deque[bytes] = deque(maxlen=100)
         # True after the encoder cleanly exits (rc=0) while we still had
         # frames to write — e.g. FFmpeg's -shortest closes pipe:0 when the
         # audio stream ends before the piped raw video. Subsequent
         # write_frame() calls become silent no-ops. Single-writer invariant:
-        # callers must serialise write_frame() from one thread (the Pass 2
-        # loop in VideoAnnotator is single-threaded by design).
+        # callers must serialise write_frame() from one thread (in Pass 2 of
+        # VideoAnnotator that is the ThreadedFrameWriter thread, joined
+        # before close()).
         self._eof = False
 
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
         cmd += hw_config.global_encode_args  # e.g. [-vaapi_device, ...] — MUST be before -i
         cmd += [
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-f", "rawvideo", "-pix_fmt", pix_fmt,
             "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "pipe:0",
             "-i", str(original_path),
@@ -172,12 +264,13 @@ class FFmpegEncoder:
         # the BufferedWriter "write all bytes" contract — raw unbuffered
         # mode can short-write under EINTR / backpressure and misalign
         # the rawvideo stream. write_frame() calls flush() after each
-        # frame, which keeps the buffer empty so close()'s implicit
-        # flush cannot push residual bytes into a pipe that ffmpeg has
-        # already closed (e.g. after -shortest).
+        # frame, which keeps the buffer empty between frames. Only a
+        # flush that hits a pipe ffmpeg already closed (e.g. after
+        # -shortest) leaves bytes behind; close() deals with those.
         self._process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=False,
         )
+        _grow_pipe(self._process.stdin)
         # Start daemon thread to drain stderr and prevent deadlock
         self._stderr_thread = threading.Thread(
             target=_drain_stderr, args=(self._process, self._stderr_lines), daemon=True
@@ -185,7 +278,7 @@ class FFmpegEncoder:
         self._stderr_thread.start()
 
     def write_frame(self, frame: np.ndarray) -> bool:
-        """Write one BGR24 frame to the encoder.
+        """Write one frame (laid out as ``pix_fmt``) to the encoder.
 
         Returns True when the frame was written and the caller should keep
         going, False once the encoder has finalised (rc == 0) — callers
@@ -215,11 +308,13 @@ class FFmpegEncoder:
                 f"{_format_stderr(self._stderr_lines)}"
             )
         try:
-            self._process.stdin.write(frame.tobytes())
-            # Flush after every frame so the Python-side buffer never holds
-            # residual bytes: close()'s implicit flush would otherwise push
-            # them into a pipe ffmpeg already closed (e.g. after -shortest)
-            # and raise a spurious BrokenPipeError despite a clean rc=0.
+            # A memoryview hands the array's own memory to write(): no copy.
+            self._process.stdin.write(memoryview(np.ascontiguousarray(frame)).cast("B"))
+            # Flush after every frame so the Python-side buffer holds no
+            # residual bytes for close()'s implicit flush to push into a
+            # pipe ffmpeg already closed (e.g. after -shortest). If this
+            # flush itself hits the closed pipe, the unwritten tail stays
+            # buffered; close() drops it.
             self._process.stdin.flush()
         except OSError as e:  # BrokenPipeError is a subclass of OSError.
             # The pipe closed mid-write. Most often this means the
@@ -259,7 +354,15 @@ class FFmpegEncoder:
     def close(self) -> None:
         """Close stdin, wait for FFmpeg to finish, check return code."""
         if self._process.stdin:
-            self._process.stdin.close()
+            try:
+                self._process.stdin.close()
+            except BrokenPipeError:
+                # ffmpeg closed its input while the flush in write_frame still
+                # had the tail of a frame buffered, and closing flushes it into
+                # the closed pipe again. The tail is dropped either way: the
+                # return code below tells a clean early exit (-shortest) from
+                # a crash, whose RuntimeError the NVENC fallback relies on.
+                logger.debug("FFmpegEncoder: dropped the unwritten tail of a frame, ffmpeg closed its input")
         self._stderr_thread.join(timeout=10)
         if self._process.stderr:
             self._process.stderr.close()

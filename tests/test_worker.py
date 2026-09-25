@@ -1,4 +1,8 @@
 import asyncio
+import gc
+import weakref
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -6,7 +10,7 @@ import pytest
 from config import Settings
 from hw_accel import HWAccelConfig, HWAccelType
 from job_manager import JobManager, JobStatus
-from video_annotator import AnnotationStats
+from video_annotator import AnnotationStats, JobCancelledError
 
 
 @pytest.fixture
@@ -25,13 +29,14 @@ def mock_model_entry():
     entry.model = MagicMock()
     entry.model.names = {0: "person"}
     entry.visualizer = MagicMock()
+    entry.device = "cpu"
     return entry
 
 
 @pytest.fixture
 def worker_model_manager(mock_model_entry):
     mm = MagicMock()
-    mm.get_model = AsyncMock(return_value=mock_model_entry)
+    mm.get_video_model = AsyncMock(return_value=mock_model_entry)
     return mm
 
 
@@ -99,7 +104,7 @@ class TestAnnotationWorker:
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
         job.input_path.touch()
 
-        worker_app.state.model_manager.get_model = AsyncMock(
+        worker_app.state.model_manager.get_video_model = AsyncMock(
             side_effect=RuntimeError("model not found")
         )
 
@@ -159,7 +164,7 @@ class TestAnnotationWorker:
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
         job.input_path.touch()
 
-        worker_app.state.model_manager.get_model = AsyncMock(
+        worker_app.state.model_manager.get_video_model = AsyncMock(
             side_effect=RuntimeError("model error")
         )
 
@@ -193,21 +198,22 @@ class TestAnnotationWorker:
 
         call_count = 0
 
-        async def get_model_side_effect(name):
+        async def get_video_model_side_effect(name):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 raise RuntimeError("model error")
-            return worker_app.state.model_manager.get_model.return_value
+            return worker_app.state.model_manager.get_video_model.return_value
 
         # Reset to allow first call to fail, second to succeed
         original_entry = MagicMock()
         original_entry.model = MagicMock()
         original_entry.model.names = {0: "person"}
         original_entry.visualizer = MagicMock()
+        original_entry.device = "cpu"
 
-        worker_app.state.model_manager.get_model = AsyncMock(side_effect=get_model_side_effect)
-        worker_app.state.model_manager.get_model.return_value = original_entry
+        worker_app.state.model_manager.get_video_model = AsyncMock(side_effect=get_video_model_side_effect)
+        worker_app.state.model_manager.get_video_model.return_value = original_entry
 
         mock_stats = AnnotationStats(total_frames=10)
         mock_annotator_cls = MagicMock()
@@ -224,6 +230,60 @@ class TestAnnotationWorker:
 
         assert worker_job_manager.get_job(job1.job_id).status == JobStatus.FAILED
         assert worker_job_manager.get_job(job2.job_id).status == JobStatus.COMPLETED
+
+
+    @pytest.mark.asyncio
+    async def test_passes_configured_inference_mode(
+        self, worker_app, worker_job_manager, tmp_path
+    ):
+        """VIDEO_FP16 / VIDEO_BATCH_SIZE reach VideoAnnotator as fp16 / batch_size."""
+        settings = Settings(
+            yolo_models="{}", video_jobs_dir=str(tmp_path), max_executor_workers=1,
+            video_fp16="false", video_batch_size="4",
+        )
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        mock_annotator_cls = MagicMock()
+        mock_annotator_cls.return_value.annotate.return_value = AnnotationStats(total_frames=1)
+        mock_executor = MagicMock()
+        mock_executor.executor = None
+
+        with (
+            patch("main.VideoAnnotator", mock_annotator_cls),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            await _run_worker_until_job_done(worker_app, settings, worker_job_manager)
+
+        kwargs = mock_annotator_cls.call_args.kwargs
+        assert kwargs["fp16"] is False
+        assert kwargs["batch_size"] == 4
+
+    @pytest.mark.asyncio
+    async def test_auto_inference_mode_on_cpu_is_fp32_batch_1(
+        self, worker_app, worker_settings, worker_job_manager
+    ):
+        """With the defaults (auto) a model on CPU keeps today's behaviour."""
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        mock_annotator_cls = MagicMock()
+        mock_annotator_cls.return_value.annotate.return_value = AnnotationStats(total_frames=1)
+        mock_executor = MagicMock()
+        mock_executor.executor = None
+
+        with (
+            patch("main.VideoAnnotator", mock_annotator_cls),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            await _run_worker_until_job_done(worker_app, worker_settings, worker_job_manager)
+
+        kwargs = mock_annotator_cls.call_args.kwargs
+        assert kwargs["fp16"] is False
+        assert kwargs["batch_size"] == 1
+        worker_app.state.model_manager.get_video_model.assert_awaited()
 
 
 class TestAnnotationWorkerCancellation:
@@ -300,20 +360,20 @@ class TestAnnotationWorkerCancellation:
     async def test_cancel_during_model_load(
         self, worker_app, worker_settings, worker_job_manager, tmp_path
     ):
-        """If cancel arrives while get_model() is in flight, worker must
+        """If cancel arrives while get_video_model() is in flight, worker must
         observe the event right after and never construct the annotator."""
         job = worker_job_manager.create_job(params={})
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
         job.input_path.touch()
 
-        real_get_model = worker_app.state.model_manager.get_model
+        real_get_video_model = worker_app.state.model_manager.get_video_model
 
-        async def slow_get_model(name=None):
+        async def slow_get_video_model(name=None):
             # Simulate /cancel arriving during model load.
             worker_job_manager.request_cancel(job.job_id)
-            return await real_get_model(name)
+            return await real_get_video_model(name)
 
-        worker_app.state.model_manager.get_model = AsyncMock(side_effect=slow_get_model)
+        worker_app.state.model_manager.get_video_model = AsyncMock(side_effect=slow_get_video_model)
 
         mock_annotator_cls = MagicMock()
         mock_executor = MagicMock()
@@ -334,7 +394,7 @@ class TestAnnotationWorkerCancellation:
     async def test_cancel_precedence_over_model_load_failure(
         self, worker_app, worker_settings, worker_job_manager, tmp_path
     ):
-        """If cancel is set and get_model() also fails, status must be
+        """If cancel is set and get_video_model() also fails, status must be
         CANCELLED (cancel wins over pre-annotate failure)."""
         job = worker_job_manager.create_job(params={})
         job.input_path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,7 +404,7 @@ class TestAnnotationWorkerCancellation:
             worker_job_manager.request_cancel(job.job_id)
             raise RuntimeError("model not found")
 
-        worker_app.state.model_manager.get_model = AsyncMock(side_effect=cancel_then_fail)
+        worker_app.state.model_manager.get_video_model = AsyncMock(side_effect=cancel_then_fail)
 
         mock_annotator_cls = MagicMock()
         mock_executor = MagicMock()
@@ -418,3 +478,158 @@ class TestAnnotationWorkerCancellation:
         final = worker_job_manager.get_job(job.job_id)
         assert final.status == JobStatus.CANCELLED
         assert final.error is None
+
+
+class TestAnnotationWorkerModelRelease:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("outcome", "final_status"),
+        [
+            ("completed", JobStatus.COMPLETED),
+            ("failed", JobStatus.FAILED),
+            ("cancelled", JobStatus.CANCELLED),
+            ("setup_error", JobStatus.FAILED),
+        ],
+    )
+    async def test_idle_worker_holds_no_reference_to_the_model(
+        self, worker_app, worker_settings, worker_job_manager, caplog, outcome, final_status
+    ):
+        """Between jobs the worker holds no reference to the last job's model,
+        so evicting the video model from the cache frees it."""
+        from main import _annotation_worker
+
+        # pytest keeps a test's log records, and the traceback of an exc_info
+        # record would keep the model alive through its frames.
+        caplog.set_level("CRITICAL", logger="main")
+
+        class FakeModel:
+            names = {0: "person"}
+
+        class FakeAnnotator:
+            def __init__(self, model, **kwargs):
+                if outcome == "setup_error":
+                    raise RuntimeError("boom during setup")
+                self.model = model  # VideoAnnotator keeps its model as well
+
+            def annotate(self, **kwargs):
+                if outcome == "failed":
+                    raise RuntimeError("ffmpeg crashed")
+                if outcome == "cancelled":
+                    raise JobCancelledError()
+                return AnnotationStats(total_frames=1)
+
+        model = FakeModel()
+        model_ref = weakref.ref(model)
+        cache = {"entry": SimpleNamespace(model=model, visualizer=MagicMock(), device="cpu")}
+        del model
+
+        async def get_video_model(model_name=None):
+            return cache["entry"]
+
+        worker_app.state.model_manager.get_video_model = get_video_model
+
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        # One thread: a no-op submitted after the job runs only once that thread
+        # has dropped the job's work item and the exception annotate() raised.
+        executor = ThreadPoolExecutor(max_workers=1)
+        mock_executor = MagicMock()
+        mock_executor.executor = executor
+        loop = asyncio.get_running_loop()
+
+        with (
+            patch("main.VideoAnnotator", FakeAnnotator),
+            patch("main.get_executor", return_value=mock_executor),
+        ):
+            task = asyncio.create_task(_annotation_worker(worker_app, worker_settings))
+            try:
+                deadline = loop.time() + 5.0
+                while job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                    assert loop.time() < deadline, f"job stuck in {job.status}"
+                    await asyncio.sleep(0.01)
+                assert job.status == final_status
+                await loop.run_in_executor(executor, lambda: None)
+
+                cache.clear()  # TTL eviction: the cache lets go of the model
+                gc.collect()
+                assert not task.done()  # the worker is waiting for the next job
+                assert model_ref() is None, "the idle worker still refers to the model"
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                executor.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_model_evicted_during_the_job_is_freed_when_it_ends(
+        self, worker_app, worker_settings, worker_job_manager, caplog
+    ):
+        """A job longer than the TTL outlives the cache entry of its model. The
+        model sits in reference cycles, so the worker collects it, and empties
+        PyTorch's cache, once the job has let go of it."""
+        from main import _annotation_worker
+
+        caplog.set_level("CRITICAL", logger="main")  # log records must not keep the model alive
+
+        class FakeModel:
+            names = {0: "person"}
+
+            def __init__(self):
+                self.me = self  # a reference cycle, as in a YOLO object that has run predict()
+
+        class FakeAnnotator:
+            def __init__(self, model, **kwargs):
+                self.model = model
+
+            def annotate(self, **kwargs):
+                cache.clear()  # the TTL evicts the video model while the job runs
+                return AnnotationStats(total_frames=1)
+
+        model = FakeModel()
+        model_ref = weakref.ref(model)
+        cache = {"entry": SimpleNamespace(model=model, visualizer=MagicMock(), device="cpu")}
+        del model
+
+        async def get_video_model(model_name=None):
+            return cache["entry"]
+
+        worker_app.state.model_manager.get_video_model = get_video_model
+
+        job = worker_job_manager.create_job(params={})
+        job.input_path.parent.mkdir(parents=True, exist_ok=True)
+        job.input_path.touch()
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        mock_executor = MagicMock()
+        mock_executor.executor = executor
+        empty_cache = MagicMock()
+        loop = asyncio.get_running_loop()
+
+        with (
+            patch("main.VideoAnnotator", FakeAnnotator),
+            patch("main.get_executor", return_value=mock_executor),
+            patch("main.torch.cuda.is_available", return_value=True),
+            patch("main.torch.cuda.empty_cache", empty_cache),
+        ):
+            task = asyncio.create_task(_annotation_worker(worker_app, worker_settings))
+            try:
+                gc.disable()  # only the worker's gc.collect() may free the model's cycle
+                deadline = loop.time() + 5.0
+                while job.status in (JobStatus.QUEUED, JobStatus.PROCESSING):
+                    assert loop.time() < deadline, f"job stuck in {job.status}"
+                    await asyncio.sleep(0.01)
+                assert job.status == JobStatus.COMPLETED
+                assert model_ref() is None, "the evicted model outlived its job"
+                empty_cache.assert_called_once()
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                executor.shutdown()
+                gc.enable()

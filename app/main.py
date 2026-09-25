@@ -1,3 +1,4 @@
+import gc
 import os
 import shutil
 try:
@@ -43,6 +44,7 @@ from models import (
 from visualization import encode_image_to_bytes
 from job_manager import JobManager, JobStatus
 from video_annotator import VideoAnnotator, AnnotationParams, JobCancelledError
+from batch_inference import resolve_inference_mode
 from detection_stabilizer import StabilizerConfig
 from frame_selection import SelectionParams
 from inference_utils import get_executor
@@ -210,7 +212,7 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                 model_name = job.params.get("model")
                 logger.debug(f"Job {job_id}: loading model '{model_name or 'default'}'")
                 try:
-                    model_entry = await model_manager.get_model(model_name)
+                    model_entry = await model_manager.get_video_model(model_name)
                 except (RuntimeError, ValueError) as e:
                     if job.cancel_event.is_set():
                         logger.info(
@@ -240,6 +242,9 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                         center_zone=settings.stabilizer_center_zone,
                         max_staleness_sec=settings.stabilizer_max_staleness,
                     )
+                    mode = resolve_inference_mode(
+                        settings.video_fp16, settings.video_batch_size, model_entry.device
+                    )
                     annotator = VideoAnnotator(
                         model=model_entry.model,
                         visualizer=model_entry.visualizer,
@@ -248,6 +253,8 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                         codec=settings.video_codec,
                         crf=settings.video_crf,
                         stabilizer_config=stabilizer_config,
+                        fp16=mode.fp16,
+                        batch_size=mode.batch_size,
                     )
 
                     params = AnnotationParams(
@@ -330,6 +337,17 @@ async def _annotation_worker(app: FastAPI, settings: Settings) -> None:
                     job_manager.mark_failed(job_id, str(e))
 
             finally:
+                # Drop the job's model before waiting for the next job: TTL
+                # eviction frees the video model only if nothing here refers to it.
+                annotator = None
+                model_entry = None
+                # A model evicted mid-job (a job longer than the TTL) and the
+                # tensors of a failed or cancelled pass 1 sit in reference
+                # cycles: collect them now that the job has let go, then hand
+                # PyTorch's cache back so NVDEC/NVENC and other processes get it.
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 # Always clean up input file (per-job finally)
                 try:
                     if job.input_path and job.input_path.exists():
@@ -477,9 +495,12 @@ async def health(model_manager: ModelManager = Depends(get_model_manager)):
 
     return {
         "status": "healthy",
-        "models_loaded": len(model_manager._preloaded) + len(model_manager._cached),
+        "models_loaded": (
+            len(model_manager._preloaded) + len(model_manager._cached) + len(model_manager._video_models)
+        ),
         "preloaded_count": len(model_manager._preloaded),
         "cached_count": len(model_manager._cached),
+        "video_models_count": len(model_manager._video_models),
         "default_device": model_manager.default_device,
         "video_processing": ffmpeg_available,
         "open_fds": open_fds,
@@ -1003,10 +1024,13 @@ async def annotate_video(
     if classes:
         classes_list = [c.strip() for c in classes.split(",") if c.strip()]
 
-    # Validate model exists before expensive upload
-    if model:
+    # Validate model exists before expensive upload. A preloaded model is
+    # valid as it is; any other model is loaded as the video jobs' own
+    # instance, which the worker then reuses (get_model would put a copy
+    # into the /detect cache that the job never uses).
+    if model and not model_manager.is_preloaded(model):
         try:
-            await model_manager.get_model(model)
+            await model_manager.get_video_model(model)
         except (RuntimeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid model: {e}")
 
@@ -1204,6 +1228,7 @@ async def list_models(model_manager: ModelManager = Depends(get_model_manager)):
     - **default_model**: The default model used when no model is specified
     - **preloaded**: List of models loaded at startup (never evicted)
     - **cached**: List of on-demand loaded models with TTL info
+    - **video**: Separate instances video annotation jobs use, with TTL info
     - **ttl_seconds**: Time-to-live for cached models
     - **device**: Device used for inference
     """

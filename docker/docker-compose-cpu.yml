@@ -12,6 +12,9 @@ services:
       - VIDEO_CODEC=${VIDEO_CODEC:-auto}
       - VIDEO_CRF=${VIDEO_CRF:-18}
       - VIDEO_HW_ACCEL=cpu
+      # Video annotation inference; empty = auto (FP32 + batch 1 on CPU)
+      - VIDEO_FP16=${VIDEO_FP16:-}
+      - VIDEO_BATCH_SIZE=${VIDEO_BATCH_SIZE:-}
       - YOLO_DEVICE=cpu
       - MODELS_DIR=/models
       # Process watchdog (supervisor.py) kill switch: false runs uvicorn unsupervised; empty = default (true).

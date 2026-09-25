@@ -1,12 +1,61 @@
+import logging
+import os
 import subprocess
+import sys
 from unittest.mock import patch, MagicMock, call
 from io import BytesIO
 
 import numpy as np
 import pytest
 
-from ffmpeg_pipe import FFmpegDecoder, FFmpegEncoder
+import ffmpeg_pipe
+from ffmpeg_pipe import FFmpegDecoder, FFmpegEncoder, _grow_pipe, frame_shape
 from hw_accel import HWAccelConfig, HWAccelType
+
+
+class TestFrameShape:
+    def test_bgr24(self):
+        assert frame_shape(640, 480, "bgr24") == (480, 640, 3)
+
+    def test_yuv420p(self):
+        assert frame_shape(640, 480, "yuv420p") == (640 * 480 * 3 // 2,)
+
+    def test_yuv420p_odd_size_rounds_chroma_up(self):
+        assert frame_shape(641, 481, "yuv420p") == (641 * 481 + 2 * 321 * 241,)
+
+    def test_unknown_pix_fmt(self):
+        with pytest.raises(ValueError, match="Unsupported pix_fmt"):
+            frame_shape(640, 480, "nv12")
+
+
+class _ChunkedStdout(BytesIO):
+    """A pipe that hands out at most ``chunk`` bytes per readinto() call."""
+
+    def __init__(self, data: bytes, chunk: int):
+        super().__init__(data)
+        self._chunk = chunk
+
+    def readinto(self, b):
+        view = memoryview(b)[:self._chunk]
+        return super().readinto(view)
+
+
+class TestGrowPipe:
+    def test_real_pipe_grows_to_1_mib(self):
+        f_getpipe = getattr(ffmpeg_pipe.fcntl, "F_GETPIPE_SZ", None)
+        if f_getpipe is None:
+            pytest.skip("F_GETPIPE_SZ is Linux-only")
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(read_fd, "rb") as stream:
+                _grow_pipe(stream)
+                assert ffmpeg_pipe.fcntl.fcntl(stream.fileno(), f_getpipe) == 1 << 20
+        finally:
+            os.close(write_fd)
+
+    def test_streams_without_a_pipe_are_ignored(self):
+        _grow_pipe(BytesIO(b""))
+        _grow_pipe(MagicMock())
 
 
 class TestFFmpegDecoder:
@@ -155,6 +204,7 @@ class TestFFmpegDecoder:
         assert "-pix_fmt" in cmd
         assert "bgr24" in cmd
         assert "pipe:1" in cmd
+        assert "-color_range" not in cmd  # bgr24 honours the source range by itself
 
     def test_amd_decode_args(self):
         mock_proc = self._make_mock_process([])
@@ -166,6 +216,101 @@ class TestFFmpegDecoder:
         cmd = mock_popen.call_args[0][0]
         assert "-hwaccel" in cmd
         assert "vaapi" in cmd
+
+    def test_yuv420p_output_and_flat_frames(self):
+        size = 640 * 480 * 3 // 2
+        mock_proc = self._make_mock_process([])
+        mock_proc.stdout = BytesIO(bytes(range(256)) * (size // 256) + bytes(size % 256))
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with FFmpegDecoder("input.mp4", 640, 480, config, pix_fmt="yuv420p") as decoder:
+                assert decoder.frame_shape == (size,)
+                assert decoder.frame_size == size
+                frame = decoder.read_frame()
+                assert decoder.read_frame() is None
+
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+        # An output option, so ffmpeg converts a full-range source instead of relabelling it
+        assert cmd[-3:] == ["-color_range", "tv", "pipe:1"]
+        assert frame.shape == (size,)
+        assert frame[:3].tolist() == [0, 1, 2]
+
+    def test_fps_puts_the_output_on_a_constant_grid(self):
+        """Left alone, ffmpeg resamples a pipe decode to r_frame_rate, which a camera's
+        timestamp jitter can push far above the real rate; fps pins the grid instead."""
+        mock_proc = self._make_mock_process([])
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with FFmpegDecoder("input.mp4", 640, 480, config, pix_fmt="yuv420p", fps=12.457):
+                pass
+
+        cmd = mock_popen.call_args[0][0]
+        output_options = cmd[cmd.index("input.mp4") + 1:]  # after -i: options of the output
+        assert output_options[output_options.index("-fps_mode") + 1] == "cfr"
+        assert output_options[output_options.index("-r") + 1] == "12.457"
+        assert cmd[-3:] == ["-color_range", "tv", "pipe:1"]
+
+    def test_read_into_fills_the_buffer_in_place(self):
+        frames = [np.full((4, 6, 3), i, dtype=np.uint8) for i in (7, 9)]
+        mock_proc = self._make_mock_process(frames)
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        buf = np.zeros((4, 6, 3), dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegDecoder("input.mp4", 6, 4, config) as decoder:
+                assert decoder.read_into(buf) is True
+                assert (buf == 7).all()
+                assert decoder.read_into(buf) is True
+                assert (buf == 9).all()
+                assert decoder.read_into(buf) is False
+
+    def test_read_into_retries_short_reads(self):
+        frame = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
+        mock_proc = self._make_mock_process([])
+        mock_proc.stdout = _ChunkedStdout(frame.tobytes(), chunk=5)
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        buf = np.zeros_like(frame)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegDecoder("input.mp4", 6, 4, config) as decoder:
+                assert decoder.read_into(buf) is True
+        np.testing.assert_array_equal(buf, frame)
+
+    def test_read_into_rejects_a_wrong_size_buffer(self):
+        mock_proc = self._make_mock_process([])
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegDecoder("input.mp4", 6, 4, config) as decoder:
+                with pytest.raises(ValueError, match="a frame needs 72"):
+                    decoder.read_into(np.zeros(10, dtype=np.uint8))
+
+    def test_read_into_raises_when_ffmpeg_crashed(self):
+        mock_proc = self._make_mock_process([])
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with FFmpegDecoder("input.mp4", 6, 4, config) as decoder:
+                with pytest.raises(RuntimeError, match="FFmpeg decoder crashed"):
+                    decoder.read_into(np.zeros((4, 6, 3), dtype=np.uint8))
+
+    def test_abort_kills_ffmpeg_and_close_stays_quiet(self, caplog):
+        mock_proc = self._make_mock_process([])
+        mock_proc.returncode = -9
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc):
+            with caplog.at_level(logging.WARNING, logger="ffmpeg_pipe"):
+                with FFmpegDecoder("input.mp4", 6, 4, config) as decoder:
+                    decoder.abort()
+
+        mock_proc.kill.assert_called_once()
+        assert not any("exited with code" in r.message for r in caplog.records)
 
 
 class TestFFmpegEncoder:
@@ -228,7 +373,11 @@ class TestFFmpegEncoder:
                 result = encoder.write_frame(frame)
 
         assert result is True
-        mock_proc.stdin.write.assert_called_once_with(frame.tobytes())
+        mock_proc.stdin.write.assert_called_once()
+        written = mock_proc.stdin.write.call_args.args[0]
+        # A memoryview of the frame itself: no tobytes() copy of every frame
+        assert isinstance(written, memoryview)
+        assert written.tobytes() == frame.tobytes()
 
     def test_write_frame_returns_false_after_eof(self):
         """After encoder finalises (e.g. -shortest), write_frame returns False
@@ -635,6 +784,58 @@ class TestFFmpegEncoder:
         # stdin.write was never called because poll() short-circuited first.
         mock_proc.stdin.write.assert_not_called()
 
+    def test_close_after_a_clean_early_exit_drops_the_unwritten_tail(self, caplog):
+        """A real pipe to a child that exits rc=0 without reading, as ffmpeg does after -shortest.
+
+        Frames smaller than the stdin buffer (4096 bytes) wait in it until
+        flush(). The child exits while flush() is blocked on the full pipe,
+        so the last frame stays buffered and close() flushes it into the
+        closed pipe again: that BrokenPipeError must not escape a clean exit.
+        """
+        caplog.set_level(logging.DEBUG, logger="ffmpeg_pipe")
+        real_popen = subprocess.Popen
+
+        def child_that_never_reads(cmd, **kwargs):
+            return real_popen([sys.executable, "-c", "import time; time.sleep(0.5)"], **kwargs)
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros(1024, dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", side_effect=child_that_never_reads):
+            with FFmpegEncoder("input.mp4", "output.mp4", 320, 240, 10.0, config, "h264", crf=18) as encoder:
+                for _ in range(10_000):  # a 1 MiB pipe is full after 1024 frames
+                    if not encoder.write_frame(frame):
+                        break
+                else:
+                    pytest.fail("write_frame never reported the early exit")
+
+        assert "clean exit after BrokenPipe" in caplog.text  # the pipe broke inside flush()
+
+    def test_close_after_a_crash_keeps_the_crash_error(self):
+        """A real pipe to a child that exits rc=1 without reading, as ffmpeg does when NVENC fails to start.
+
+        As after a clean exit, the pipe breaks inside flush() with the last
+        frame still buffered, and close() flushes it into the closed pipe
+        again. The block must still end with the crash's RuntimeError, which
+        annotate()'s NVENC fallback catches, and not with that BrokenPipeError.
+        """
+        real_popen = subprocess.Popen
+
+        def child_that_fails_without_reading(cmd, **kwargs):
+            return real_popen(
+                [sys.executable, "-c", "import sys, time; time.sleep(0.5); sys.exit(1)"], **kwargs
+            )
+
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        frame = np.zeros(1024, dtype=np.uint8)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", side_effect=child_that_fails_without_reading):
+            # "mid-write": the pipe broke inside flush(), so a frame was left buffered
+            with pytest.raises(RuntimeError, match="crashed mid-write"):
+                with FFmpegEncoder("input.mp4", "output.mp4", 320, 240, 10.0, config, "h264", crf=18) as encoder:
+                    for _ in range(10_000):  # a 1 MiB pipe is full after 1024 frames
+                        encoder.write_frame(frame)
+
     def test_bitrate_mode_command(self):
         """When bitrate is passed, command uses -b:v instead of -crf."""
         mock_proc = self._make_mock_process()
@@ -678,3 +879,34 @@ class TestFFmpegEncoder:
         cmd = mock_popen.call_args[0][0]
         assert "-crf" in cmd
         assert "-b:v" not in cmd
+
+    def test_yuv420p_input_format(self):
+        mock_proc = self._make_mock_process()
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+
+        with patch("ffmpeg_pipe.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            with FFmpegEncoder(
+                original_path="input.mp4",
+                output_path="output.mp4",
+                width=640,
+                height=480,
+                fps=30.0,
+                hw_config=config,
+                codec="h264",
+                crf=18,
+                pix_fmt="yuv420p",
+            ) as encoder:
+                encoder.write_frame(np.zeros(640 * 480 * 3 // 2, dtype=np.uint8))
+
+        cmd = mock_popen.call_args[0][0]
+        pipe_input = cmd.index("pipe:0")
+        # -pix_fmt before -i pipe:0 describes the raw input
+        assert cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+        assert cmd.index("-pix_fmt") < pipe_input
+
+    def test_unknown_pix_fmt_is_rejected_before_ffmpeg_starts(self):
+        config = HWAccelConfig(accel_type=HWAccelType.CPU)
+        with patch("ffmpeg_pipe.subprocess.Popen") as mock_popen:
+            with pytest.raises(ValueError, match="Unsupported pix_fmt"):
+                FFmpegEncoder("input.mp4", "output.mp4", 640, 480, 30.0, config, "h264", pix_fmt="rgb48")
+        mock_popen.assert_not_called()

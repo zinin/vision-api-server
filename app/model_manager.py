@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import time
@@ -62,6 +63,8 @@ class ModelManager:
 
         self._preloaded: dict[str, ModelEntry] = {}
         self._cached: dict[str, CachedModelEntry] = {}
+        # Instances of their own for video annotation jobs, see get_video_model()
+        self._video_models: dict[str, CachedModelEntry] = {}
         self._loading_locks: dict[str, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
 
@@ -74,6 +77,10 @@ class ModelManager:
         if self._preloaded:
             return next(iter(self._preloaded.keys()))
         return None
+
+    def is_preloaded(self, model_name: str) -> bool:
+        """True for a model loaded at startup from YOLO_MODELS."""
+        return model_name in self._preloaded
 
     @staticmethod
     def _is_valid_model_file(path: Path) -> bool:
@@ -262,6 +269,59 @@ class ModelManager:
                 async with self._global_lock:
                     self._loading_locks.pop(model_name, None)
 
+    async def get_video_model(self, model_name: str | None = None) -> ModelEntry:
+        """A model instance of its own for video annotation jobs.
+
+        An Ultralytics model predicts through one cached predictor that holds
+        its own copy of the weights (FP16 under ``quantize=16``) and the
+        arguments of the latest call. On the instance ``/detect`` uses, the
+        two would rebuild that predictor (deep copy, fuse, warm-up) whenever
+        ``quantize`` alternates between their calls, and a call on one thread
+        would replace the ``conf`` and ``imgsz`` that a run on the other
+        reads. The instance is loaded from the same file onto the same device
+        as ``get_model`` would use, cached, and evicted after ``ttl_seconds``
+        without a job.
+
+        Raises:
+            ValueError: If no model name provided and no default model available.
+            RuntimeError: If model loading fails.
+        """
+        if model_name is None:
+            if not self._preloaded:
+                raise ValueError("No model specified and no default model available")
+            model_name = next(iter(self._preloaded))
+
+        cached = self._video_models.get(model_name)
+        if cached is not None:
+            cached.touch()
+            return cached.entry
+
+        lock_key = f"video:{model_name}"
+        async with self._global_lock:
+            if lock_key not in self._loading_locks:
+                self._loading_locks[lock_key] = asyncio.Lock()
+            lock = self._loading_locks[lock_key]
+
+        async with lock:
+            cached = self._video_models.get(model_name)
+            if cached is not None:
+                cached.touch()
+                return cached.entry
+
+            preloaded = self._preloaded.get(model_name)
+            device = preloaded.device if preloaded is not None else self.default_device
+            try:
+                entry = await self._load_model_async(model_name, device)
+                self._video_models[model_name] = CachedModelEntry(entry=entry)
+                logger.info(f"Video model {model_name} loaded on {device} (TTL: {self.ttl_seconds}s)")
+                return entry
+            except Exception as e:
+                logger.error(f"Failed to load video model {model_name}: {e}")
+                raise RuntimeError(f"Failed to load model {model_name}: {e}") from e
+            finally:
+                async with self._global_lock:
+                    self._loading_locks.pop(lock_key, None)
+
     async def cleanup_expired(self) -> int:
         """Remove expired models from cache. Returns count of evicted models."""
         evicted = 0
@@ -279,9 +339,35 @@ class ModelManager:
                 del cached.entry.visualizer
                 evicted += 1
 
-        if evicted > 0 and self.default_device.startswith("cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.debug("CUDA cache cleared after model eviction")
+        # A job longer than the TTL keeps its own reference to the model, so
+        # evicting the entry mid-job frees nothing here: the annotation worker
+        # collects the instance once the job lets go of it.
+        expired_video = [
+            name for name, cached in self._video_models.items()
+            if cached.is_expired(self.ttl_seconds)
+        ]
+        for model_name in expired_video:
+            cached = self._video_models.pop(model_name, None)
+            if cached:
+                logger.info(f"Evicting idle video model: {model_name}")
+                del cached.entry.model
+                del cached.entry.visualizer
+                evicted += 1
+
+        if evicted > 0:
+            # A YOLO object that has run predict() sits in reference cycles:
+            # the dels above free nothing until the cyclic GC runs, and a full
+            # collection may not come for a long time. Collect first, so that
+            # empty_cache() can hand the evicted models' memory back.
+            gc.collect()
+            # Not gated on the default device: a video model lives on its
+            # preloaded model's device (YOLO_DEVICE=cpu with a model preloaded
+            # on cuda:0), and predict() without device= runs on the GPU even
+            # for a model loaded on the CPU. empty_cache() does nothing while
+            # CUDA is uninitialised.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.debug("CUDA cache cleared after model eviction")
 
         return evicted
 
@@ -333,6 +419,12 @@ class ModelManager:
             del cached.entry.visualizer
         self._cached.clear()
 
+        for model_name, cached in list(self._video_models.items()):
+            logger.debug(f"Unloading video model: {model_name}")
+            del cached.entry.model
+            del cached.entry.visualizer
+        self._video_models.clear()
+
         # Clear preloaded models
         for model_name, entry in list(self._preloaded.items()):
             logger.debug(f"Unloading preloaded model: {model_name}")
@@ -356,18 +448,21 @@ class ModelManager:
             for name, entry in self._preloaded.items()
         ]
 
-        cached_info = [
-            {
-                "name": name,
-                "device": cached.entry.device,
-                "expires_in_seconds": int(max(0, self.ttl_seconds - (now - cached.last_used_at)))
-            }
-            for name, cached in self._cached.items()
-        ]
+        def with_ttl(entries: dict[str, CachedModelEntry]) -> list[dict]:
+            return [
+                {
+                    "name": name,
+                    "device": cached.entry.device,
+                    "expires_in_seconds": int(max(0, self.ttl_seconds - (now - cached.last_used_at)))
+                }
+                for name, cached in entries.items()
+            ]
 
         return {
             "preloaded": preloaded_info,
-            "cached": cached_info,
+            "cached": with_ttl(self._cached),
+            # Video jobs' own instances: a second copy of the weights until eviction
+            "video": with_ttl(self._video_models),
             "default_device": self.default_device,
             "ttl_seconds": self.ttl_seconds
         }

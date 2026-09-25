@@ -62,6 +62,10 @@ YOLO_MODEL_TTL=900
 # Process watchdog: false runs uvicorn without supervisor.py. The only WATCHDOG_* variable
 # the dev compose files forward; the deploy files forward more (see deploy/.env.example)
 WATCHDOG_ENABLED=true
+
+# Video annotation inference: empty or auto = FP16 + batch 8 on NVIDIA, FP32 + batch 1 on AMD/CPU
+VIDEO_FP16=auto
+VIDEO_BATCH_SIZE=auto
 ```
 
 **Device options:**

@@ -39,6 +39,8 @@ def mock_model_manager():
     entry.visualizer = MagicMock()
     entry.model_name = "yolo26s.pt"
     mm.get_model = AsyncMock(return_value=entry)
+    mm.is_preloaded = MagicMock(return_value=False)
+    mm.get_video_model = AsyncMock(return_value=entry)
     return mm
 
 
@@ -93,12 +95,31 @@ class TestAnnotateVideo:
         assert tmp_files == [], f"Temp files not cleaned up: {tmp_files}"
 
     def test_invalid_model(self, client, mock_model_manager):
-        mock_model_manager.get_model = AsyncMock(side_effect=RuntimeError("not found"))
+        mock_model_manager.get_video_model = AsyncMock(side_effect=RuntimeError("not found"))
         resp = client.post(
             "/detect/video/visualize?model=bad.pt",
             files=[_make_video_file()],
         )
         assert resp.status_code == 400
+
+    def test_not_preloaded_model_loads_the_video_instance(self, client, mock_model_manager):
+        resp = client.post(
+            "/detect/video/visualize?model=yolo26m.pt",
+            files=[_make_video_file()],
+        )
+        assert resp.status_code == 202
+        mock_model_manager.get_video_model.assert_awaited_once_with("yolo26m.pt")
+        mock_model_manager.get_model.assert_not_awaited()
+
+    def test_preloaded_model_loads_nothing(self, client, mock_model_manager):
+        mock_model_manager.is_preloaded.return_value = True
+        resp = client.post(
+            "/detect/video/visualize?model=yolo26s.pt",
+            files=[_make_video_file()],
+        )
+        assert resp.status_code == 202
+        mock_model_manager.get_model.assert_not_awaited()
+        mock_model_manager.get_video_model.assert_not_awaited()
 
     def test_classes_parsed(self, client, job_manager_for_tests):
         resp = client.post(
@@ -377,6 +398,25 @@ class TestHealthFdStats:
         assert data["video_processing"] is False
         assert data["open_fds"] == 100
         assert data["fd_soft_limit"] == 1000
+
+
+class TestHealthModelCounts:
+    def test_video_models_count_as_loaded(self, client):
+        from model_manager import CachedModelEntry, ModelEntry, ModelManager
+
+        def entry(name):
+            return ModelEntry(model=MagicMock(), visualizer=MagicMock(), model_name=name, device="cuda:0")
+
+        mm = ModelManager(default_device="cuda:0")
+        mm._preloaded = {"yolo26s.pt": entry("yolo26s.pt"), "yolo26x.pt": entry("yolo26x.pt")}
+        mm._video_models = {"yolo26x.pt": CachedModelEntry(entry=entry("yolo26x.pt"))}
+        app.dependency_overrides[get_model_manager] = lambda: mm
+
+        data = client.get("/health").json()
+        assert data["models_loaded"] == 3
+        assert data["preloaded_count"] == 2
+        assert data["cached_count"] == 0
+        assert data["video_models_count"] == 1
 
 
 class TestFdStatsHelper:

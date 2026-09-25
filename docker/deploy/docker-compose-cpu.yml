@@ -12,6 +12,9 @@ services:
       VIDEO_CODEC: ${VIDEO_CODEC:-auto}
       VIDEO_CRF: ${VIDEO_CRF:-18}
       VIDEO_HW_ACCEL: cpu
+      # Video annotation inference; empty = auto (FP16 + batch 8 on NVIDIA, FP32 + batch 1 elsewhere)
+      VIDEO_FP16: ${VIDEO_FP16:-}
+      VIDEO_BATCH_SIZE: ${VIDEO_BATCH_SIZE:-}
       # Process watchdog (supervisor.py): restarts the container when /health hangs.
       # Empty value = built-in default; see .env.example.
       WATCHDOG_ENABLED: ${WATCHDOG_ENABLED:-}

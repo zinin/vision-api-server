@@ -355,7 +355,12 @@ class ModelManager:
             # collection may not come for a long time. Collect first, so that
             # empty_cache() can hand the evicted models' memory back.
             gc.collect()
-            if self.default_device.startswith("cuda") and torch.cuda.is_available():
+            # Not gated on the default device: a video model lives on its
+            # preloaded model's device (YOLO_DEVICE=cpu with a model preloaded
+            # on cuda:0), and predict() without device= runs on the GPU even
+            # for a model loaded on the CPU. empty_cache() does nothing while
+            # CUDA is uninitialised.
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 logger.debug("CUDA cache cleared after model eviction")
 

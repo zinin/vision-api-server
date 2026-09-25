@@ -137,7 +137,23 @@ class TestCleanupExpired:
             assert model_ref() is None, "the evicted model is still alive"
         finally:
             gc.enable()
-        assert freed_when_emptied == ([True] if device.startswith("cuda") else [])
+        assert freed_when_emptied == [True]
+
+    @pytest.mark.parametrize("default_device", ["cuda:0", "cpu"])
+    async def test_eviction_empties_the_cuda_cache_whatever_the_default_device(self, default_device):
+        """A video model lives on its preloaded model's device, which need not
+        be the default one (YOLO_DEVICE=cpu with yolo26x.pt preloaded on
+        cuda:0): its eviction must still hand the memory back."""
+        mm = ModelManager(default_device=default_device, ttl_seconds=60)
+        mm._video_models["yolo26x.pt"] = CachedModelEntry(
+            entry=_entry("yolo26x.pt", "cuda:0"), last_used_at=time.time() - 120,
+        )
+        with (
+            patch("model_manager.torch.cuda.is_available", return_value=True),
+            patch("model_manager.torch.cuda.empty_cache") as empty_cache,
+        ):
+            assert await mm.cleanup_expired() == 1
+        empty_cache.assert_called_once_with()
 
     async def test_no_collection_without_an_eviction(self, manager):
         with patch("gc.collect") as collect:

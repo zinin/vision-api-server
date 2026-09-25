@@ -1024,10 +1024,13 @@ async def annotate_video(
     if classes:
         classes_list = [c.strip() for c in classes.split(",") if c.strip()]
 
-    # Validate model exists before expensive upload
-    if model:
+    # Validate model exists before expensive upload. A preloaded model is
+    # valid as it is; any other model is loaded as the video jobs' own
+    # instance, which the worker then reuses (get_model would put a copy
+    # into the /detect cache that the job never uses).
+    if model and not model_manager.is_preloaded(model):
         try:
-            await model_manager.get_model(model)
+            await model_manager.get_video_model(model)
         except (RuntimeError, ValueError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid model: {e}")
 

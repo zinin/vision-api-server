@@ -39,6 +39,8 @@ def mock_model_manager():
     entry.visualizer = MagicMock()
     entry.model_name = "yolo26s.pt"
     mm.get_model = AsyncMock(return_value=entry)
+    mm.is_preloaded = MagicMock(return_value=False)
+    mm.get_video_model = AsyncMock(return_value=entry)
     return mm
 
 
@@ -93,12 +95,31 @@ class TestAnnotateVideo:
         assert tmp_files == [], f"Temp files not cleaned up: {tmp_files}"
 
     def test_invalid_model(self, client, mock_model_manager):
-        mock_model_manager.get_model = AsyncMock(side_effect=RuntimeError("not found"))
+        mock_model_manager.get_video_model = AsyncMock(side_effect=RuntimeError("not found"))
         resp = client.post(
             "/detect/video/visualize?model=bad.pt",
             files=[_make_video_file()],
         )
         assert resp.status_code == 400
+
+    def test_not_preloaded_model_loads_the_video_instance(self, client, mock_model_manager):
+        resp = client.post(
+            "/detect/video/visualize?model=yolo26m.pt",
+            files=[_make_video_file()],
+        )
+        assert resp.status_code == 202
+        mock_model_manager.get_video_model.assert_awaited_once_with("yolo26m.pt")
+        mock_model_manager.get_model.assert_not_awaited()
+
+    def test_preloaded_model_loads_nothing(self, client, mock_model_manager):
+        mock_model_manager.is_preloaded.return_value = True
+        resp = client.post(
+            "/detect/video/visualize?model=yolo26s.pt",
+            files=[_make_video_file()],
+        )
+        assert resp.status_code == 202
+        mock_model_manager.get_model.assert_not_awaited()
+        mock_model_manager.get_video_model.assert_not_awaited()
 
     def test_classes_parsed(self, client, job_manager_for_tests):
         resp = client.post(

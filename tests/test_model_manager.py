@@ -104,6 +104,12 @@ class TestGetVideoModel:
         assert manager._video_models == {}
 
 
+class TestIsPreloaded:
+    def test_only_names_loaded_at_startup(self, manager):
+        assert manager.is_preloaded("yolo26x.pt")
+        assert not manager.is_preloaded("yolo26m.pt")
+
+
 class TestGetStatus:
     def test_lists_video_models_with_their_ttl(self, manager):
         """A video model holds its own copy of the weights until eviction; /models shows it."""

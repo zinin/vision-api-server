@@ -78,6 +78,10 @@ class ModelManager:
             return next(iter(self._preloaded.keys()))
         return None
 
+    def is_preloaded(self, model_name: str) -> bool:
+        """True for a model loaded at startup from YOLO_MODELS."""
+        return model_name in self._preloaded
+
     @staticmethod
     def _is_valid_model_file(path: Path) -> bool:
         """Check if model file is a valid zip archive (PyTorch model format)."""

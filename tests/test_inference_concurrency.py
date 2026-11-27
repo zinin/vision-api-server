@@ -22,12 +22,13 @@ IMAGE = np.zeros((32, 32, 3), dtype=np.uint8)
 
 
 class SharedPredictorModel:
-    """Takes conf, imgsz and max_det the way an Ultralytics model does.
+    """Takes conf, imgsz and max_det the way Ultralytics before 8.4.209 does.
 
-    ``Model.predict()`` writes the call's arguments to the one cached predictor
-    first and only then takes the predictor's lock; the run reads them from the
-    predictor while it computes. The detections returned here spell out what
-    the run read: ``max_det`` boxes with confidence ``conf`` and x1 ``imgsz``.
+    There ``Model.predict()`` writes the call's arguments to the one cached
+    predictor first and only then takes the predictor's lock; the run reads
+    them from the predictor while it computes. The detections returned here
+    spell out what the run read: ``max_det`` boxes with confidence ``conf``
+    and x1 ``imgsz``.
     """
 
     names = {0: "person"}

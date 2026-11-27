@@ -2,6 +2,7 @@ import asyncio
 import gc
 import logging
 import os
+import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -31,6 +32,8 @@ class ModelEntry:
     visualizer: DetectionVisualizer
     model_name: str
     device: str
+    # One predict() at a time on this instance, see inference_utils.run_inference()
+    predict_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass

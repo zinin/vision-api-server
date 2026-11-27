@@ -121,11 +121,11 @@ pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`), motion frame selection (`tests/test_frame_selection.py`: the rule and the metric on arrays; `tests/test_video_extraction_integration.py`: both ffmpeg passes and both video endpoints on lavfi clips), and the annotation pipeline pieces (`tests/test_frame_threads.py`, `tests/test_batch_inference.py` incl. a byte-exact check against Ultralytics' LetterBox, `tests/test_model_manager.py`; `tests/test_video_annotation_integration.py`: `annotate()` with real ffmpeg on lavfi clips).
+Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFmpeg), the process watchdog (`tests/test_supervisor.py`, fake child + fake clock, two real-subprocess smoke tests) and deployment invariants of the compose files and Dockerfiles (`tests/test_compose.py`), motion frame selection (`tests/test_frame_selection.py`: the rule and the metric on arrays; `tests/test_video_extraction_integration.py`: both ffmpeg passes and both video endpoints on lavfi clips), and the annotation pipeline pieces (`tests/test_frame_threads.py`, `tests/test_batch_inference.py` incl. a byte-exact check against Ultralytics' LetterBox, `tests/test_model_manager.py`; `tests/test_video_annotation_integration.py`: `annotate()` with real ffmpeg on lavfi clips), and concurrent requests on one model instance (`tests/test_inference_concurrency.py`).
 
 ## Key Patterns
 
-**Async Inference**: YOLO runs in ThreadPoolExecutor via `run_in_executor()`.
+**Async Inference**: YOLO runs in ThreadPoolExecutor via `run_in_executor()`. Calls on one model instance take turns (`ModelEntry.predict_lock`, taken in the worker thread by `run_inference`): Ultralytics before 8.4.209 writes a call's arguments to the reused predictor before it takes its own lock, so concurrent requests ran with each other's `conf`/`imgsz`/`max_det`. `requirements.txt` still allows those versions, and the lock does not rely on library internals.
 
 **Two-Tier Caching**: Preloaded (never evicted) + cached (TTL-based eviction).
 

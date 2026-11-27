@@ -36,7 +36,7 @@ class SharedPredictorModel:
         self._args = None
         self._lock = threading.Lock()  # the predictor's own lock
 
-    def predict(self, source, conf, imgsz, max_det, verbose):
+    def predict(self, source, conf, imgsz, max_det, **_):
         self._args = (conf, imgsz, max_det)
         with self._lock:
             time.sleep(0.1)  # inference; the other requests arrive meanwhile

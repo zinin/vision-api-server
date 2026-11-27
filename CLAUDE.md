@@ -125,7 +125,7 @@ Tests cover config, Pydantic models, JobManager, VideoAnnotator (mocked YOLO/FFm
 
 ## Key Patterns
 
-**Async Inference**: YOLO runs in ThreadPoolExecutor via `run_in_executor()`. Calls on one model instance take turns (`ModelEntry.predict_lock`, taken in the worker thread by `run_inference`): Ultralytics before 8.4.209 writes a call's arguments to the reused predictor before it takes its own lock, so concurrent requests ran with each other's `conf`/`imgsz`/`max_det`. `requirements.txt` still allows those versions, and the lock does not rely on library internals.
+**Async Inference**: YOLO runs in ThreadPoolExecutor via `run_in_executor()`. Calls on one model instance take turns (`ModelEntry.predict_lock`, taken in the worker thread by `run_inference`): Ultralytics before 8.4.209 writes a call's arguments to the reused predictor before it takes its own lock, so concurrent requests ran with each other's `conf`/`imgsz`/`max_det`. `requirements.txt` still allows those versions, and the lock does not rely on library internals. Every `predict()` passes `iou=NMS_IOU` (0.7, `app/config.py`): Ultralytics 8.4.208 lowered the predict default to 0.5, which changes which overlapping boxes survive.
 
 **Two-Tier Caching**: Preloaded (never evicted) + cached (TTL-based eviction).
 

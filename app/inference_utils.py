@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from config import NMS_IOU
 from model_manager import ModelEntry
 from models import DetectionResponse, ImageSize, Detection, BoundingBox
 
@@ -97,6 +98,7 @@ async def run_inference(
         conf=conf,
         imgsz=imgsz,
         max_det=max_det,
+        iou=NMS_IOU,
         verbose=False
     )
 

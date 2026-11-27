@@ -1,8 +1,13 @@
 import json
+from typing import Final
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator, Field
 from functools import lru_cache
+
+# NMS IoU of every predict() call. Ultralytics 8.4.208 lowered its predict default
+# from 0.7 to 0.5, which changes which overlapping boxes survive.
+NMS_IOU: Final = 0.7
 
 
 class Settings(BaseSettings):

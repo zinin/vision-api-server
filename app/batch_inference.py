@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from ultralytics.utils.checks import check_imgsz
 
+from config import NMS_IOU
 from detection_stabilizer import RawDetection
 
 logger = logging.getLogger(__name__)
@@ -158,7 +159,7 @@ class BatchDetector:
     def _predict(self, frames: list[np.ndarray]) -> list[Any] | None:
         kwargs: dict[str, Any] = {
             "source": frames, "conf": self._conf, "imgsz": self._imgsz,
-            "max_det": self._max_det, "verbose": False,
+            "max_det": self._max_det, "iou": NMS_IOU, "verbose": False,
         }
         if self._fp16:
             kwargs["quantize"] = 16

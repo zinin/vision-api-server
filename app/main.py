@@ -552,7 +552,7 @@ async def detect_objects(
     start_time = time.perf_counter()
 
     results = await run_inference(
-        model_entry.model,
+        model_entry,
         processed.image,
         conf,
         imgsz,
@@ -682,7 +682,7 @@ async def detect_objects_in_video(
     for frame in frames:
         # Run inference on frame
         results = await run_inference(
-            model_entry.model,
+            model_entry,
             frame.image,
             conf,
             imgsz,
@@ -912,7 +912,7 @@ async def detect_and_visualize(
     start_time = time.perf_counter()
 
     results = await run_inference(
-        model_entry.model,
+        model_entry,
         processed.image,
         conf,
         imgsz,

@@ -3,9 +3,10 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any
 
-from ultralytics import YOLO
 import numpy as np
 
+from config import NMS_IOU
+from model_manager import ModelEntry
 from models import DetectionResponse, ImageSize, Detection, BoundingBox
 
 
@@ -59,7 +60,7 @@ def shutdown_executor(wait: bool = True) -> None:
 
 
 async def run_inference(
-    model: YOLO,
+    entry: ModelEntry,
     image: np.ndarray,
     conf: float,
     imgsz: int,
@@ -69,8 +70,16 @@ async def run_inference(
     """
     Run model inference in thread pool to avoid blocking event loop.
 
+    Calls on one model instance take turns. A YOLO instance keeps the arguments
+    of a call on a predictor it reuses, and Ultralytics before 8.4.209 writes
+    them there before it takes the predictor's own lock: a concurrent request
+    replaces the conf, imgsz and max_det that a running one reads.
+    The lock is taken in the worker thread, so it stays held while predict()
+    runs even if the awaiting request is cancelled. Other model instances run
+    in parallel.
+
     Args:
-        model: YOLO model instance
+        entry: Loaded model, with the lock that serialises its calls
         image: Input image as numpy array
         conf: Confidence threshold
         imgsz: Image size for inference
@@ -84,15 +93,20 @@ async def run_inference(
     executor = get_executor(max_workers).executor
 
     predict_fn = partial(
-        model.predict,
+        entry.model.predict,
         source=image,
         conf=conf,
         imgsz=imgsz,
         max_det=max_det,
+        iou=NMS_IOU,
         verbose=False
     )
 
-    return await loop.run_in_executor(executor, predict_fn)
+    def locked_predict() -> list[Any]:
+        with entry.predict_lock:
+            return predict_fn()
+
+    return await loop.run_in_executor(executor, locked_predict)
 
 
 def build_detection_response(

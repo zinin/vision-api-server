@@ -187,6 +187,7 @@ class TestBatchDetector:
         assert kwargs["conf"] == 0.24
         assert kwargs["imgsz"] == 640
         assert kwargs["max_det"] == 100
+        assert kwargs["iou"] == 0.7  # not the library's default, which moved to 0.5
         assert kwargs["verbose"] is False
         assert "quantize" not in kwargs
 

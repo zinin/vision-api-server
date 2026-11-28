@@ -75,8 +75,10 @@ async def run_inference(
     them there before it takes the predictor's own lock: a concurrent request
     replaces the conf, imgsz and max_det that a running one reads.
     The lock is taken in the worker thread, so it stays held while predict()
-    runs even if the awaiting request is cancelled. Other model instances run
-    in parallel.
+    runs even if the awaiting request is cancelled. It does not serialise
+    other model instances, but a call waiting for it occupies an executor
+    thread: once waiting calls fill the pool, calls on other instances queue
+    behind them.
 
     Args:
         entry: Loaded model, with the lock that serialises its calls

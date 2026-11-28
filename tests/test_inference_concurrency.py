@@ -66,7 +66,11 @@ async def http(entry, tmp_path):
     manager = MagicMock()
     manager.get_model = AsyncMock(return_value=entry)
     app.dependency_overrides[get_model_manager] = lambda: manager
-    app.dependency_overrides[get_settings] = lambda: Settings(yolo_models="{}", video_jobs_dir=str(tmp_path))
+    # max_executor_workers pinned: a pool of one thread from MAX_EXECUTOR_WORKERS=1 never overlaps
+    # the calls, and the race test would pass without the lock
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        yolo_models="{}", video_jobs_dir=str(tmp_path), max_executor_workers=4
+    )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         yield client
     app.dependency_overrides.clear()
@@ -173,3 +177,22 @@ async def test_cancelled_request_keeps_the_instance_until_predict_returns():
     finish.set()
     await second
     assert log == ["start 0.1", "end 0.1", "start 0.2", "end 0.2"]
+
+
+async def test_failed_predict_releases_the_instance():
+    calls = []
+
+    class FailingOnceModel:
+        def predict(self, conf, **_):
+            calls.append(conf)
+            if len(calls) == 1:
+                raise RuntimeError("CUDA out of memory")
+            return []
+
+    entry = ModelEntry(model=FailingOnceModel(), visualizer=None, model_name="m.pt", device="cpu")
+    with pytest.raises(RuntimeError, match="out of memory"):
+        await run_inference(entry, IMAGE, 0.1, 640, 100)
+    assert not entry.predict_lock.locked(), "a failed predict() left the instance locked"
+
+    assert await run_inference(entry, IMAGE, 0.2, 640, 100) == []
+    assert calls == [0.1, 0.2]

@@ -33,7 +33,7 @@ class ModelEntry:
     model_name: str
     device: str
     # One predict() at a time on this instance, see inference_utils.run_inference()
-    predict_lock: threading.Lock = field(default_factory=threading.Lock)
+    predict_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 @dataclass

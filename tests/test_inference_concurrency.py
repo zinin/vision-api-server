@@ -169,6 +169,7 @@ async def test_cancelled_request_keeps_the_instance_until_predict_returns():
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
+    assert entry.predict_lock.locked(), "cancelling the request released the instance while predict() still runs"
 
     second = asyncio.create_task(run_inference(entry, IMAGE, 0.2, 640, 100))
     await asyncio.sleep(0.2)  # long enough for the second call to get in, if nothing stops it
